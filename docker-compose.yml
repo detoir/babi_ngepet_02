@@ -1,0 +1,20 @@
+version: '3.8'
+
+services:
+  babi_ngepet_01:
+    build: .
+    container_name: babi_ngepet_01_scanner
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - scanner_data:/app/data
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  scanner_data:
+    driver: local
