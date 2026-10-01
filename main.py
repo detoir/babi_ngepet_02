@@ -11,10 +11,32 @@ import time
 import signal
 import os
 import asyncio
+import urllib.request
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 processes = []
+OUTBOUND_IP = "Unknown"
+
+def fetch_public_ip() -> str:
+    global OUTBOUND_IP
+    services = [
+        "https://api.ipify.org",
+        "https://ifconfig.me/ip",
+        "https://icanhazip.com",
+    ]
+    for url in services:
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "curl/7.68.0"})
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                ip = resp.read().decode("utf-8").strip()
+                if ip:
+                    OUTBOUND_IP = ip
+                    return ip
+        except Exception:
+            continue
+    OUTBOUND_IP = "Unable to determine (check network)"
+    return OUTBOUND_IP
 
 def terminate_all_children():
     for p in processes:
@@ -38,7 +60,14 @@ async def process_supervisor_loop():
     
     python_executable = sys.executable
 
+    # Pre-flight environment check
+    tg_token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+    if not tg_token:
+        print("[SUPERVISOR] ⚠️ WARNING: TELEGRAM_BOT_TOKEN is not set in Environment Variables!")
+        print("[SUPERVISOR] ⚠️ ai_scanner.py will fail to start without a valid Telegram Bot Token.")
+
     print("[SUPERVISOR] ==========================================")
+    print(f"[SUPERVISOR] Public Outbound IP for Binance Whitelist: {OUTBOUND_IP}")
     print(f"[SUPERVISOR] Starting Trading Workers on Python {sys.version.split()[0]}")
     print("[SUPERVISOR] ==========================================")
 
@@ -72,6 +101,12 @@ async def lifespan(app: FastAPI):
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
+    # Detect Outbound IP at boot
+    ip = fetch_public_ip()
+    print("=" * 60)
+    print(f"🚀 HELIPOD OUTBOUND IP (FOR BINANCE API WHITELIST): {ip}")
+    print("=" * 60)
+
     supervisor_task = asyncio.create_task(process_supervisor_loop())
     yield
     supervisor_task.cancel()
@@ -85,7 +120,15 @@ def health():
     return {
         "status": "online",
         "bot": "babi_ngepet_01",
+        "outbound_ip": OUTBOUND_IP,
         "active_workers": len([p for p in processes if p.poll() is None])
+    }
+
+@app.get("/ip")
+def get_ip():
+    return {
+        "outbound_ip": OUTBOUND_IP,
+        "message": "Use this IP address in your Binance API Whitelist"
     }
 
 if __name__ == "__main__":
