@@ -65,6 +65,8 @@ from config_db import (
     place_binance_stop_loss,
     cancel_binance_order,
     emergency_binance_market_close,
+    parse_database_timestamp,
+    utc_now,
 )
 
 exchange = get_exchange_instance()
@@ -475,7 +477,7 @@ async def fetch_full_market_universe_tickers() -> list:
 
     return market_universe
 
-def analyze_macro_universe_with_ai(market_universe: list, live_news: str, btc_regime: dict, btc_24h_pct: float, capital_info: dict = None, active_positions: list = None) -> dict:
+def analyze_macro_universe_with_ai(market_universe: list, live_news: str, btc_regime: dict, btc_24h_pct: float, capital_info: dict = None, active_positions: list = None, pending_watchlist: list = None) -> dict:
     user_rules = get_active_strategy_rules()
     lessons = get_contextual_trade_lessons()
     top_candidates = market_universe[:35]
@@ -517,12 +519,17 @@ def analyze_macro_universe_with_ai(market_universe: list, live_news: str, btc_re
     if active_positions:
         active_pos_section = json.dumps(active_positions)
 
+    pending_watch_section = "No pending limit orders on watchlist."
+    if pending_watchlist:
+        pending_watch_section = json.dumps(pending_watchlist)
+
     prompt = f"""
     You are the Chief Quantitative Strategist & Portfolio Risk Sentinel for {BOT_NAME}.
     PRIMARY OBJECTIVES:
     1. Maximize Positive Expected Value (+EV) by synthesizing Global Financial News, Central Bank Catalysts, and Order Flow Microstructure.
     2. Adapt strategy dynamically: Unleash TREND_MOMENTUM on institutional weekdays, enforce SWEEP_REVERSION / fast scalp harvesting during Chop/Weekends.
     3. Defend active positions: Detect sudden macro shock reversals and order book flips.
+    4. Audit pending watchlist limit orders: Verify whether unfilled limit orders are still technically/fundamentally applicable or should be cancelled to free capital.
 
     [CURRENT ACCOUNT CAPITAL & MARGIN CAPACITY]
     • Total Balance: ${cap_total:.2f} USD | Free Margin: ${cap_free:.2f} USD | Mode: {cap_mode}
@@ -538,6 +545,10 @@ def analyze_macro_universe_with_ai(market_universe: list, live_news: str, btc_re
     [ACTIVE POSITIONS - REVERSAL AUDIT]
     Format: [symbol, action, entry, curr_price, pnl_pct, peak_gain_pct, pullback_from_peak]
     {active_pos_section}
+
+    [PENDING WATCHLIST & LIMIT ORDERS AUDIT (Stage 0 - Review for Invalidation)]
+    Format: [{"id": id, "symbol": sym, "action": act, "planned_entry": entry, "curr_price": curr_price, "dist_to_entry_pct": dist_pct, "thesis": thesis, "pending_mins": mins, "order_id": order_id}]
+    {pending_watch_section}
 
     [REAL-TIME MICROSTRUCTURE UNIVERSE (Top 35 Liquid Perps)]
     Format: [s: symbol, p: mark price, c: 24h %, v_m: volume M$, fr: funding %, oi_m: OI M$, book_ratio: bid/ask depth, hi: 24h high, lo: 24h low]
@@ -563,6 +574,8 @@ def analyze_macro_universe_with_ai(market_universe: list, live_news: str, btc_re
        - No shorts if the asset has already dumped > -10% in 24h (capitulation wick risk).
     4. Sudden Reversal Management:
        - For any active position showing momentum exhaustion or adverse flow, prescribe HARVEST_NOW or TIGHTEN_SL.
+    5. Watchlist Applicability Audit:
+       - For each pending Stage 0 limit setup: check if the original thesis holds. If market trend flipped, price ran away without fill, or order book structure deteriorated, prescribe CANCEL_INVALID to purge it. Otherwise, prescribe KEEP.
 
     Respond ONLY in strict JSON format:
     {{
@@ -584,6 +597,13 @@ def analyze_macro_universe_with_ai(market_universe: list, live_news: str, btc_re
                 "reason": "1-sentence explanation"
             }}
         ],
+        "watchlist_directives": [
+            {{
+                "symbol": "SYMBOL/USDT:USDT",
+                "verdict": "KEEP" | "CANCEL_INVALID",
+                "reason": "1-sentence explanation why setup remains valid or is invalidated"
+            }}
+        ],
         "macro_verdict": "1-sentence summary of market regime and strategy activated"
     }}
     """
@@ -603,9 +623,9 @@ def analyze_macro_universe_with_ai(market_universe: list, live_news: str, btc_re
         return parsed
     except Exception as e:
         log_event("ERROR", "AI_SCANNER", f"AI Parse Error: {e}")
-        return {"action": "HOLD", "selected_setups": [], "active_position_directives": [], "macro_verdict": f"AI Error: {e}"}
+        return {"action": "HOLD", "selected_setups": [], "active_position_directives": [], "watchlist_directives": [], "macro_verdict": f"AI Error: {e}"}
 
-def analyze_whale_microstructure_with_ai(market_universe: list, btc_regime: dict, btc_24h_pct: float, capital_info: dict = None, active_positions: list = None) -> dict:
+def analyze_whale_microstructure_with_ai(market_universe: list, btc_regime: dict, btc_24h_pct: float, capital_info: dict = None, active_positions: list = None, pending_watchlist: list = None) -> dict:
     top_candidates = market_universe[:35]
 
     cap_total = capital_info.get("total", 10000.0) if capital_info else 10000.0
@@ -619,11 +639,16 @@ def analyze_whale_microstructure_with_ai(market_universe: list, btc_regime: dict
     if active_positions:
         active_pos_section = json.dumps(active_positions)
 
+    pending_watch_section = "No pending limit orders on watchlist."
+    if pending_watchlist:
+        pending_watch_section = json.dumps(pending_watchlist)
+
     prompt = f"""
     You are the Senior Institutional Order Flow Specialist & Risk Defender for {BOT_NAME}.
     PRIMARY OBJECTIVES:
     1. Exploit whale positioning WITHOUT falling for spoofed bid walls or crowded liquidation traps.
     2. Protect active profits: Identify sudden institutional distribution or whale flips against open positions.
+    3. Audit pending watchlist limit orders: Purge limit orders where order flow, depth ratio, or top trader ratios have flipped against the planned entry.
 
     [PORTFOLIO CAPITAL ANCHOR]
     • Total Balance: ${cap_total:.2f} USD | Free Margin: ${cap_free:.2f} USD
@@ -634,6 +659,10 @@ def analyze_whale_microstructure_with_ai(market_universe: list, btc_regime: dict
 
     [ACTIVE POSITIONS - WHALE REVERSAL AUDIT]
     {active_pos_section}
+
+    [PENDING WATCHLIST & LIMIT ORDERS AUDIT (Stage 0 - Review for Invalidation)]
+    Format: [{"id": id, "symbol": sym, "action": act, "planned_entry": entry, "curr_price": curr_price, "dist_to_entry_pct": dist_pct, "thesis": thesis, "pending_mins": mins, "order_id": order_id}]
+    {pending_watch_section}
 
     [NATIVE BINANCE DERIVATIVES MICROSTRUCTURE]
     Format: [s: symbol, p: price, c: 24h %, v_m: volume M$, fr: funding %, oi_m: Open Interest M$, book_ratio: bid/ask depth, whale_ls_ratio: top trader long/short ratio, hi: 24h high, lo: 24h low]
@@ -648,6 +677,8 @@ def analyze_whale_microstructure_with_ai(market_universe: list, btc_regime: dict
        - When BTC is dumping, identify high OI tokens with positive funding and dropping prices (whales distributing into retail exit liquidity).
     4. REVERSAL HARVEST:
        - If an active position has top traders flipping against it or massive order book imbalance against it, recommend HARVEST_NOW or TIGHTEN_SL.
+    5. WATCHLIST APPLICABILITY AUDIT:
+       - If a pending limit order has order flow or top trader ratios flipping adversely, recommend CANCEL_INVALID to free the slot. Otherwise, recommend KEEP.
 
     Respond ONLY in strict JSON:
     {{
@@ -665,6 +696,13 @@ def analyze_whale_microstructure_with_ai(market_universe: list, btc_regime: dict
             {{
                 "symbol": "SYMBOL/USDT:USDT",
                 "verdict": "HOLD" | "TIGHTEN_SL" | "HARVEST_NOW",
+                "reason": "1-sentence explanation"
+            }}
+        ],
+        "watchlist_directives": [
+            {{
+                "symbol": "SYMBOL/USDT:USDT",
+                "verdict": "KEEP" | "CANCEL_INVALID",
                 "reason": "1-sentence explanation"
             }}
         ],
@@ -687,7 +725,7 @@ def analyze_whale_microstructure_with_ai(market_universe: list, btc_regime: dict
         return parsed
     except Exception as e:
         log_event("ERROR", "WHALE_SCANNER", f"AI Whale Scan Error: {e}")
-        return {"action": "HOLD", "whale_setups": [], "active_position_directives": [], "whale_verdict": f"AI Parsing Error: {e}"}
+        return {"action": "HOLD", "whale_setups": [], "active_position_directives": [], "watchlist_directives": [], "whale_verdict": f"AI Parsing Error: {e}"}
 
 # ==============================================================================
 # PIPELINES
@@ -731,35 +769,54 @@ async def execute_unified_hourly_discovery_pipeline(context: ContextTypes.DEFAUL
         account_balance = float(capital_info.get("total", 10000.0))
         log_event("INFO", "CAPITAL", f"Current Capital Checked: ${account_balance:.2f} USD ({capital_info.get('mode', 'SIMULATION')})")
 
-        # 2. Fetch Active Positions for Sudden Reversal & Profit Management
+        # 2. Fetch Active Positions & Pending Watchlist Setups
         active_positions_payload = []
+        pending_watchlist_payload = []
         with get_db_connection() as conn:
             c = conn.cursor()
-            c.execute("SELECT * FROM watched_signals WHERE status = 'WATCHING' AND stage >= 1")
-            active_rows = c.fetchall()
-            for r in active_rows:
+            c.execute("SELECT * FROM watched_signals WHERE status = 'WATCHING'")
+            all_watched_rows = c.fetchall()
+            for r in all_watched_rows:
                 sym = r["symbol"]
                 act = r["action"]
                 entry = float(r["entry_limit"] or 0.0)
                 sl = float(r["current_sl"] or 0.0)
-                high_fav = float(r["highest_favorable_price"] or entry)
+                stage_val = int(r["stage"] or 0)
                 curr_price = await asyncio.to_thread(fetch_real_perp_market_price, sym)
-                if curr_price > 0 and entry > 0:
-                    pnl_pct = ((curr_price - entry) / entry * 100.0) if act == "LONG" else ((entry - curr_price) / entry * 100.0)
-                    peak_gain = ((high_fav - entry) / entry * 100.0) if act == "LONG" else ((entry - high_fav) / entry * 100.0)
-                    pullback = ((high_fav - curr_price) / high_fav * 100.0) if act == "LONG" else ((curr_price - high_fav) / high_fav * 100.0)
-                    active_positions_payload.append({
+                created_at = parse_database_timestamp(r["timestamp"])
+                mins_elapsed = round((utc_now() - created_at).total_seconds() / 60.0, 1)
+
+                if stage_val >= 1:
+                    high_fav = float(r["highest_favorable_price"] or entry)
+                    if curr_price > 0 and entry > 0:
+                        pnl_pct = ((curr_price - entry) / entry * 100.0) if act == "LONG" else ((entry - curr_price) / entry * 100.0)
+                        peak_gain = ((high_fav - entry) / entry * 100.0) if act == "LONG" else ((entry - high_fav) / entry * 100.0)
+                        pullback = ((high_fav - curr_price) / high_fav * 100.0) if act == "LONG" else ((curr_price - high_fav) / high_fav * 100.0)
+                        active_positions_payload.append({
+                            "id": r["id"],
+                            "symbol": sym,
+                            "action": act,
+                            "entry": entry,
+                            "current_sl": sl,
+                            "curr_price": curr_price,
+                            "pnl_pct": round(pnl_pct, 2),
+                            "peak_gain_pct": round(peak_gain, 2),
+                            "pullback_from_peak": round(pullback, 2),
+                            "sl_order_id": str(r["binance_sl_order_id"] or ""),
+                            "executed_qty": float(r["executed_qty"] or 0.0)
+                        })
+                else:
+                    dist_pct = round(abs(curr_price - entry) / entry * 100.0, 2) if entry > 0 else 0.0
+                    pending_watchlist_payload.append({
                         "id": r["id"],
                         "symbol": sym,
                         "action": act,
-                        "entry": entry,
-                        "current_sl": sl,
+                        "planned_entry": entry,
                         "curr_price": curr_price,
-                        "pnl_pct": round(pnl_pct, 2),
-                        "peak_gain_pct": round(peak_gain, 2),
-                        "pullback_from_peak": round(pullback, 2),
-                        "sl_order_id": str(r["binance_sl_order_id"] or ""),
-                        "executed_qty": float(r["executed_qty"] or 0.0)
+                        "dist_to_entry_pct": dist_pct,
+                        "thesis": r["strategic_thesis"] or "",
+                        "pending_mins": mins_elapsed,
+                        "order_id": str(r["binance_entry_order_id"] or "")
                     })
 
         # 3. Market Data Ingestion
@@ -778,16 +835,58 @@ async def execute_unified_hourly_discovery_pipeline(context: ContextTypes.DEFAUL
         # 4. Concurrently Run AI Macro and AI Whale Discovery Prompts
         macro_task = asyncio.to_thread(
             analyze_macro_universe_with_ai,
-            market_universe, live_news, btc_regime, btc_24h_pct, capital_info, active_positions_payload
+            market_universe, live_news, btc_regime, btc_24h_pct, capital_info, active_positions_payload, pending_watchlist_payload
         )
         whale_task = asyncio.to_thread(
             analyze_whale_microstructure_with_ai,
-            market_universe, btc_regime, btc_24h_pct, capital_info, active_positions_payload
+            market_universe, btc_regime, btc_24h_pct, capital_info, active_positions_payload, pending_watchlist_payload
         )
 
         macro_decision, whale_decision = await asyncio.gather(macro_task, whale_task)
 
-        # 5. Apply AI Active Position Sudden Reversal & Profit Management Directives
+        # 5. Apply AI Watchlist Applicability Directives (Purge Invalid Pending Setups)
+        all_watchlist_directives = (
+            macro_decision.get("watchlist_directives", []) +
+            whale_decision.get("watchlist_directives", [])
+        )
+
+        for w_dir in all_watchlist_directives:
+            w_sym = w_dir.get("symbol")
+            w_verdict = str(w_dir.get("verdict") or "KEEP").upper()
+            w_reason = w_dir.get("reason", "")
+            if not w_sym or w_verdict != "CANCEL_INVALID":
+                continue
+
+            match_pending = next((p for p in pending_watchlist_payload if p["symbol"] == w_sym), None)
+            if not match_pending:
+                continue
+
+            # Cancel pending limit order on Binance
+            if match_pending["order_id"]:
+                await asyncio.to_thread(cancel_binance_order, match_pending["symbol"], match_pending["order_id"])
+
+            with get_db_connection() as conn:
+                conn.execute("""
+                    UPDATE watched_signals 
+                    SET status = 'INVALIDATED', realized_pnl = 0.0, movement_tag = '🚫 AI_PURGED_INVALID', last_updated = CURRENT_TIMESTAMP 
+                    WHERE id = ?
+                """, (match_pending["id"],))
+
+            log_event("INFO", "AI_WATCHLIST", f"Pending setup {w_sym} cancelled by AI audit: {w_reason}")
+            if chat_id and context:
+                msg = (
+                    f"🚫 <b>WATCHLIST AUDIT: SETUP CANCELLED</b>\n\n"
+                    f"• <b>Contract:</b> <code>{match_pending['symbol']}</code> ({match_pending['action']})\n"
+                    f"• <b>Planned Entry:</b> ${match_pending['planned_entry']:.6f} (Mark: ${match_pending['curr_price']:.6f})\n"
+                    f"• <b>AI Verdict:</b> <i>{html.escape(w_reason)}</i>\n"
+                    f"🤖 <b>Cancelled pending order on Binance. Slot freed for higher EV setups.</b>"
+                )
+                try:
+                    await context.bot.send_message(chat_id=int(chat_id), text=msg, parse_mode="HTML")
+                except Exception:
+                    pass
+
+        # 6. Apply AI Active Position Sudden Reversal & Profit Management Directives
         all_reversal_directives = (
             macro_decision.get("active_position_directives", []) +
             whale_decision.get("active_position_directives", [])
@@ -841,7 +940,7 @@ async def execute_unified_hourly_discovery_pipeline(context: ContextTypes.DEFAUL
 
                 log_event("INFO", "AI_REVERSAL", f"Stop-Loss tightened on {d_sym} to ${tighter_sl:.6f}. Reason: {d_reason}")
 
-        # 6. Profit Prioritization & Candidate Ranking Engine
+        # 7. Profit Prioritization & Candidate Ranking Engine
         raw_candidates = []
 
         # Ingest AI Macro Setups

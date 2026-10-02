@@ -238,8 +238,21 @@ def init_db():
 
 init_db()
 
+def utc_now() -> datetime.datetime:
+    return datetime.datetime.now(datetime.timezone.utc).replace(tzinfo=None)
+
+def parse_database_timestamp(raw_ts: str) -> datetime.datetime:
+    if not raw_ts:
+        return utc_now()
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S.%f"):
+        try:
+            return datetime.datetime.strptime(raw_ts.split("+")[0].split("Z")[0], fmt)
+        except ValueError:
+            pass
+    return utc_now()
+
 def log_event(level: str, component: str, message: str):
-    timestamp = datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+    timestamp = utc_now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"[{timestamp}] [{level:<5}] [{component:<14}] {message}")
     try:
         with get_db_connection() as conn:
@@ -251,7 +264,7 @@ def log_event(level: str, component: str, message: str):
         pass
 
 def is_weekend_regime() -> bool:
-    now_utc = datetime.datetime.utcnow()
+    now_utc = utc_now()
     weekday = now_utc.weekday()
     hour = now_utc.hour
     if weekday == 4 and hour >= 22:
@@ -674,7 +687,7 @@ def get_recent_system_logs(limit=15, level_filter=None) -> list:
         return c.fetchall()
 
 def generate_monthly_performance_report() -> dict:
-    start_of_month = datetime.datetime.utcnow().strftime("%Y-%m-01 00:00:00")
+    start_of_month = utc_now().strftime("%Y-%m-01 00:00:00")
     
     with get_db_connection() as conn:
         c = conn.cursor()
@@ -693,7 +706,7 @@ def generate_monthly_performance_report() -> dict:
         c.execute("""
             SELECT realized_pnl, status 
             FROM watched_signals 
-            WHERE status IN ('COMPLETED', 'INVALIDATED') 
+            WHERE status IN ('COMPLETED', 'INVALIDATED', 'STOPPED_OUT') 
             AND stage >= 1 
             AND last_updated >= ?
         """, (start_of_month,))
@@ -716,7 +729,7 @@ def generate_monthly_performance_report() -> dict:
         pending_orders = c.fetchone()["pending_cnt"] or 0
 
         return {
-            "month": datetime.datetime.utcnow().strftime("%B %Y"),
+            "month": utc_now().strftime("%B %Y"),
             "start_date": start_of_month.split(" ")[0],
             "total_scans": total_scans,
             "total_signals": total_signals,
@@ -731,8 +744,8 @@ def generate_monthly_performance_report() -> dict:
         }
 
 def export_monthly_report_csv() -> tuple:
-    start_of_month = datetime.datetime.utcnow().strftime("%Y-%m-01 00:00:00")
-    filename = f"Trade_Report_{datetime.datetime.utcnow().strftime('%Y_%m')}.csv"
+    start_of_month = utc_now().strftime("%Y-%m-01 00:00:00")
+    filename = f"Trade_Report_{utc_now().strftime('%Y_%m')}.csv"
     
     with get_db_connection() as conn:
         c = conn.cursor()

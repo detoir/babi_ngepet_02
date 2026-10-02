@@ -113,7 +113,12 @@ The system runs as an integrated ASGI supervisor service (`main.py`) exposing he
 - **Stagnation Trap Exit**: Adaptive timeout (180m in trend, 90m in chop, 60m in weekend) flags dead trades.
 - **Symbol Cooldown**: Positions stopped out receive a mandatory 4-hour cooldown lock to prevent revenge trading.
 
-### 5. Automated Audit Ledger & CSV Export
+### 5. AI Watchlist Applicability & Invalidation Audit
+- **Pending Order Review Engine**: During every hourly AI scan, the system passes all pending Stage 0 limit orders (symbol, planned entry, current mark, distance %, elapsed pending time, original thesis) directly into the DeepSeek AI prompt.
+- **Dynamic Invalidation (`CANCEL_INVALID`)**: If the technical thesis has deteriorated, price has moved too far away without filling, order book depth flipped, or macro sentiment invalidated the setup, DeepSeek AI commands `CANCEL_INVALID`.
+- **Automated Order Cleanup**: Automatically cancels the live pending limit order on Binance, updates SQLite status to `INVALIDATED`, sends a Telegram notification, and frees watchlist capacity for new $+EV$ setups.
+
+### 6. Automated Audit Ledger & CSV Export
 - `/report` command generates a comprehensive monthly performance audit (win rate, net realized PnL, active/pending counts) and immediately generates and uploads a downloadable `.csv` trade ledger directly to Telegram.
 
 ---

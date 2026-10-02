@@ -397,8 +397,9 @@ async def run_sentinel_cycle(session: aiohttp.ClientSession):
                     await asyncio.to_thread(emergency_binance_market_close, sym, act, executed_qty)
 
                 cooldown_time = (utc_now() + datetime.timedelta(hours=4)).strftime("%Y-%m-%d %H:%M:%S")
+                close_status = "COMPLETED" if pnl_approx >= 0 else "STOPPED_OUT"
                 with get_db_connection() as conn:
-                    conn.execute("UPDATE watched_signals SET status = 'INVALIDATED', realized_pnl = ?, last_updated = CURRENT_TIMESTAMP WHERE id = ?", (pnl_approx, w_id))
+                    conn.execute("UPDATE watched_signals SET status = ?, realized_pnl = ?, last_updated = CURRENT_TIMESTAMP WHERE id = ?", (close_status, pnl_approx, w_id))
                     if pnl_approx < 0:
                         conn.execute("INSERT OR REPLACE INTO symbol_cooldowns (symbol, cooldown_until) VALUES (?, ?)", (sym, cooldown_time))
                         conn.execute("""
