@@ -22,6 +22,8 @@ from config_db import (
     TELEGRAM_BOT_TOKEN,
     TELEGRAM_CHAT_ID,
     TRADING_MODE,
+    is_weekend_regime,
+    utc_now,
     get_exchange_instance,
     get_db_connection,
     log_event,
@@ -92,13 +94,13 @@ async def check_btc_flash_shock() -> str:
 
 def parse_database_timestamp(raw_ts: str) -> datetime.datetime:
     if not raw_ts:
-        return datetime.datetime.utcnow()
+        return utc_now()
     for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S.%f"):
         try:
             return datetime.datetime.strptime(raw_ts.split("+")[0].split("Z")[0], fmt)
         except ValueError:
             pass
-    return datetime.datetime.utcnow()
+    return utc_now()
 
 async def run_sentinel_cycle(session: aiohttp.ClientSession):
     with get_db_connection() as conn:
@@ -181,7 +183,7 @@ async def run_sentinel_cycle(session: aiohttp.ClientSession):
         # 2. STAGE 0: PENDING LIMIT ORDER TRACKING & AUTO FILL
         if stage == 0:
             created_at = parse_database_timestamp(item["timestamp"])
-            minutes_pending = (datetime.datetime.utcnow() - created_at).total_seconds() / 60.0
+            minutes_pending = (utc_now() - created_at).total_seconds() / 60.0
 
             # EXPIRATION WITH BINANCE CANCELLATION
             if minutes_pending >= (PENDING_TTL_HOURS * 60.0):
@@ -269,7 +271,7 @@ async def run_sentinel_cycle(session: aiohttp.ClientSession):
         # 3. STAGE 1+: ACTIVE POSITION RISK DEFENSE & DYNAMIC TP/SL MANAGEMENT
         if stage >= 1:
             created_at = parse_database_timestamp(item["timestamp"])
-            holding_mins = (datetime.datetime.utcnow() - created_at).total_seconds() / 60.0
+            holding_mins = (utc_now() - created_at).total_seconds() / 60.0
             pnl_approx = ((curr_price - entry) / entry * 100.0) if act == "LONG" else ((entry - curr_price) / entry * 100.0)
 
             if act == "LONG":
@@ -283,11 +285,39 @@ async def run_sentinel_cycle(session: aiohttp.ClientSession):
 
             updated_high_fav = peak_price
 
-            # RULE A: AUTO BREAK-EVEN (At +0.6R, lock entry + fees)
+            # --- DYNAMIC REGIME TUNING ---
+            coin_trend_str = str(item["coin_trend"] or "").upper()
+            is_weekend = is_weekend_regime()
+            is_sideways = ("NEUTRAL" in coin_trend_str or "CONSOLIDATION" in coin_trend_str or speed_tag == "SWEEP_REVERSION")
+
+            if is_weekend:
+                # WEEKEND ANOMALY REGIME: Low CME liquidity & erratic manipulation
+                regime_label = "WEEKEND ANOMALY"
+                be_r_trigger = 0.5
+                reversal_min_gain = 1.0
+                reversal_pullback_threshold = 0.4
+                stagnation_limit_mins = 60.0
+            elif is_sideways:
+                # SIDEWAYS / CHOP REGIME: Quick range-bound mean reversion
+                regime_label = "SIDEWAYS CHOP"
+                be_r_trigger = 0.6
+                reversal_min_gain = 1.4
+                reversal_pullback_threshold = 0.5
+                stagnation_limit_mins = 90.0
+            else:
+                # TRENDING MOMENTUM REGIME (Weekday Institutional Flow):
+                # Allow winners room to breathe so full TP1 (+1.2R) and TP2 (+2.0R) can be achieved
+                regime_label = "TRENDING MOMENTUM"
+                be_r_trigger = 1.0
+                reversal_min_gain = 2.2
+                reversal_pullback_threshold = 1.0
+                stagnation_limit_mins = STAGNATION_MINS  # 180.0
+
+            # RULE A: ADAPTIVE AUTO BREAK-EVEN
             risk_span = abs(entry - float(item["initial_sl"] or current_sl))
             if risk_span > 0:
                 r_gain = (curr_price - entry) / risk_span if act == "LONG" else (entry - curr_price) / risk_span
-                if r_gain >= 0.6 and "BE_LOCKED" not in tag_current:
+                if r_gain >= be_r_trigger and "BE_LOCKED" not in tag_current:
                     be_sl = round(entry * 1.0015, 6) if act == "LONG" else round(entry * 0.9985, 6)
                     
                     # Update Stop-Loss on Binance
@@ -307,7 +337,7 @@ async def run_sentinel_cycle(session: aiohttp.ClientSession):
                     sl_order_id = new_sl_id
                     tag_current = "🛡️ BE_LOCKED"
                     msg = (
-                        f"🛡️ <b>BREAK-EVEN AUTO-LOCKED (+0.6R Reached)</b>\n\n"
+                        f"🛡️ <b>BREAK-EVEN AUTO-LOCKED (+{be_r_trigger:.1f}R Reached [{regime_label}])</b>\n\n"
                         f"• <b>Contract:</b> <code>{sym}</code> ({act})\n"
                         f"• <b>Current Mark:</b> ${curr_price:.6f} (<code>{pnl_approx:+.2f}%</code>)\n"
                         f"🤖 <b>Updated Binance Stop-Loss to: ${be_sl:.6f}</b>.\n"
@@ -315,10 +345,9 @@ async def run_sentinel_cycle(session: aiohttp.ClientSession):
                     )
                     await send_telegram_alert(session, msg)
 
-            # RULE B: SUDDEN REVERSAL & PROFIT HARVEST DEFENSE
-            # Protects profit if trade gained >= +1.2% and gives back >= 40% from peak, or hits standard peak giveback (>=2.5% gain & >=1.0% pullback)
-            is_sudden_reversal = (peak_gain_pct >= 1.2 and pullback_from_peak >= (peak_gain_pct * 0.40) and pullback_from_peak >= 0.6 and pnl_approx > 0.3)
-            is_peak_giveback = (peak_gain_pct >= 2.5 and pullback_from_peak >= 1.0)
+            # RULE B: ADAPTIVE SUDDEN REVERSAL & PROFIT HARVEST DEFENSE
+            is_sudden_reversal = (peak_gain_pct >= reversal_min_gain and pullback_from_peak >= reversal_pullback_threshold and pnl_approx > 0.3)
+            is_peak_giveback = (peak_gain_pct >= 2.8 and pullback_from_peak >= 1.2)
 
             if (is_sudden_reversal or is_peak_giveback) and stage == 1 and "PEAK_EXIT" not in tag_current:
                 if sl_order_id:
@@ -333,7 +362,7 @@ async def run_sentinel_cycle(session: aiohttp.ClientSession):
                         WHERE id = ?
                     """, (pnl_approx, w_id))
                 msg = (
-                    f"💰 <b>PROFIT HARVEST: SUDDEN REVERSAL DEFENDED</b>\n\n"
+                    f"💰 <b>PROFIT HARVEST: SUDDEN REVERSAL DEFENDED [{regime_label}]</b>\n\n"
                     f"• <b>Contract:</b> <code>{sym}</code> ({act})\n"
                     f"• <b>Peak Gain:</b> <code>+{peak_gain_pct:.2f}%</code>\n"
                     f"• <b>Secured Exit:</b> ${curr_price:.6f} (<code>{pnl_approx:+.2f}%</code>)\n"
@@ -343,17 +372,17 @@ async def run_sentinel_cycle(session: aiohttp.ClientSession):
                 await send_telegram_alert(session, msg)
                 continue
 
-            # Stagnation Defense: 3 hours in chop
-            if stage == 1 and holding_mins >= STAGNATION_MINS and pnl_approx <= STAGNATION_PNL_FLOOR and "STAGNANT" not in tag_current:
+            # Stagnation Defense: Adaptive time in chop
+            if stage == 1 and holding_mins >= stagnation_limit_mins and pnl_approx <= STAGNATION_PNL_FLOOR and "STAGNANT" not in tag_current:
                 with get_db_connection() as conn:
                     conn.execute("UPDATE watched_signals SET movement_tag = '⚠️ STAGNANT_WARNED' WHERE id = ?", (w_id,))
                     conn.execute("""
                         INSERT INTO loss_diagnostics (symbol, action, entry_price, exit_price, stop_loss_price, exit_type, holding_duration_mins, market_regime, diagnostic_reason)
-                        VALUES (?, ?, ?, ?, ?, 'STAGNATION', ?, 'CHOP', ?)
-                    """, (sym, act, entry, curr_price, current_sl, holding_mins, f"Stalled below {STAGNATION_PNL_FLOOR}% after {holding_mins:.0f}m."))
+                        VALUES (?, ?, ?, ?, ?, 'STAGNATION', ?, ?, ?)
+                    """, (sym, act, entry, curr_price, current_sl, holding_mins, regime_label, f"Stalled below {STAGNATION_PNL_FLOOR}% after {holding_mins:.0f}m."))
                 tag_current = "⚠️ STAGNANT_WARNED"
                 msg = (
-                    f"⏳ <b>ADVISORY: STAGNANT TRADE (>{int(STAGNATION_MINS/60)} Hours)</b>\n\n"
+                    f"⏳ <b>ADVISORY: STAGNANT TRADE (>{int(stagnation_limit_mins)}m [{regime_label}])</b>\n\n"
                     f"• <b>Contract:</b> <code>{sym}</code> ({act})\n"
                     f"• <b>Current Mark:</b> ${curr_price:.6f} (<code>{pnl_approx:+.2f}%</code>)\n"
                     f"• <b>Notice:</b> Momentum stalled. Capital may be freed if desired."
@@ -367,7 +396,7 @@ async def run_sentinel_cycle(session: aiohttp.ClientSession):
                 if TRADING_MODE in ("LIVE", "TESTNET"):
                     await asyncio.to_thread(emergency_binance_market_close, sym, act, executed_qty)
 
-                cooldown_time = (datetime.datetime.utcnow() + datetime.timedelta(hours=4)).strftime("%Y-%m-%d %H:%M:%S")
+                cooldown_time = (utc_now() + datetime.timedelta(hours=4)).strftime("%Y-%m-%d %H:%M:%S")
                 with get_db_connection() as conn:
                     conn.execute("UPDATE watched_signals SET status = 'INVALIDATED', realized_pnl = ?, last_updated = CURRENT_TIMESTAMP WHERE id = ?", (pnl_approx, w_id))
                     if pnl_approx < 0:

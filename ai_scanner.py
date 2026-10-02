@@ -172,20 +172,30 @@ def calculate_adx_regime(candles: list, period=14) -> dict:
     return {"regime": "TRENDING" if dx >= 25.0 else "RANGING", "adx": round(dx, 1)}
 
 def calculate_deterministic_trade_levels(price: float, atr_1h: float, direction: str, ema21_1h: float, strat_mode: str = "TREND_MOMENTUM"):
-    # Tighter dynamic risk distance (1.5% to 2.8% max)
+    is_weekend = is_weekend_regime()
+    is_sweep = (strat_mode == "SWEEP_REVERSION" or is_weekend)
+
+    # Dynamic risk distance (1.5% to 2.8% max)
     raw_risk = atr_1h * 1.5
     risk_dist = max(raw_risk, price * 0.015)
     risk_dist = min(risk_dist, price * 0.028)
 
-    # Balanced asymmetric reward multipliers: TP1 at +1.2R, TP2 at +2.0R, TP3 at +3.2R
-    tp1_mult = 1.2
-    tp2_mult = 2.0
-    tp3_mult = 3.2
+    # Adaptive reward multipliers based on regime
+    if is_sweep:
+        # Range-bound / Weekend: Compressed targets for quick scalp turnover
+        tp1_mult = 0.85
+        tp2_mult = 1.5
+        tp3_mult = 2.2
+    else:
+        # Trending: Asymmetric reward multipliers allowing runners to achieve full target
+        tp1_mult = 1.2
+        tp2_mult = 2.0
+        tp3_mult = 3.2
 
-    if strat_mode == "TREND_MOMENTUM":
+    if not is_sweep:
         if direction == "SHORT":
             # For shorts: Pullback limit entry above current price to avoid shorting the exact low
-            bounce_target = min(price * 1.0040, max(price * 1.0015, ema21_1h)) if ema21_1h > price else (price * 1.0020)
+            bounce_target = min(price * 1.0035, max(price * 1.0012, ema21_1h)) if ema21_1h > price else (price * 1.0018)
             entry = round(bounce_target, 6)
             sl = round(entry + risk_dist, 6)
             t1 = round(entry - (tp1_mult * risk_dist), 6)
@@ -193,13 +203,13 @@ def calculate_deterministic_trade_levels(price: float, atr_1h: float, direction:
             t3 = round(entry - (tp3_mult * risk_dist), 6)
         else:
             # For longs: Pullback limit entry below current price to avoid buying the exact peak
-            pullback_target = max(price * 0.9960, min(price * 0.9985, ema21_1h)) if ema21_1h < price else (price * 0.9980)
+            pullback_target = max(price * 0.9965, min(price * 0.9988, ema21_1h)) if ema21_1h < price else (price * 0.9982)
             entry = round(pullback_target, 6)
             sl = round(entry - risk_dist, 6)
             t1 = round(entry + (tp1_mult * risk_dist), 6)
             t2 = round(entry + (tp2_mult * risk_dist), 6)
             t3 = round(entry + (tp3_mult * risk_dist), 6)
-    else:  # SWEEP_REVERSION
+    else:  # SWEEP_REVERSION / WEEKEND
         if direction == "LONG":
             entry = round(price * 0.994, 6)
             sl = round(entry - risk_dist, 6)
@@ -306,11 +316,12 @@ async def fetch_microstructure_data_async(session: aiohttp.ClientSession, symbol
 
 async def fetch_live_world_and_crypto_news() -> str:
     headlines = []
-    headers = {"User-Agent": "Mozilla/5.0"}
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+    high_impact_alerts = []
     
     async def fetch_url(session, url):
         try:
-            async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=3.5)) as resp:
+            async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=4.5)) as resp:
                 if resp.status == 200:
                     return await resp.text()
         except Exception:
@@ -318,40 +329,78 @@ async def fetch_live_world_and_crypto_news() -> str:
         return None
 
     async with aiohttp.ClientSession() as session:
-        t_ct, t_cd, t_fng = await asyncio.gather(
+        t_yahoo, t_goog, t_ct, t_cd, t_fng = await asyncio.gather(
+            fetch_url(session, "https://finance.yahoo.com/news/rssindex"),
+            fetch_url(session, "https://news.google.com/rss/search?q=Federal+Reserve+OR+CPI+OR+Inflation+OR+FOMC+OR+Recession&hl=en-US&gl=US&ceid=US:en"),
             fetch_url(session, "https://cointelegraph.com/rss"),
             fetch_url(session, "https://www.coindesk.com/arc/outboundfeeds/rss/"),
             fetch_url(session, "https://api.alternative.me/fng/?limit=1")
         )
 
-    if t_ct:
+    # 1. Global Financial & Macro News (Yahoo Finance)
+    if t_yahoo:
         try:
-            root = ET.fromstring(t_ct)
-            for item in root.findall("./channel/item")[:5]:
+            root = ET.fromstring(t_yahoo)
+            for item in root.findall("./channel/item")[:4]:
                 t = item.find("title")
                 if t is not None and t.text:
-                    headlines.append(f"[Crypto News] {re.sub(r'<[^>]+>', '', t.text).strip()}")
+                    clean_txt = re.sub(r'<[^>]+>', '', t.text).strip()
+                    headlines.append(f"[Global Markets/Finance] {clean_txt}")
+                    if any(k in clean_txt.upper() for k in ["FOMC", "FED", "RATE HIKE", "RATE CUT", "POWELL", "CPI", "INFLATION", "PAYROLLS", "RECESSION", "TARIFF", "WAR"]):
+                        high_impact_alerts.append(f"⚠️ {clean_txt}")
         except Exception:
             pass
 
+    # 2. Central Bank & Macroeconomic Economic Indicators (Google News Macro)
+    if t_goog:
+        try:
+            root = ET.fromstring(t_goog)
+            for item in root.findall("./channel/item")[:3]:
+                t = item.find("title")
+                if t is not None and t.text:
+                    clean_txt = re.sub(r'<[^>]+>', '', t.text).strip()
+                    headlines.append(f"[Global Macro Policy] {clean_txt}")
+                    if any(k in clean_txt.upper() for k in ["FOMC", "FED", "RATE", "POWELL", "CPI", "INFLATION", "NFP"]):
+                        high_impact_alerts.append(f"⚠️ {clean_txt}")
+        except Exception:
+            pass
+
+    # 3. Crypto Native Major News (CoinDesk & CoinTelegraph)
     if t_cd:
         try:
             root = ET.fromstring(t_cd)
-            for item in root.findall("./channel/item")[:5]:
+            for item in root.findall("./channel/item")[:3]:
                 t = item.find("title")
                 if t is not None and t.text:
-                    headlines.append(f"[Macro News] {re.sub(r'<[^>]+>', '', t.text).strip()}")
+                    headlines.append(f"[Crypto Macro] {re.sub(r'<[^>]+>', '', t.text).strip()}")
         except Exception:
             pass
 
+    if t_ct:
+        try:
+            root = ET.fromstring(t_ct)
+            for item in root.findall("./channel/item")[:3]:
+                t = item.find("title")
+                if t is not None and t.text:
+                    headlines.append(f"[Crypto Market] {re.sub(r'<[^>]+>', '', t.text).strip()}")
+        except Exception:
+            pass
+
+    # 4. Sentiment Index
     if t_fng:
         try:
             data = json.loads(t_fng).get("data", [])[0]
-            headlines.append(f"[Macro Sentiment] Fear & Greed Index: {data.get('value', '50')} ({data.get('value_classification', 'Neutral')})")
+            headlines.append(f"[Global Sentiment] Fear & Greed Index: {data.get('value', '50')} ({data.get('value_classification', 'Neutral')})")
         except Exception:
             pass
 
-    return "\n".join(headlines) if headlines else "Normal liquidity conditions."
+    final_report = []
+    if high_impact_alerts:
+        final_report.append("[🚨 HIGH-IMPACT MACRO / FINANCIAL CATALYST DETECTED]\n" + "\n".join(high_impact_alerts[:3]))
+    if headlines:
+        final_report.append("[LIVE FINANCIAL & CRYPTO FEEDS]\n" + "\n".join(headlines[:10]))
+
+    return "\n\n".join(final_report) if final_report else "Normal global liquidity and financial conditions."
 
 async def fetch_full_market_universe_tickers() -> list:
     try:
@@ -455,6 +504,15 @@ def analyze_macro_universe_with_ai(market_universe: list, live_news: str, btc_re
         - Focus exclusively on SHORTING relative weakness tokens with weak order books.
         """
 
+    sideways_clause = ""
+    if regime_str == "RANGING" or adx_val < 22.0:
+        sideways_clause = """
+        [SIDEWAYS / CHOP MARKET REGIME ACTIVE]
+        - Market is range-bound (ADX < 22).
+        - Breakouts are prone to failure; prioritize SWEEP_REVERSION or quick FAST TRADE mean-reversions.
+        - Set coin_trend to 'NEUTRAL CONSOLIDATION'.
+        """
+
     active_pos_section = "No active positions currently."
     if active_positions:
         active_pos_section = json.dumps(active_positions)
@@ -462,17 +520,20 @@ def analyze_macro_universe_with_ai(market_universe: list, live_news: str, btc_re
     prompt = f"""
     You are the Chief Quantitative Strategist & Portfolio Risk Sentinel for {BOT_NAME}.
     PRIMARY OBJECTIVES:
-    1. Maximize Positive Expected Value (+EV) and allocate risk based on current dynamic account capital.
-    2. Protect open profits: Detect sudden market reversals and order book breakdowns against active positions.
+    1. Maximize Positive Expected Value (+EV) by synthesizing Global Financial News, Central Bank Catalysts, and Order Flow Microstructure.
+    2. Adapt strategy dynamically: Unleash TREND_MOMENTUM on institutional weekdays, enforce SWEEP_REVERSION / fast scalp harvesting during Chop/Weekends.
+    3. Defend active positions: Detect sudden macro shock reversals and order book flips.
 
     [CURRENT ACCOUNT CAPITAL & MARGIN CAPACITY]
     • Total Balance: ${cap_total:.2f} USD | Free Margin: ${cap_free:.2f} USD | Mode: {cap_mode}
 
-    [MACRO CONTEXT]
+    [MACRO & GLOBAL FINANCIAL CONTEXT]
     BTC Macro Regime: {regime_str} | ADX: {adx_val} | BTC 24h Change: {btc_24h_pct:+.2f}%
     {macro_alert}
-    {live_news}
+    {sideways_clause}
     {weekend_clause}
+    
+    {live_news}
 
     [ACTIVE POSITIONS - REVERSAL AUDIT]
     Format: [symbol, action, entry, curr_price, pnl_pct, peak_gain_pct, pullback_from_peak]
@@ -491,8 +552,12 @@ def analyze_macro_universe_with_ai(market_universe: list, live_news: str, btc_re
     ======================================================================
     EXECUTION & RISK DIRECTIVE:
     ======================================================================
-    1. If BTC is negative (< -0.8%), select ONLY high-beta altcoin SHORT breakdowns.
-    2. Short criteria: Tokens near 24h lows, book_ratio < 0.85, or underperforming BTC by >2.0%.
+    1. Macro & News Alignment:
+       - If High-Impact Catalysts (FOMC/CPI/War) are detected or BTC < -0.8%, focus on SHORT relative weakness altcoins.
+       - Disqualify long breakouts when broader financial markets or crypto are in risk-off mode.
+    2. Adaptive Strategy Mode:
+       - Trending weekdays (ADX >= 25): Select TREND_MOMENTUM with BEARISH DOWNTREND or BULLISH UPTREND.
+       - Ranging / Chop (ADX < 22) or Weekends: Select SWEEP_REVERSION with NEUTRAL CONSOLIDATION.
     3. Traps to Disqualify:
        - No longs when BTC is red.
        - No shorts if the asset has already dumped > -10% in 24h (capitulation wick risk).
@@ -509,7 +574,7 @@ def analyze_macro_universe_with_ai(market_universe: list, live_news: str, btc_re
                 "strategy_mode": "TREND_MOMENTUM" | "SWEEP_REVERSION",
                 "trade_speed": "FAST TRADE" | "SLOW TRADE",
                 "coin_trend": "BULLISH UPTREND" | "BEARISH DOWNTREND" | "NEUTRAL CONSOLIDATION",
-                "strategic_thesis": "1-sentence explicit technical/funding edge"
+                "strategic_thesis": "1-sentence explicit technical/news/funding edge"
             }}
         ],
         "active_position_directives": [
@@ -975,7 +1040,15 @@ async def execute_whale_discovery_pipeline(context: ContextTypes.DEFAULT_TYPE = 
 def auth_guard(update: Update) -> bool:
     if not TELEGRAM_CHAT_ID:
         return True
-    return bool(update.effective_user and str(update.effective_user.id).strip() == str(TELEGRAM_CHAT_ID).strip())
+    clean_target_id = str(TELEGRAM_CHAT_ID).strip()
+    user_id = str(update.effective_user.id).strip() if update.effective_user else ""
+    chat_id = str(update.effective_chat.id).strip() if update.effective_chat else ""
+
+    if user_id == clean_target_id or chat_id == clean_target_id:
+        return True
+
+    print(f"[AUTH_GUARD] ⛔ Blocked command from unauthorized User ID: '{user_id}' (Chat ID: '{chat_id}'). Expected TELEGRAM_CHAT_ID: '{clean_target_id}'")
+    return False
 
 async def set_bot_menu_commands(application):
     commands = [
@@ -997,7 +1070,18 @@ async def set_bot_menu_commands(application):
         pass
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not auth_guard(update): return
+    if not auth_guard(update):
+        user_id = update.effective_user.id if update.effective_user else "unknown"
+        chat_id = update.effective_chat.id if update.effective_chat else "unknown"
+        await update.message.reply_text(
+            f"🔒 <b>Unauthorized Access</b>\n\n"
+            f"• <b>Your Telegram User ID:</b> <code>{user_id}</code>\n"
+            f"• <b>Your Chat ID:</b> <code>{chat_id}</code>\n\n"
+            f"👉 Set <code>TELEGRAM_CHAT_ID={user_id}</code> in your Helipod Environment Variables to authorize your account.",
+            parse_mode="HTML"
+        )
+        return
+
     with get_db_connection() as conn:
         conn.execute("INSERT OR REPLACE INTO bot_state (key, value) VALUES ('system_shutdown', '0')")
         conn.execute("INSERT OR REPLACE INTO bot_state (key, value) VALUES ('scanning_active', '1')")

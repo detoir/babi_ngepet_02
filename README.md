@@ -77,8 +77,12 @@ The system runs as an integrated ASGI supervisor service (`main.py`) exposing he
 
 ## 🚀 Key Features & Upgrades in v02
 
-### 1. Dual AI Discovery Engines
-- **Macro Quant Strategist (`DeepSeek-V3`)**: Analyzes the top 35 liquid perpetual pairs, factoring in real account margin capacity, 1H/4H technical indicators (RSI, ATR, 21 EMA), BTC trend regime (ADX), weekend volatility shifts, and live macro/crypto news feeds (CoinTelegraph, CoinDesk, Alternative.me Fear & Greed Index).
+### 1. Dual AI Discovery Engines & Global Financial News Ingestion
+- **Macro Quant Strategist (`DeepSeek-V3`)**: Analyzes the top 35 liquid perpetual pairs, factoring in real account margin capacity, 1H/4H technical indicators (RSI, ATR, 21 EMA), BTC trend regime (ADX), weekend volatility shifts, and live **multi-stream global financial news**:
+  - **Global Financial Markets & Policy**: Yahoo Finance World/Business News RSS & Google News Central Bank / Inflation / FOMC Search Feeds.
+  - **Crypto Native Feeds**: CoinTelegraph & CoinDesk Major News.
+  - **Macro Sentiment**: Real-time Crypto Fear & Greed Index.
+  - **High-Impact Catalyst Detection**: Scans and flags upcoming/active central bank decisions, CPI/NFP data prints, and geopolitical shocks.
 - **Institutional Whale Microstructure Radar**: Ingests real-time Binance derivatives microstructure:
   - **Open Interest (OI)** via `/fapi/v1/openInterest`
   - **Order Book Bid/Ask Depth Ratio** via `/fapi/v1/depth` (20-level order book analysis)
@@ -97,11 +101,16 @@ The system runs as an integrated ASGI supervisor service (`main.py`) exposing he
 - Awards confluence bonuses (+0.50 EV) when both Whale Flow and Macro AI agree on an asset.
 - **Correlation Limit**: Strictly caps active trades to **maximum 2 positions per side** (e.g., max 2 LONGs or 2 SHORTs) to eliminate directional cluster risk.
 
-### 4. High-Frequency Risk Defense Sentinel (8s Radar)
+### 4. Dynamic Regime-Adaptive Risk Sentinel (8s Radar)
+- **Regime-Adaptive Auto Break-Even**:
+  - **Trending (Weekdays)**: Moves SL to BE at `+1.0R` so ordinary micro-pullbacks don't shake out winning runners.
+  - **Sideways / Chop**: Tightens Auto-BE to `+0.6R` to lock fast range scalps.
+  - **Weekend Anomaly**: Ultra-fast `+0.5R` BE trigger to defend against low-liquidity wicks.
+- **Regime-Adaptive Reversal Harvest**:
+  - **Trending**: Lets trades breathe; only exits on $\ge 1.0\%$ pullback after $\ge +2.2\%$ gain, allowing full $+3.3\%$ to $+5.5\%$ TP1/TP2 targets.
+  - **Sideways / Weekend**: Secures profits quickly on any $0.4\% - 0.5\%$ giveback after a $+1.0\%$ run.
 - **BTC Macro Shock Protocol**: If BTC experiences a sudden $\ge 2.0\%$ price shock within 5 minutes, the bot instantly cancels pending counter-trend limit orders and moves active counter-trend stops to Break-Even.
-- **Auto Break-Even**: Automatically trails Stop-Loss to **Entry + 0.15% (Break-Even + Fees)** when the position reaches $+0.6\text{R}$.
-- **Sudden Reversal / Peak Giveback Exit**: If an open position gains $\ge +1.2\%$ and retraces $\ge 40\%$ from its high (or gains $\ge +2.5\%$ and pulls back $\ge 1.0\%$), the Sentinel harvests profit immediately before the market turns negative.
-- **Stagnation Trap Exit**: Flags positions stuck in negative territory ($\le -1.5\%$) for over 3 hours (`STAGNATION_MINS`).
+- **Stagnation Trap Exit**: Adaptive timeout (180m in trend, 90m in chop, 60m in weekend) flags dead trades.
 - **Symbol Cooldown**: Positions stopped out receive a mandatory 4-hour cooldown lock to prevent revenge trading.
 
 ### 5. Automated Audit Ledger & CSV Export
@@ -410,17 +419,21 @@ $$\text{EV} = (\text{Quant Score} \times \text{Gain}_{\text{TP1}}\%) - ((1.0 - \
 
 ---
 
-### 5. Sentinel Risk Defense Trigger Thresholds
+### 5. Sentinel Dynamic Regime Risk Trigger Thresholds
 Executed in real-time every 8 seconds via `sentinel.py`:
 - **BTC Flash Shock Trigger:**
   - $\pm 2.0\%$ price shift within $\le 300$ seconds (5 minutes).
   - *Action:* Automatically cancels opposing Stage 0 limit orders; tightens opposing Stage 1+ open positions to Break-Even.
-- **Auto Break-Even Trigger:**
-  - Reaching $+0.6\text{R}$ gain locks Stop-Loss to $\text{Entry} \times 1.0015$ (LONG) or $\text{Entry} \times 0.9985$ (SHORT), covering $0.15\%$ taker fees.
-- **Sudden Reversal / Peak Giveback Triggers:**
-  - *Condition A:* Peak gain $\ge +1.2\%$, retraces $\ge 40\%$ from peak, pullback $\ge 0.6\%$, and net PnL $> 0.3\%$.
-  - *Condition B:* Peak gain $\ge +2.5\%$, retraces $\ge 1.0\%$ from peak.
-  - *Action:* Immediate emergency market exit to secure accrued profits before reversal worsens.
+- **Regime-Adaptive Auto Break-Even:**
+  - **Trending Regime (Weekdays):** Triggers at $+1.0\text{R}$ gain. Moves Stop-Loss to $\text{Entry} \pm 0.15\%$ (covering taker fees) without choking normal micro-retracements.
+  - **Sideways / Chop Regime:** Triggers early at $+0.6\text{R}$ gain.
+  - **Weekend Anomaly Regime:** Triggers immediately at $+0.5\text{R}$ gain.
+- **Regime-Adaptive Sudden Reversal / Peak Harvest:**
+  - **Trending Regime:** Exits if peak gain $\ge +2.2\%$ and pullbacks $\ge 1.0\%$ (or peak $\ge +2.8\%$ with $\ge 1.2\%$ giveback), protecting big runners while letting TP1 (+1.2R, $\approx +3.3\%$) execute cleanly.
+  - **Sideways Regime:** Exits if peak gain $\ge +1.4\%$ and pullbacks $\ge 0.5\%$.
+  - **Weekend Anomaly:** Exits aggressively if peak gain $\ge +1.0\%$ and pullbacks $\ge 0.4\%$.
+- **Adaptive Stagnation Timeout:**
+  - 180 minutes in Trending, 90 minutes in Sideways Chop, and 60 minutes in Weekend Anomaly.
 - **Symbol Cooldown Duration:**
   - 4 hours timeout applied to any asset that triggers its Stop-Loss, preventing revenge re-entries.
 - **Circuit Breaker Timeout:**
@@ -428,10 +441,13 @@ Executed in real-time every 8 seconds via `sentinel.py`:
 
 ---
 
-### 6. Weekend Regime Schedule
-Checked continuously via `is_weekend_regime()`:
-- **Active Hours:** Friday 22:00 UTC through Sunday 22:00 UTC (aligning with CME Futures weekend closure and reduced institutional liquidity).
-- **Enforcement:** Strictly disables `TREND_MOMENTUM` breakout strategies. Forces `SWEEP_REVERSION` (fading range boundaries).
+### 6. Weekend Regime Schedule & Global Financial News Ingestion
+- **Weekend Anomaly Active Hours:** Friday 22:00 UTC through Sunday 22:00 UTC (aligning with CME Futures weekend closure and reduced institutional liquidity).
+- **Enforcement:** Strictly disables `TREND_MOMENTUM` breakout strategies. Forces `SWEEP_REVERSION` (fading range boundaries) and tighter profit preservation stops.
+- **Global Financial News Ingestion:**
+  - Real-time RSS scraping of Yahoo Finance Top Business News and Google News Macro / Fed Search feeds.
+  - Automatic keyword detection for high-impact macroeconomic catalysts (`FOMC`, `FED`, `RATE HIKE/CUT`, `POWELL`, `CPI`, `INFLATION`, `PAYROLLS`, `NFP`, `WAR`, `TARIFFS`).
+  - Automatically classifies market sentiment and directs DeepSeek AI to avoid counter-trend exposures during high-volatility events.
 
 ---
 
