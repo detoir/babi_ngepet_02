@@ -547,7 +547,7 @@ def analyze_macro_universe_with_ai(market_universe: list, live_news: str, btc_re
     {active_pos_section}
 
     [PENDING WATCHLIST & LIMIT ORDERS AUDIT (Stage 0 - Review for Invalidation)]
-    Format: [{"id": id, "symbol": sym, "action": act, "planned_entry": entry, "curr_price": curr_price, "dist_to_entry_pct": dist_pct, "thesis": thesis, "pending_mins": mins, "order_id": order_id}]
+    Format: [id, symbol, action, planned_entry, curr_price, dist_to_entry_pct, thesis, pending_mins, order_id]
     {pending_watch_section}
 
     [REAL-TIME MICROSTRUCTURE UNIVERSE (Top 35 Liquid Perps)]
@@ -661,7 +661,7 @@ def analyze_whale_microstructure_with_ai(market_universe: list, btc_regime: dict
     {active_pos_section}
 
     [PENDING WATCHLIST & LIMIT ORDERS AUDIT (Stage 0 - Review for Invalidation)]
-    Format: [{"id": id, "symbol": sym, "action": act, "planned_entry": entry, "curr_price": curr_price, "dist_to_entry_pct": dist_pct, "thesis": thesis, "pending_mins": mins, "order_id": order_id}]
+    Format: [id, symbol, action, planned_entry, curr_price, dist_to_entry_pct, thesis, pending_mins, order_id]
     {pending_watch_section}
 
     [NATIVE BINANCE DERIVATIVES MICROSTRUCTURE]
