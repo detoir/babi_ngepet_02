@@ -102,21 +102,28 @@ The system runs as an integrated ASGI supervisor service (`main.py`) exposing he
 - **Correlation Limit**: Strictly caps active trades to **maximum 2 positions per side** (e.g., max 2 LONGs or 2 SHORTs) to eliminate directional cluster risk.
 
 ### 4. Dynamic Regime-Adaptive Risk Sentinel (8s Radar)
-- **Regime-Adaptive Auto Break-Even**:
-  - **Trending (Weekdays)**: Moves SL to BE at `+1.0R` so ordinary micro-pullbacks don't shake out winning runners.
-  - **Sideways / Chop**: Tightens Auto-BE to `+0.6R` to lock fast range scalps.
-  - **Weekend Anomaly**: Ultra-fast `+0.5R` BE trigger to defend against low-liquidity wicks.
+- **Regime-Adaptive Auto Break-Even & 33% Milestone Scale-Out**:
+  - **Trending (Weekdays)**: At `+1.0R`, banks **33% into realized cash profit** immediately and moves SL on remaining 67% to BE (`entry * 1.0015` / `0.9985`), guaranteeing cash in hand so winning trades never return to scratch.
+  - **Sideways / Chop**: Tightens Auto-BE milestone to `+0.6R` with 33% banked to lock fast range scalps.
+  - **Weekend Anomaly**: Ultra-fast `+0.5R` trigger with 33% banked to defend against low-liquidity wicks.
+- **Dynamic Tiered Trailing Profit Floors**:
+  - Automatically ratchets `current_sl` upwards as unrealized peak gains expand:
+    - Peak gain $\ge +1.5\% \implies$ Stop-Loss trailed to lock in at least **$+0.6\%$ profit floor**.
+    - Peak gain $\ge +2.2\% \implies$ Stop-Loss trailed to lock in at least **$+1.2\%$ profit floor**.
+    - Peak gain $\ge +3.0\% \implies$ Stop-Loss trailed to lock in at least **$+2.0\%$ profit floor**.
 - **Regime-Adaptive Reversal Harvest**:
   - **Trending**: Lets trades breathe; only exits on $\ge 1.0\%$ pullback after $\ge +2.2\%$ gain, allowing full $+3.3\%$ to $+5.5\%$ TP1/TP2 targets.
   - **Sideways / Weekend**: Secures profits quickly on any $0.4\% - 0.5\%$ giveback after a $+1.0\%$ run.
+- **Accurate Simulation Execution**: In `SIMULATION` mode, stop hits execute at the exact resting order price (`current_sl`), eliminating artificial 8-second polling wick latency.
 - **BTC Macro Shock Protocol**: If BTC experiences a sudden $\ge 2.0\%$ price shock within 5 minutes, the bot instantly cancels pending counter-trend limit orders and moves active counter-trend stops to Break-Even.
 - **Stagnation Trap Exit**: Adaptive timeout (180m in trend, 90m in chop, 60m in weekend) flags dead trades.
 - **Symbol Cooldown**: Positions stopped out receive a mandatory 4-hour cooldown lock to prevent revenge trading.
 
-### 5. AI Watchlist Applicability & Invalidation Audit
+### 5. AI Watchlist Applicability & Active Position Reversal Audit
 - **Pending Order Review Engine**: During every hourly AI scan, the system passes all pending Stage 0 limit orders (symbol, planned entry, current mark, distance %, elapsed pending time, original thesis) directly into the DeepSeek AI prompt.
-- **Dynamic Invalidation (`CANCEL_INVALID`)**: If the technical thesis has deteriorated, price has moved too far away without filling, order book depth flipped, or macro sentiment invalidated the setup, DeepSeek AI commands `CANCEL_INVALID`.
-- **Automated Order Cleanup**: Automatically cancels the live pending limit order on Binance, updates SQLite status to `INVALIDATED`, sends a Telegram notification, and frees watchlist capacity for new $+EV$ setups.
+- **Dynamic Invalidation (`CANCEL_INVALID`)**: If the technical thesis has deteriorated, price has moved too far away without filling, order book depth flipped, or macro sentiment invalidated the setup, DeepSeek AI commands `CANCEL_INVALID` and cancels the Binance order.
+- **Active Position Reversal Audit**: All active positions (Stage 1+) are evaluated hourly by both Macro and Whale AI (`[ACTIVE POSITIONS - REVERSAL AUDIT]`). If sudden distribution or macro trend breakdown is detected, DeepSeek issues `HARVEST_NOW` (immediate profit preservation exit) or `TIGHTEN_SL` (defensive stop adjustment).
+- **Anti-Chase Pullback Limit Pricing**: For extended tokens ($> +3.5\%$ 24h change for LONGs or $< -4.0\%$ for SHORTs), entry levels require deeper discount pullbacks ($0.5\% - 1.0\%$) into EMA21 support/resistance rather than chasing shallow tops.
 
 ### 6. Automated Audit Ledger & CSV Export
 - `/report` command generates a comprehensive monthly performance audit (win rate, net realized PnL, active/pending counts) and immediately generates and uploads a downloadable `.csv` trade ledger directly to Telegram.
@@ -131,7 +138,7 @@ The system runs as an integrated ASGI supervisor service (`main.py`) exposing he
 │  • Binance Perpetual Tickers (> $1M 24h Vol)                                          │
 │  • Microstructure: 20-Level Depth Ratio, Open Interest, Top Trader Long/Short Ratio    │
 │  • BTC 1H ADX Regime & 24h Delta                                                       │
-│  • Real-Time Macro RSS (CoinTelegraph, CoinDesk) & Crypto Fear & Greed Index           │
+│  • Real-Time Macro RSS (Yahoo Finance, Google News, CoinTelegraph) & Fear/Greed Index  │
 └───────────────────────────────────────────┬────────────────────────────────────────────┘
                                             │
                                             ▼
@@ -143,7 +150,8 @@ The system runs as an integrated ASGI supervisor service (`main.py`) exposing he
 │   │  • Trend Momentum & Sweep Reversion │   │  • Liquidation Flush Shorts          │   │
 │   │  • Bearish Filter: If BTC < -0.8%   │   │  • Trapped Long / Whale Dump Filters │   │
 │   │    --> STRICTLY DISQUALIFY LONGS    │   │  • Bid-Wall Spoofing Elimination     │   │
-│   │  • Weekend Mean-Reversion Mode      │   │  • Top Trader Divergence Scoring     │   │
+│   │  • Active Position Reversal Audit   │   │  • Active Position Microstructure    │   │
+│   │  • Watchlist Invalidation Audit     │   │  • Watchlist Order Flow Audit        │   │
 │   └──────────────────┬──────────────────┘   └───────────────────┬──────────────────┘   │
 └──────────────────────┼──────────────────────────────────────────┼──────────────────────┘
                        │                                          │
@@ -152,6 +160,7 @@ The system runs as an integrated ASGI supervisor service (`main.py`) exposing he
 ┌────────────────────────────────────────────────────────────────────────────────────────┐
 │                      EXPECTED PROFIT INDEX & PORTFOLIO GUARD                           │
 │  • Compute EV = (Prob × Gain_TP1) - ((1 - Prob) × Risk)                                │
+│  • Anti-Chase Entry Discount for Extended Assets (>3.5% Chg)                           │
 │  • Confluence Bonus (+0.50 EV if Macro & Whale agree)                                  │
 │  • Dynamic Position Sizing (0.5% - 1.0% Risk of Account Balance, capped at 40% Margin) │
 │  • Correlation Filter (Max 2 Correlated Positions Per Side)                            │
@@ -168,13 +177,14 @@ The system runs as an integrated ASGI supervisor service (`main.py`) exposing he
 │                                                                                        │
 │  [STAGE 1+: ACTIVE TRADE DEFENSE]                                                      │
 │  ├── BTC Shock Move (>= 2.0% in <5m)     ──► Emergency Move SL to Break-Even           │
-│  ├── Gain Reaches +0.6R                  ──► Auto Break-Even (Entry + 0.15% Fees)     │
-│  ├── Peak Giveback (>= 40% from +1.2%+)  ──► Sudden Reversal Harvest (Market Close)    │
+│  ├── Gain Reaches +0.6R - +1.0R          ──► Bank 33% Cash + Auto Break-Even on 67%   │
+│  ├── Peak Gain >= 1.5% / 2.2% / 3.0%     ──► Ratchet Trailing Floor (+0.6% / 1.2% / 2%)│
+│  ├── Sudden Reversal (>=40% drop from PK)──► Reversal Profit Harvest (Market Close)   │
 │  ├── Stagnation (> 180m and <= -1.5%)    ──► Diagnostic Alert                          │
-│  ├── TP 1 Reached (+1.2R)                ──► Close 50% Size, SL -> Break-Even          │
-│  ├── TP 2 Reached (+2.0R)                ──► Close 30% Size, SL -> TP 1 Price          │
-│  ├── TP 3 Reached (+3.2R)                ──► Close 20% Size, Trade Completed           │
-│  └── Stop-Loss Hit                       ──► Close all, trigger 4h symbol cooldown     │
+│  ├── TP 1 Reached (+1.2R)                ──► Close 50% of Remaining, SL -> BE         │
+│  ├── TP 2 Reached (+2.0R)                ──► Close 60% of Remaining, SL -> TP 1 Price  │
+│  ├── TP 3 Reached (+3.2R)                ──► Close Remaining Runner, COMPLETED         │
+│  └── Stop-Loss Hit                       ──► Fill at SL price, 4h symbol cooldown      │
 └────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 

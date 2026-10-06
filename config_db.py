@@ -150,6 +150,8 @@ def init_db():
                 binance_tp2_id TEXT DEFAULT '',
                 binance_tp3_id TEXT DEFAULT '',
                 executed_qty REAL DEFAULT 0.0,
+                remaining_ratio REAL DEFAULT 1.0,
+                partial_realized_pnl REAL DEFAULT 0.0,
                 trading_mode TEXT DEFAULT 'SIMULATION',
                 timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
                 last_updated DATETIME DEFAULT CURRENT_TIMESTAMP
@@ -164,6 +166,8 @@ def init_db():
             ("binance_tp2_id", "TEXT DEFAULT ''"),
             ("binance_tp3_id", "TEXT DEFAULT ''"),
             ("executed_qty", "REAL DEFAULT 0.0"),
+            ("remaining_ratio", "REAL DEFAULT 1.0"),
+            ("partial_realized_pnl", "REAL DEFAULT 0.0"),
             ("trading_mode", "TEXT DEFAULT 'SIMULATION'")
         ]:
             try:

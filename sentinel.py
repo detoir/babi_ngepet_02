@@ -125,6 +125,9 @@ async def run_sentinel_cycle(session: aiohttp.ClientSession):
         stage = int(item["stage"] or 0)
         pos_size_usd = float(item["position_size_usd"] or 500.0)
         executed_qty = float(item["executed_qty"] or 0.0)
+        item_dict = dict(item)
+        remaining_ratio = float(item_dict.get("remaining_ratio", 1.0) or 1.0)
+        partial_realized_pnl = float(item_dict.get("partial_realized_pnl", 0.0) or 0.0)
         entry_order_id = str(item["binance_entry_order_id"] or "")
         sl_order_id = str(item["binance_sl_order_id"] or "")
         high_fav = float(item["highest_favorable_price"] or entry if entry > 0 else 1.0)
@@ -231,7 +234,7 @@ async def run_sentinel_cycle(session: aiohttp.ClientSession):
                 with get_db_connection() as conn:
                     conn.execute("""
                         UPDATE watched_signals 
-                        SET stage = 1, highest_favorable_price = ?, executed_qty = ?, binance_sl_order_id = ?, last_updated = CURRENT_TIMESTAMP 
+                        SET stage = 1, highest_favorable_price = ?, executed_qty = ?, remaining_ratio = 1.0, partial_realized_pnl = 0.0, binance_sl_order_id = ?, last_updated = CURRENT_TIMESTAMP 
                         WHERE id = ?
                     """, (entry, executed_qty, new_sl_id, w_id))
 
@@ -313,35 +316,92 @@ async def run_sentinel_cycle(session: aiohttp.ClientSession):
                 reversal_pullback_threshold = 1.0
                 stagnation_limit_mins = STAGNATION_MINS  # 180.0
 
-            # RULE A: ADAPTIVE AUTO BREAK-EVEN
+            # RULE A: ADAPTIVE AUTO BREAK-EVEN & 33% MILESTONE PROFIT SCALE-OUT
             risk_span = abs(entry - float(item["initial_sl"] or current_sl))
             if risk_span > 0:
                 r_gain = (curr_price - entry) / risk_span if act == "LONG" else (entry - curr_price) / risk_span
-                if r_gain >= be_r_trigger and "BE_LOCKED" not in tag_current:
+                is_milestone_banked = ("BE_LOCKED" in tag_current or "BANKED" in tag_current or remaining_ratio < 0.90)
+                if r_gain >= be_r_trigger and not is_milestone_banked:
                     be_sl = round(entry * 1.0015, 6) if act == "LONG" else round(entry * 0.9985, 6)
                     
-                    # Update Stop-Loss on Binance
+                    # Scale out milestone: Bank 33% of original position immediately into cash
+                    bank_fraction = round(remaining_ratio * 0.33, 4)
+                    banked_gain = round(bank_fraction * pnl_approx, 4)
+                    new_partial_pnl = round(partial_realized_pnl + banked_gain, 4)
+                    new_remaining_ratio = round(remaining_ratio - bank_fraction, 4)
+
+                    new_sl_id = sl_order_id
+                    if TRADING_MODE in ("LIVE", "TESTNET") and executed_qty > 0:
+                        bank_qty = executed_qty * 0.33
+                        await asyncio.to_thread(emergency_binance_market_close, sym, act, bank_qty)
+                        if sl_order_id:
+                            await asyncio.to_thread(cancel_binance_order, sym, sl_order_id)
+                        rem_qty = max(0.0, executed_qty - bank_qty)
+                        new_sl_id = await asyncio.to_thread(place_binance_stop_loss, sym, act, rem_qty, be_sl)
+                    else:
+                        rem_qty = executed_qty * 0.67 if executed_qty > 0 else 0.0
+
+                    tag_current = "🛡️ BE_LOCKED + 33% BANKED"
+                    with get_db_connection() as conn:
+                        conn.execute("""
+                            UPDATE watched_signals 
+                            SET current_sl = ?, binance_sl_order_id = ?, executed_qty = ?, remaining_ratio = ?, partial_realized_pnl = ?, movement_tag = ? 
+                            WHERE id = ?
+                        """, (be_sl, new_sl_id, rem_qty, new_remaining_ratio, new_partial_pnl, tag_current, w_id))
+                    
+                    current_sl = be_sl
+                    sl_order_id = new_sl_id
+                    executed_qty = rem_qty
+                    remaining_ratio = new_remaining_ratio
+                    partial_realized_pnl = new_partial_pnl
+                    msg = (
+                        f"🛡️ <b>BREAK-EVEN & MILESTONE PROFIT SECURED (+{be_r_trigger:.1f}R [{regime_label}])</b>\n\n"
+                        f"• <b>Contract:</b> <code>{sym}</code> ({act})\n"
+                        f"• <b>Current Mark:</b> ${curr_price:.6f} (<code>{pnl_approx:+.2f}%</code>)\n"
+                        f"• <b>Banked to Realized Cash:</b> <code>+{banked_gain:.2f}%</code> (33% scaled out)\n"
+                        f"🤖 <b>Updated Stop-Loss to Break-Even: ${be_sl:.6f}</b>.\n"
+                        f"• Trade is now completely risk-free with guaranteed cash gain."
+                    )
+                    await send_telegram_alert(session, msg)
+
+            # RULE A.2: DYNAMIC TIERED PROFIT FLOOR RATCHET
+            # As peak gain expands, ratchet current_sl up to lock in guaranteed profit floors
+            target_floor_sl = None
+            floor_label = None
+
+            if peak_gain_pct >= 3.0:
+                target_floor_sl = round(entry * 1.020, 6) if act == "LONG" else round(entry * 0.980, 6)
+                floor_label = "🔒 PROFIT_FLOOR_+2.0%"
+            elif peak_gain_pct >= 2.2:
+                target_floor_sl = round(entry * 1.012, 6) if act == "LONG" else round(entry * 0.988, 6)
+                floor_label = "🔒 PROFIT_FLOOR_+1.2%"
+            elif peak_gain_pct >= 1.5:
+                target_floor_sl = round(entry * 1.006, 6) if act == "LONG" else round(entry * 0.994, 6)
+                floor_label = "🔒 PROFIT_FLOOR_+0.6%"
+
+            if target_floor_sl is not None:
+                is_better_sl = (target_floor_sl > current_sl) if act == "LONG" else (target_floor_sl < current_sl)
+                if is_better_sl:
                     new_sl_id = sl_order_id
                     if TRADING_MODE in ("LIVE", "TESTNET") and executed_qty > 0:
                         if sl_order_id:
                             await asyncio.to_thread(cancel_binance_order, sym, sl_order_id)
-                        new_sl_id = await asyncio.to_thread(place_binance_stop_loss, sym, act, executed_qty, be_sl)
+                        new_sl_id = await asyncio.to_thread(place_binance_stop_loss, sym, act, executed_qty, target_floor_sl)
 
+                    tag_current = f"{tag_current} | {floor_label}" if ("BE_LOCKED" in tag_current or "BANKED" in tag_current) else floor_label
                     with get_db_connection() as conn:
                         conn.execute("""
                             UPDATE watched_signals 
-                            SET current_sl = ?, binance_sl_order_id = ?, movement_tag = '🛡️ BE_LOCKED' 
+                            SET current_sl = ?, binance_sl_order_id = ?, movement_tag = ? 
                             WHERE id = ?
-                        """, (be_sl, new_sl_id, w_id))
-                    current_sl = be_sl
+                        """, (target_floor_sl, new_sl_id, tag_current, w_id))
+                    current_sl = target_floor_sl
                     sl_order_id = new_sl_id
-                    tag_current = "🛡️ BE_LOCKED"
                     msg = (
-                        f"🛡️ <b>BREAK-EVEN AUTO-LOCKED (+{be_r_trigger:.1f}R Reached [{regime_label}])</b>\n\n"
+                        f"<b>{floor_label} (Peak: +{peak_gain_pct:.2f}%)</b>\n\n"
                         f"• <b>Contract:</b> <code>{sym}</code> ({act})\n"
-                        f"• <b>Current Mark:</b> ${curr_price:.6f} (<code>{pnl_approx:+.2f}%</code>)\n"
-                        f"🤖 <b>Updated Binance Stop-Loss to: ${be_sl:.6f}</b>.\n"
-                        f"• Trade is now completely risk-free."
+                        f"• <b>Current Mark:</b> ${curr_price:.6f}\n"
+                        f"🤖 <b>Ratcheted Stop-Loss to: ${current_sl:.6f}</b> (Locking guaranteed profit floor)."
                     )
                     await send_telegram_alert(session, msg)
 
@@ -355,17 +415,22 @@ async def run_sentinel_cycle(session: aiohttp.ClientSession):
                 if TRADING_MODE in ("LIVE", "TESTNET"):
                     await asyncio.to_thread(emergency_binance_market_close, sym, act, executed_qty)
 
+                exit_price = curr_price
+                exit_pnl = ((exit_price - entry) / entry * 100.0) if act == "LONG" else ((entry - exit_price) / entry * 100.0)
+                final_pnl = round(partial_realized_pnl + (remaining_ratio * exit_pnl), 2)
+
                 with get_db_connection() as conn:
                     conn.execute("""
                         UPDATE watched_signals 
-                        SET status = 'COMPLETED', realized_pnl = ?, movement_tag = '🎯 REVERSAL_HARVEST', last_updated = CURRENT_TIMESTAMP 
+                        SET status = 'COMPLETED', realized_pnl = ?, remaining_ratio = 0.0, movement_tag = '🎯 REVERSAL_HARVEST', last_updated = CURRENT_TIMESTAMP 
                         WHERE id = ?
-                    """, (pnl_approx, w_id))
+                    """, (final_pnl, w_id))
                 msg = (
                     f"💰 <b>PROFIT HARVEST: SUDDEN REVERSAL DEFENDED [{regime_label}]</b>\n\n"
                     f"• <b>Contract:</b> <code>{sym}</code> ({act})\n"
                     f"• <b>Peak Gain:</b> <code>+{peak_gain_pct:.2f}%</code>\n"
-                    f"• <b>Secured Exit:</b> ${curr_price:.6f} (<code>{pnl_approx:+.2f}%</code>)\n"
+                    f"• <b>Secured Exit:</b> ${curr_price:.6f} (<code>{exit_pnl:+.2f}%</code>)\n"
+                    f"• <b>Total Realized Trade PnL:</b> <code>{final_pnl:+.2f}%</code>\n"
                     f"• <b>Pullback from High:</b> <code>-{pullback_from_peak:.2f}%</code>\n"
                     f"🤖 <b>Closed on Binance to preserve profit before market flipped.</b>"
                 )
@@ -396,23 +461,29 @@ async def run_sentinel_cycle(session: aiohttp.ClientSession):
                 if TRADING_MODE in ("LIVE", "TESTNET"):
                     await asyncio.to_thread(emergency_binance_market_close, sym, act, executed_qty)
 
+                # In SIMULATION mode, the resting stop order executes at current_sl
+                # In LIVE/TESTNET mode, exchange execution fills at current_sl (with small slippage)
+                exit_price = current_sl if TRADING_MODE == "SIMULATION" else curr_price
+                exit_pnl = ((exit_price - entry) / entry * 100.0) if act == "LONG" else ((entry - exit_price) / entry * 100.0)
+                final_pnl = round(partial_realized_pnl + (remaining_ratio * exit_pnl), 2)
+
                 cooldown_time = (utc_now() + datetime.timedelta(hours=4)).strftime("%Y-%m-%d %H:%M:%S")
-                close_status = "COMPLETED" if pnl_approx >= 0 else "STOPPED_OUT"
+                close_status = "COMPLETED" if final_pnl >= 0 else "STOPPED_OUT"
                 with get_db_connection() as conn:
-                    conn.execute("UPDATE watched_signals SET status = ?, realized_pnl = ?, last_updated = CURRENT_TIMESTAMP WHERE id = ?", (close_status, pnl_approx, w_id))
-                    if pnl_approx < 0:
+                    conn.execute("UPDATE watched_signals SET status = ?, realized_pnl = ?, remaining_ratio = 0.0, last_updated = CURRENT_TIMESTAMP WHERE id = ?", (close_status, final_pnl, w_id))
+                    if final_pnl < 0:
                         conn.execute("INSERT OR REPLACE INTO symbol_cooldowns (symbol, cooldown_until) VALUES (?, ?)", (sym, cooldown_time))
                         conn.execute("""
                             INSERT INTO loss_diagnostics (symbol, action, entry_price, exit_price, stop_loss_price, exit_type, holding_duration_mins, market_regime, diagnostic_reason)
                             VALUES (?, ?, ?, ?, ?, 'STOP_LOSS', ?, 'UNCERTAIN', ?)
-                        """, (sym, act, entry, curr_price, current_sl, holding_mins, f"Hit SL at ${current_sl:.6f}."))
+                        """, (sym, act, entry, exit_price, current_sl, holding_mins, f"Hit SL at ${current_sl:.6f}."))
 
-                emoji = "🛑 <b>STOP-LOSS HIT ON BINANCE</b>" if pnl_approx < 0 else "🛡️ <b>BREAK-EVEN STOP TRIGGERED</b>"
+                emoji = "🛑 <b>STOP-LOSS HIT ON BINANCE</b>" if final_pnl < 0 else "🛡️ <b>BREAK-EVEN / PROFIT STOP TRIGGERED</b>"
                 msg = (
                     f"{emoji}\n\n"
                     f"• <b>Contract:</b> <code>{sym}</code> ({act})\n"
-                    f"• <b>Exit Price:</b> ${curr_price:.6f}\n"
-                    f"• <b>Result:</b> <code>{pnl_approx:+.2f}%</code>\n"
+                    f"• <b>Exit Price:</b> ${exit_price:.6f}\n"
+                    f"• <b>Total Realized Result:</b> <code>{final_pnl:+.2f}%</code>\n"
                     f"🤖 <b>Position closed and orders cleaned up on Binance.</b>"
                 )
                 await send_telegram_alert(session, msg)
@@ -423,30 +494,43 @@ async def run_sentinel_cycle(session: aiohttp.ClientSession):
                 hit_t1 = (curr_price >= t1) if act == "LONG" else (curr_price <= t1)
                 if hit_t1:
                     stage = 2
-                    be_sl = round(entry * 1.001, 6) if act == "LONG" else round(entry * 0.999, 6)
+                    be_sl = round(entry * 1.0015, 6) if act == "LONG" else round(entry * 0.9985, 6)
                     current_sl = be_sl
                     
-                    # Close 50% on Binance
+                    # Close 50% of remaining position on Binance
+                    closed_fraction = round(remaining_ratio * 0.5, 4)
+                    tp1_gain = round(closed_fraction * pnl_approx, 4)
+                    new_partial_pnl = round(partial_realized_pnl + tp1_gain, 4)
+                    new_remaining_ratio = round(remaining_ratio - closed_fraction, 4)
+
                     if TRADING_MODE in ("LIVE", "TESTNET") and executed_qty > 0:
                         half_qty = executed_qty * 0.5
                         await asyncio.to_thread(emergency_binance_market_close, sym, act, half_qty)
                         if sl_order_id:
                             await asyncio.to_thread(cancel_binance_order, sym, sl_order_id)
-                        remaining_qty = executed_qty - half_qty
+                        remaining_qty = max(0.0, executed_qty - half_qty)
                         new_sl_id = await asyncio.to_thread(place_binance_stop_loss, sym, act, remaining_qty, be_sl)
                     else:
+                        remaining_qty = executed_qty * 0.5 if executed_qty > 0 else 0.0
                         new_sl_id = sl_order_id
 
+                    tag_current = "🎯 TP1_LOCKED"
                     with get_db_connection() as conn:
                         conn.execute("""
                             UPDATE watched_signals 
-                            SET stage = 2, current_sl = ?, binance_sl_order_id = ?, highest_favorable_price = ?, last_updated = CURRENT_TIMESTAMP 
+                            SET stage = 2, current_sl = ?, binance_sl_order_id = ?, executed_qty = ?, remaining_ratio = ?, partial_realized_pnl = ?, highest_favorable_price = ?, movement_tag = ?, last_updated = CURRENT_TIMESTAMP 
                             WHERE id = ?
-                        """, (be_sl, new_sl_id, updated_high_fav, w_id))
+                        """, (be_sl, new_sl_id, remaining_qty, new_remaining_ratio, new_partial_pnl, tag_current, updated_high_fav, w_id))
+                    
+                    executed_qty = remaining_qty
+                    remaining_ratio = new_remaining_ratio
+                    partial_realized_pnl = new_partial_pnl
+                    sl_order_id = new_sl_id
                     msg = (
-                        f"🎯 <b>TP 1 HIT (+1.2R) — 50% PROFIT LOCKED</b>\n\n"
+                        f"🎯 <b>TP 1 HIT (+1.2R) — 50% OF REMAINING LOCKED</b>\n\n"
                         f"• <b>Contract:</b> <code>{sym}</code> ({act})\n"
-                        f"• <b>Current Mark:</b> ${curr_price:.6f}\n\n"
+                        f"• <b>Current Mark:</b> ${curr_price:.6f}\n"
+                        f"• <b>Banked on Leg:</b> <code>+{tp1_gain:.2f}%</code>\n\n"
                         f"🤖 <b>AUTOMATED ACTIONS EXECUTED:</b>\n"
                         f"1. <b>Closed 50% of position</b> on Binance.\n"
                         f"2. <b>Moved Stop-Loss to Break-Even: ${be_sl:.6f}</b>.\n"
@@ -461,29 +545,42 @@ async def run_sentinel_cycle(session: aiohttp.ClientSession):
                     stage = 3
                     current_sl = t1
                     
-                    # Close 30% on Binance
+                    # Close 60% of remaining position on Binance (leaving runner for TP3)
+                    closed_fraction = round(remaining_ratio * 0.6, 4)
+                    tp2_gain = round(closed_fraction * pnl_approx, 4)
+                    new_partial_pnl = round(partial_realized_pnl + tp2_gain, 4)
+                    new_remaining_ratio = round(remaining_ratio - closed_fraction, 4)
+
                     if TRADING_MODE in ("LIVE", "TESTNET") and executed_qty > 0:
-                        tp2_qty = executed_qty * 0.3
+                        tp2_qty = executed_qty * 0.6
                         await asyncio.to_thread(emergency_binance_market_close, sym, act, tp2_qty)
                         if sl_order_id:
                             await asyncio.to_thread(cancel_binance_order, sym, sl_order_id)
-                        remaining_qty = executed_qty * 0.2
+                        remaining_qty = max(0.0, executed_qty - tp2_qty)
                         new_sl_id = await asyncio.to_thread(place_binance_stop_loss, sym, act, remaining_qty, t1)
                     else:
+                        remaining_qty = executed_qty * 0.4 if executed_qty > 0 else 0.0
                         new_sl_id = sl_order_id
 
+                    tag_current = "🎯🎯 TP2_LOCKED"
                     with get_db_connection() as conn:
                         conn.execute("""
                             UPDATE watched_signals 
-                            SET stage = 3, current_sl = ?, binance_sl_order_id = ?, highest_favorable_price = ?, last_updated = CURRENT_TIMESTAMP 
+                            SET stage = 3, current_sl = ?, binance_sl_order_id = ?, executed_qty = ?, remaining_ratio = ?, partial_realized_pnl = ?, highest_favorable_price = ?, movement_tag = ?, last_updated = CURRENT_TIMESTAMP 
                             WHERE id = ?
-                        """, (t1, new_sl_id, updated_high_fav, w_id))
+                        """, (t1, new_sl_id, remaining_qty, new_remaining_ratio, new_partial_pnl, tag_current, updated_high_fav, w_id))
+                    
+                    executed_qty = remaining_qty
+                    remaining_ratio = new_remaining_ratio
+                    partial_realized_pnl = new_partial_pnl
+                    sl_order_id = new_sl_id
                     msg = (
-                        f"🎯🎯 <b>TP 2 HIT (+2.0R) — 30% PROFIT LOCKED</b>\n\n"
+                        f"🎯🎯 <b>TP 2 HIT (+2.0R) — 60% OF REMAINING LOCKED</b>\n\n"
                         f"• <b>Contract:</b> <code>{sym}</code> ({act})\n"
-                        f"• <b>Current Mark:</b> ${curr_price:.6f}\n\n"
+                        f"• <b>Current Mark:</b> ${curr_price:.6f}\n"
+                        f"• <b>Banked on Leg:</b> <code>+{tp2_gain:.2f}%</code>\n\n"
                         f"🤖 <b>AUTOMATED ACTIONS EXECUTED:</b>\n"
-                        f"1. <b>Closed 30% of position</b> on Binance.\n"
+                        f"1. <b>Closed 60% of position</b> on Binance.\n"
                         f"2. <b>Trailed Stop-Loss to TP1: ${t1:.6f}</b>."
                     )
                     await send_telegram_alert(session, msg)
@@ -495,20 +592,21 @@ async def run_sentinel_cycle(session: aiohttp.ClientSession):
                     if sl_order_id:
                         await asyncio.to_thread(cancel_binance_order, sym, sl_order_id)
                     if TRADING_MODE in ("LIVE", "TESTNET"):
-                        await asyncio.to_thread(emergency_binance_market_close, sym, act, executed_qty * 0.2)
+                        await asyncio.to_thread(emergency_binance_market_close, sym, act, executed_qty)
 
+                    final_pnl = round(partial_realized_pnl + (remaining_ratio * pnl_approx), 2)
                     with get_db_connection() as conn:
                         conn.execute("""
                             UPDATE watched_signals 
-                            SET status = 'COMPLETED', realized_pnl = ?, last_updated = CURRENT_TIMESTAMP 
+                            SET status = 'COMPLETED', realized_pnl = ?, remaining_ratio = 0.0, movement_tag = '🏆 TP3_FULL', last_updated = CURRENT_TIMESTAMP 
                             WHERE id = ?
-                        """, (pnl_approx, w_id))
+                        """, (final_pnl, w_id))
                     msg = (
                         f"🏆 <b>FULL TAKE-PROFIT ACHIEVED (+3.2R)!</b>\n\n"
                         f"• <b>Contract:</b> <code>{sym}</code> ({act})\n"
                         f"• <b>Final Mark:</b> ${curr_price:.6f}\n"
-                        f"• <b>Total Net Movement:</b> <code>{pnl_approx:+.2f}%</code>\n\n"
-                        f"🤖 <b>Closed remaining 20% on Binance. Trade complete!</b>"
+                        f"• <b>Total Net Trade Return:</b> <code>{final_pnl:+.2f}%</code>\n\n"
+                        f"🤖 <b>Closed remaining position on Binance. Trade complete!</b>"
                     )
                     await send_telegram_alert(session, msg)
                     continue

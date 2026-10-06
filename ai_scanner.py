@@ -173,7 +173,7 @@ def calculate_adx_regime(candles: list, period=14) -> dict:
     dx = (abs(plus_di - minus_di) / denom * 100.0) if denom > 0 else 0.0
     return {"regime": "TRENDING" if dx >= 25.0 else "RANGING", "adx": round(dx, 1)}
 
-def calculate_deterministic_trade_levels(price: float, atr_1h: float, direction: str, ema21_1h: float, strat_mode: str = "TREND_MOMENTUM"):
+def calculate_deterministic_trade_levels(price: float, atr_1h: float, direction: str, ema21_1h: float, strat_mode: str = "TREND_MOMENTUM", change_24h: float = 0.0):
     is_weekend = is_weekend_regime()
     is_sweep = (strat_mode == "SWEEP_REVERSION" or is_weekend)
 
@@ -197,7 +197,11 @@ def calculate_deterministic_trade_levels(price: float, atr_1h: float, direction:
     if not is_sweep:
         if direction == "SHORT":
             # For shorts: Pullback limit entry above current price to avoid shorting the exact low
-            bounce_target = min(price * 1.0035, max(price * 1.0012, ema21_1h)) if ema21_1h > price else (price * 1.0018)
+            # Anti-chase: If coin has already dumped heavily (<= -4.0%), demand a deeper bounce into resistance
+            if change_24h <= -4.0:
+                bounce_target = min(price * 1.008, max(price * 1.004, ema21_1h)) if ema21_1h > price else (price * 1.005)
+            else:
+                bounce_target = min(price * 1.0035, max(price * 1.0012, ema21_1h)) if ema21_1h > price else (price * 1.0018)
             entry = round(bounce_target, 6)
             sl = round(entry + risk_dist, 6)
             t1 = round(entry - (tp1_mult * risk_dist), 6)
@@ -205,7 +209,11 @@ def calculate_deterministic_trade_levels(price: float, atr_1h: float, direction:
             t3 = round(entry - (tp3_mult * risk_dist), 6)
         else:
             # For longs: Pullback limit entry below current price to avoid buying the exact peak
-            pullback_target = max(price * 0.9965, min(price * 0.9988, ema21_1h)) if ema21_1h < price else (price * 0.9982)
+            # Anti-chase: If coin has already pumped heavily (>= +3.5%), demand a deeper dip into discount support
+            if change_24h >= 3.5:
+                pullback_target = max(price * 0.992, min(price * 0.996, ema21_1h)) if ema21_1h < price else (price * 0.994)
+            else:
+                pullback_target = max(price * 0.9965, min(price * 0.9988, ema21_1h)) if ema21_1h < price else (price * 0.9982)
             entry = round(pullback_target, 6)
             sl = round(entry - risk_dist, 6)
             t1 = round(entry + (tp1_mult * risk_dist), 6)
@@ -803,7 +811,9 @@ async def execute_unified_hourly_discovery_pipeline(context: ContextTypes.DEFAUL
                             "peak_gain_pct": round(peak_gain, 2),
                             "pullback_from_peak": round(pullback, 2),
                             "sl_order_id": str(r["binance_sl_order_id"] or ""),
-                            "executed_qty": float(r["executed_qty"] or 0.0)
+                            "executed_qty": float(r["executed_qty"] or 0.0),
+                            "remaining_ratio": float(dict(r).get("remaining_ratio", 1.0) or 1.0),
+                            "partial_realized_pnl": float(dict(r).get("partial_realized_pnl", 0.0) or 0.0)
                         })
                 else:
                     dist_pct = round(abs(curr_price - entry) / entry * 100.0, 2) if entry > 0 else 0.0
@@ -910,15 +920,17 @@ async def execute_unified_hourly_discovery_pipeline(context: ContextTypes.DEFAUL
                 if TRADING_MODE in ("LIVE", "TESTNET"):
                     await asyncio.to_thread(emergency_binance_market_close, match_pos["symbol"], match_pos["action"], match_pos["executed_qty"])
 
+                final_pnl = round(match_pos["partial_realized_pnl"] + (match_pos["remaining_ratio"] * match_pos["pnl_pct"]), 2)
                 with get_db_connection() as conn:
-                    conn.execute("UPDATE watched_signals SET status = 'COMPLETED', realized_pnl = ?, movement_tag = '🎯 AI_REVERSAL_HARVEST', last_updated = CURRENT_TIMESTAMP WHERE id = ?", (match_pos["pnl_pct"], match_pos["id"]))
+                    conn.execute("UPDATE watched_signals SET status = 'COMPLETED', realized_pnl = ?, remaining_ratio = 0.0, movement_tag = '🎯 AI_REVERSAL_HARVEST', last_updated = CURRENT_TIMESTAMP WHERE id = ?", (final_pnl, match_pos["id"]))
 
-                log_event("INFO", "AI_REVERSAL", f"Emergency profit harvested on {d_sym}: {match_pos['pnl_pct']:+.2f}%. Reason: {d_reason}")
+                log_event("INFO", "AI_REVERSAL", f"Emergency profit harvested on {d_sym}: {final_pnl:+.2f}%. Reason: {d_reason}")
                 if chat_id and context:
                     msg = (
                         f"💰 <b>AI PROFIT HARVEST: REVERSAL DEFENSE</b>\n\n"
                         f"• <b>Contract:</b> <code>{match_pos['symbol']}</code> ({match_pos['action']})\n"
-                        f"• <b>Secured Profit:</b> <code>{match_pos['pnl_pct']:+.2f}%</code>\n"
+                        f"• <b>Exit Mark:</b> ${match_pos['curr_price']:.6f} (<code>{match_pos['pnl_pct']:+.2f}%</code>)\n"
+                        f"• <b>Total Realized Trade PnL:</b> <code>{final_pnl:+.2f}%</code>\n"
                         f"• <b>AI Diagnostic:</b> <i>{html.escape(d_reason)}</i>\n"
                         f"🤖 <b>Closed immediately on Binance to protect profit.</b>"
                     )
@@ -1009,7 +1021,7 @@ async def execute_unified_hourly_discovery_pipeline(context: ContextTypes.DEFAUL
             if quant_score < CONFIDENCE_THRESHOLD:
                 continue
 
-            levels = calculate_deterministic_trade_levels(curr_price, atr_1h, act, ema21_1h, cand["strategy_mode"])
+            levels = calculate_deterministic_trade_levels(curr_price, atr_1h, act, ema21_1h, cand["strategy_mode"], change_24h=chg)
             
             # Expected Profit Index formula: EV = (Prob * Gain_TP1) - ((1 - Prob) * Risk)
             gain_tp1_pct = abs(levels["t1"] - levels["entry"]) / levels["entry"] * 100.0 if levels["entry"] > 0 else 0.0
