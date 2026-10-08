@@ -129,8 +129,13 @@ async def run_sentinel_cycle(session: aiohttp.ClientSession):
         remaining_ratio = float(item_dict.get("remaining_ratio", 1.0) or 1.0)
         partial_realized_pnl = float(item_dict.get("partial_realized_pnl", 0.0) or 0.0)
         entry_order_id = str(item["binance_entry_order_id"] or "")
-        sl_order_id = str(item["binance_sl_order_id"] or "")
-        high_fav = float(item["highest_favorable_price"] or entry if entry > 0 else 1.0)
+        try:
+            high_fav = float(item["highest_favorable_price"] or entry if entry > 0 else 1.0)
+        except (ValueError, TypeError):
+            high_fav = entry if entry > 0 else 1.0
+            corrupt_val = str(item["highest_favorable_price"] or "")
+            with get_db_connection() as conn_repair:
+                conn_repair.execute("UPDATE watched_signals SET highest_favorable_price = ?, movement_tag = ? WHERE id = ?", (high_fav, corrupt_val or "🎯 TP1_LOCKED", w_id))
         tag_current = item["movement_tag"] or ""
         speed_tag = item["trade_speed"] or "FAST TRADE"
 
@@ -520,7 +525,7 @@ async def run_sentinel_cycle(session: aiohttp.ClientSession):
                             UPDATE watched_signals 
                             SET stage = 2, current_sl = ?, binance_sl_order_id = ?, executed_qty = ?, remaining_ratio = ?, partial_realized_pnl = ?, highest_favorable_price = ?, movement_tag = ?, last_updated = CURRENT_TIMESTAMP 
                             WHERE id = ?
-                        """, (be_sl, new_sl_id, remaining_qty, new_remaining_ratio, new_partial_pnl, tag_current, updated_high_fav, w_id))
+                        """, (be_sl, new_sl_id, remaining_qty, new_remaining_ratio, new_partial_pnl, updated_high_fav, tag_current, w_id))
                     
                     executed_qty = remaining_qty
                     remaining_ratio = new_remaining_ratio
@@ -568,7 +573,7 @@ async def run_sentinel_cycle(session: aiohttp.ClientSession):
                             UPDATE watched_signals 
                             SET stage = 3, current_sl = ?, binance_sl_order_id = ?, executed_qty = ?, remaining_ratio = ?, partial_realized_pnl = ?, highest_favorable_price = ?, movement_tag = ?, last_updated = CURRENT_TIMESTAMP 
                             WHERE id = ?
-                        """, (t1, new_sl_id, remaining_qty, new_remaining_ratio, new_partial_pnl, tag_current, updated_high_fav, w_id))
+                        """, (t1, new_sl_id, remaining_qty, new_remaining_ratio, new_partial_pnl, updated_high_fav, tag_current, w_id))
                     
                     executed_qty = remaining_qty
                     remaining_ratio = new_remaining_ratio

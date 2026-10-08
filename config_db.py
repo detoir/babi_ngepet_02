@@ -174,6 +174,16 @@ def init_db():
                 c.execute(f"ALTER TABLE watched_signals ADD COLUMN {col_name} {col_def};")
             except sqlite3.OperationalError:
                 pass
+
+        # Self-healing migration: Repair rows where highest_favorable_price was saved as text (e.g. TP tags)
+        try:
+            c.execute("""
+                UPDATE watched_signals 
+                SET movement_tag = highest_favorable_price, highest_favorable_price = entry_limit 
+                WHERE typeof(highest_favorable_price) = 'text' AND (highest_favorable_price LIKE '%TP%' OR highest_favorable_price LIKE '%LOCK%');
+            """)
+        except Exception:
+            pass
         c.execute("""
             CREATE TABLE IF NOT EXISTS loss_diagnostics (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,

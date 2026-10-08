@@ -795,7 +795,10 @@ async def execute_unified_hourly_discovery_pipeline(context: ContextTypes.DEFAUL
                 mins_elapsed = round((utc_now() - created_at).total_seconds() / 60.0, 1)
 
                 if stage_val >= 1:
-                    high_fav = float(r["highest_favorable_price"] or entry)
+                    try:
+                        high_fav = float(r["highest_favorable_price"] or entry)
+                    except (ValueError, TypeError):
+                        high_fav = entry
                     if curr_price > 0 and entry > 0:
                         pnl_pct = ((curr_price - entry) / entry * 100.0) if act == "LONG" else ((entry - curr_price) / entry * 100.0)
                         peak_gain = ((high_fav - entry) / entry * 100.0) if act == "LONG" else ((entry - high_fav) / entry * 100.0)
