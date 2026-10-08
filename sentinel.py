@@ -129,6 +129,7 @@ async def run_sentinel_cycle(session: aiohttp.ClientSession):
         remaining_ratio = float(item_dict.get("remaining_ratio", 1.0) or 1.0)
         partial_realized_pnl = float(item_dict.get("partial_realized_pnl", 0.0) or 0.0)
         entry_order_id = str(item["binance_entry_order_id"] or "")
+        sl_order_id = str(item["binance_sl_order_id"] or "")
         try:
             high_fav = float(item["highest_favorable_price"] or entry if entry > 0 else 1.0)
         except (ValueError, TypeError):
@@ -138,6 +139,8 @@ async def run_sentinel_cycle(session: aiohttp.ClientSession):
                 conn_repair.execute("UPDATE watched_signals SET highest_favorable_price = ?, movement_tag = ? WHERE id = ?", (high_fav, corrupt_val or "🎯 TP1_LOCKED", w_id))
         tag_current = item["movement_tag"] or ""
         speed_tag = item["trade_speed"] or "FAST TRADE"
+        coin_trend_str = str(item["coin_trend"] or "").upper()
+        is_scalp_trade = (speed_tag == "SCALP TRADE" or "SCALP" in coin_trend_str)
 
         if entry <= 0 or current_sl <= 0:
             continue
@@ -192,9 +195,10 @@ async def run_sentinel_cycle(session: aiohttp.ClientSession):
         if stage == 0:
             created_at = parse_database_timestamp(item["timestamp"])
             minutes_pending = (utc_now() - created_at).total_seconds() / 60.0
+            pending_limit_mins = 45.0 if is_scalp_trade else (PENDING_TTL_HOURS * 60.0)
 
             # EXPIRATION WITH BINANCE CANCELLATION
-            if minutes_pending >= (PENDING_TTL_HOURS * 60.0):
+            if minutes_pending >= pending_limit_mins:
                 if entry_order_id:
                     await asyncio.to_thread(cancel_binance_order, sym, entry_order_id)
                 with get_db_connection() as conn:
@@ -204,7 +208,13 @@ async def run_sentinel_cycle(session: aiohttp.ClientSession):
                         WHERE id = ?
                     """, (w_id,))
 
-                speed_badge = "⚡ [FAST TRADE]" if speed_tag == "FAST TRADE" else "⏳ [SLOW TRADE]"
+                if is_scalp_trade:
+                    speed_badge = "⚡ [SCALP TRADE]"
+                elif speed_tag == "FAST TRADE":
+                    speed_badge = "🚀 [FAST TRADE]"
+                else:
+                    speed_badge = "⏳ [SLOW TRADE]"
+
                 expired_msg = (
                     f"⏱️ <b>SETUP EXPIRED (Unfilled Limit Order)</b>\n\n"
                     f"• <b>Contract:</b> <code>{sym}</code> ({act}) | {speed_badge}\n"
@@ -243,7 +253,21 @@ async def run_sentinel_cycle(session: aiohttp.ClientSession):
                         WHERE id = ?
                     """, (entry, executed_qty, new_sl_id, w_id))
 
-                speed_badge = "⚡ FAST TRADE" if speed_tag == "FAST TRADE" else "⏳ SLOW TRADE"
+                if is_scalp_trade:
+                    speed_badge = "⚡ SCALP SNIPER"
+                    tp_display = (
+                        f"   • TP1 (60% Size): <code>${t1:.6f}</code> (+1.0R)\n"
+                        f"   • TP2 (25% Size): <code>${t2:.6f}</code> (+1.8R)\n"
+                        f"   • TP3 (15% Size): <code>${t3:.6f}</code> (+2.6R)"
+                    )
+                else:
+                    speed_badge = "🚀 FAST TRADE" if speed_tag == "FAST TRADE" else "⏳ SLOW TRADE"
+                    tp_display = (
+                        f"   • TP1 (50% Size): <code>${t1:.6f}</code> (+1.2R)\n"
+                        f"   • TP2 (30% Size): <code>${t2:.6f}</code> (+2.0R)\n"
+                        f"   • TP3 (20% Size): <code>${t3:.6f}</code> (+3.2R)"
+                    )
+
                 exec_mode_tag = f"🤖 [AUTO-{TRADING_MODE}]" if TRADING_MODE in ("LIVE", "TESTNET") else "📋 [SIMULATION]"
                 msg = (
                     f"🟢 <b>TRADE TRIGGERED / ENTRY FILLED ({speed_badge}) {exec_mode_tag}</b>\n\n"
@@ -253,9 +277,7 @@ async def run_sentinel_cycle(session: aiohttp.ClientSession):
                     f"📋 <b>ACTIVE RISK BRACKETS:</b>\n"
                     f"1. <b>Hard Stop-Loss:</b> <code>${current_sl:.6f}</code> {'(Active on Binance)' if new_sl_id else ''}\n"
                     f"2. <b>Take-Profit Targets:</b>\n"
-                    f"   • TP1 (50% Size): <code>${t1:.6f}</code> (+1.2R)\n"
-                    f"   • TP2 (30% Size): <code>${t2:.6f}</code> (+2.0R)\n"
-                    f"   • TP3 (20% Size): <code>${t3:.6f}</code> (+3.2R)"
+                    f"{tp_display}"
                 )
                 await send_telegram_alert(session, msg)
 
@@ -298,7 +320,14 @@ async def run_sentinel_cycle(session: aiohttp.ClientSession):
             is_weekend = is_weekend_regime()
             is_sideways = ("NEUTRAL" in coin_trend_str or "CONSOLIDATION" in coin_trend_str or speed_tag == "SWEEP_REVERSION")
 
-            if is_weekend:
+            if is_scalp_trade:
+                # HIGH-SPEED SCALP SNIPER REGIME: Fast turnover, early cash harvesting
+                regime_label = "⚡ HIGH-SPEED SCALP SNIPER"
+                be_r_trigger = 0.5            # Milestone bank at +0.5R
+                reversal_min_gain = 0.85      # Catch reversals starting at +0.85%
+                reversal_pullback_threshold = 0.35
+                stagnation_limit_mins = 35.0  # Rapid capital recycling (>35m stall is closed)
+            elif is_weekend:
                 # WEEKEND ANOMALY REGIME: Low CME liquidity & erratic manipulation
                 regime_label = "WEEKEND ANOMALY"
                 be_r_trigger = 0.5
@@ -321,7 +350,7 @@ async def run_sentinel_cycle(session: aiohttp.ClientSession):
                 reversal_pullback_threshold = 1.0
                 stagnation_limit_mins = STAGNATION_MINS  # 180.0
 
-            # RULE A: ADAPTIVE AUTO BREAK-EVEN & 33% MILESTONE PROFIT SCALE-OUT
+            # RULE A: ADAPTIVE AUTO BREAK-EVEN & MILESTONE PROFIT SCALE-OUT
             risk_span = abs(entry - float(item["initial_sl"] or current_sl))
             if risk_span > 0:
                 r_gain = (curr_price - entry) / risk_span if act == "LONG" else (entry - curr_price) / risk_span
@@ -329,24 +358,25 @@ async def run_sentinel_cycle(session: aiohttp.ClientSession):
                 if r_gain >= be_r_trigger and not is_milestone_banked:
                     be_sl = round(entry * 1.0015, 6) if act == "LONG" else round(entry * 0.9985, 6)
                     
-                    # Scale out milestone: Bank 33% of original position immediately into cash
-                    bank_fraction = round(remaining_ratio * 0.33, 4)
+                    # Scale out milestone: Scalps bank 50% immediately; Swings bank 33%
+                    bank_ratio = 0.50 if is_scalp_trade else 0.33
+                    bank_fraction = round(remaining_ratio * bank_ratio, 4)
                     banked_gain = round(bank_fraction * pnl_approx, 4)
                     new_partial_pnl = round(partial_realized_pnl + banked_gain, 4)
                     new_remaining_ratio = round(remaining_ratio - bank_fraction, 4)
 
                     new_sl_id = sl_order_id
                     if TRADING_MODE in ("LIVE", "TESTNET") and executed_qty > 0:
-                        bank_qty = executed_qty * 0.33
+                        bank_qty = executed_qty * bank_ratio
                         await asyncio.to_thread(emergency_binance_market_close, sym, act, bank_qty)
                         if sl_order_id:
                             await asyncio.to_thread(cancel_binance_order, sym, sl_order_id)
                         rem_qty = max(0.0, executed_qty - bank_qty)
                         new_sl_id = await asyncio.to_thread(place_binance_stop_loss, sym, act, rem_qty, be_sl)
                     else:
-                        rem_qty = executed_qty * 0.67 if executed_qty > 0 else 0.0
+                        rem_qty = executed_qty * (1.0 - bank_ratio) if executed_qty > 0 else 0.0
 
-                    tag_current = "🛡️ BE_LOCKED + 33% BANKED"
+                    tag_current = f"🛡️ BE_LOCKED + {int(bank_ratio*100)}% BANKED"
                     with get_db_connection() as conn:
                         conn.execute("""
                             UPDATE watched_signals 
@@ -363,7 +393,7 @@ async def run_sentinel_cycle(session: aiohttp.ClientSession):
                         f"🛡️ <b>BREAK-EVEN & MILESTONE PROFIT SECURED (+{be_r_trigger:.1f}R [{regime_label}])</b>\n\n"
                         f"• <b>Contract:</b> <code>{sym}</code> ({act})\n"
                         f"• <b>Current Mark:</b> ${curr_price:.6f} (<code>{pnl_approx:+.2f}%</code>)\n"
-                        f"• <b>Banked to Realized Cash:</b> <code>+{banked_gain:.2f}%</code> (33% scaled out)\n"
+                        f"• <b>Banked to Realized Cash:</b> <code>+{banked_gain:.2f}%</code> ({int(bank_ratio*100)}% scaled out)\n"
                         f"🤖 <b>Updated Stop-Loss to Break-Even: ${be_sl:.6f}</b>.\n"
                         f"• Trade is now completely risk-free with guaranteed cash gain."
                     )
@@ -374,15 +404,30 @@ async def run_sentinel_cycle(session: aiohttp.ClientSession):
             target_floor_sl = None
             floor_label = None
 
-            if peak_gain_pct >= 3.0:
-                target_floor_sl = round(entry * 1.020, 6) if act == "LONG" else round(entry * 0.980, 6)
-                floor_label = "🔒 PROFIT_FLOOR_+2.0%"
-            elif peak_gain_pct >= 2.2:
-                target_floor_sl = round(entry * 1.012, 6) if act == "LONG" else round(entry * 0.988, 6)
-                floor_label = "🔒 PROFIT_FLOOR_+1.2%"
-            elif peak_gain_pct >= 1.5:
-                target_floor_sl = round(entry * 1.006, 6) if act == "LONG" else round(entry * 0.994, 6)
-                floor_label = "🔒 PROFIT_FLOOR_+0.6%"
+            if is_scalp_trade:
+                # High-speed scalp micro-floors
+                if peak_gain_pct >= 2.5:
+                    target_floor_sl = round(entry * 1.018, 6) if act == "LONG" else round(entry * 0.982, 6)
+                    floor_label = "🔒 SCALP_FLOOR_+1.8%"
+                elif peak_gain_pct >= 1.8:
+                    target_floor_sl = round(entry * 1.012, 6) if act == "LONG" else round(entry * 0.988, 6)
+                    floor_label = "🔒 SCALP_FLOOR_+1.2%"
+                elif peak_gain_pct >= 1.2:
+                    target_floor_sl = round(entry * 1.007, 6) if act == "LONG" else round(entry * 0.993, 6)
+                    floor_label = "🔒 SCALP_FLOOR_+0.7%"
+                elif peak_gain_pct >= 0.8:
+                    target_floor_sl = round(entry * 1.0035, 6) if act == "LONG" else round(entry * 0.9965, 6)
+                    floor_label = "🔒 SCALP_FLOOR_+0.35%"
+            else:
+                if peak_gain_pct >= 3.0:
+                    target_floor_sl = round(entry * 1.020, 6) if act == "LONG" else round(entry * 0.980, 6)
+                    floor_label = "🔒 PROFIT_FLOOR_+2.0%"
+                elif peak_gain_pct >= 2.2:
+                    target_floor_sl = round(entry * 1.012, 6) if act == "LONG" else round(entry * 0.988, 6)
+                    floor_label = "🔒 PROFIT_FLOOR_+1.2%"
+                elif peak_gain_pct >= 1.5:
+                    target_floor_sl = round(entry * 1.006, 6) if act == "LONG" else round(entry * 0.994, 6)
+                    floor_label = "🔒 PROFIT_FLOOR_+0.6%"
 
             if target_floor_sl is not None:
                 is_better_sl = (target_floor_sl > current_sl) if act == "LONG" else (target_floor_sl < current_sl)
@@ -442,7 +487,40 @@ async def run_sentinel_cycle(session: aiohttp.ClientSession):
                 await send_telegram_alert(session, msg)
                 continue
 
-            # Stagnation Defense: Adaptive time in chop
+            # Fast Scalp Stagnation Kill (Recycle capital if scalp goes nowhere after 35m)
+            if is_scalp_trade and stage == 1 and holding_mins >= stagnation_limit_mins and pnl_approx <= 0.20:
+                if sl_order_id:
+                    await asyncio.to_thread(cancel_binance_order, sym, sl_order_id)
+                if TRADING_MODE in ("LIVE", "TESTNET"):
+                    await asyncio.to_thread(emergency_binance_market_close, sym, act, executed_qty)
+
+                exit_price = curr_price
+                exit_pnl = ((exit_price - entry) / entry * 100.0) if act == "LONG" else ((entry - exit_price) / entry * 100.0)
+                final_pnl = round(partial_realized_pnl + (remaining_ratio * exit_pnl), 2)
+
+                close_status = "COMPLETED" if final_pnl >= 0 else "STOPPED_OUT"
+                with get_db_connection() as conn:
+                    conn.execute("""
+                        UPDATE watched_signals 
+                        SET status = ?, realized_pnl = ?, remaining_ratio = 0.0, movement_tag = '⚡ SCALP_STAGNATION_KILL', last_updated = CURRENT_TIMESTAMP 
+                        WHERE id = ?
+                    """, (close_status, final_pnl, w_id))
+                    conn.execute("""
+                        INSERT INTO loss_diagnostics (symbol, action, entry_price, exit_price, stop_loss_price, exit_type, holding_duration_mins, market_regime, diagnostic_reason)
+                        VALUES (?, ?, ?, ?, ?, 'SCALP_STAGNATION', ?, 'SCALP_SNIPER', ?)
+                    """, (sym, act, entry, exit_price, current_sl, holding_mins, f"Scalp stalled at {pnl_approx:+.2f}% after {holding_mins:.0f}m."))
+
+                msg = (
+                    f"⚡ <b>SCALP STAGNATION KILL ({holding_mins:.0f}m)</b>\n\n"
+                    f"• <b>Contract:</b> <code>{sym}</code> ({act})\n"
+                    f"• <b>Exit Mark:</b> ${exit_price:.6f} (<code>{exit_pnl:+.2f}%</code>)\n"
+                    f"• <b>Total Realized Trade PnL:</b> <code>{final_pnl:+.2f}%</code>\n"
+                    f"🤖 <b>Closed on Binance to recycle capital for fresh active movers.</b>"
+                )
+                await send_telegram_alert(session, msg)
+                continue
+
+            # Stagnation Defense: Adaptive time in chop (Standard Swings)
             if stage == 1 and holding_mins >= stagnation_limit_mins and pnl_approx <= STAGNATION_PNL_FLOOR and "STAGNANT" not in tag_current:
                 with get_db_connection() as conn:
                     conn.execute("UPDATE watched_signals SET movement_tag = '⚠️ STAGNANT_WARNED' WHERE id = ?", (w_id,))
@@ -502,21 +580,22 @@ async def run_sentinel_cycle(session: aiohttp.ClientSession):
                     be_sl = round(entry * 1.0015, 6) if act == "LONG" else round(entry * 0.9985, 6)
                     current_sl = be_sl
                     
-                    # Close 50% of remaining position on Binance
-                    closed_fraction = round(remaining_ratio * 0.5, 4)
+                    # Close position on Binance: 60% for Scalp, 50% for Swing
+                    tp1_close_ratio = 0.60 if is_scalp_trade else 0.50
+                    closed_fraction = round(remaining_ratio * tp1_close_ratio, 4)
                     tp1_gain = round(closed_fraction * pnl_approx, 4)
                     new_partial_pnl = round(partial_realized_pnl + tp1_gain, 4)
                     new_remaining_ratio = round(remaining_ratio - closed_fraction, 4)
 
                     if TRADING_MODE in ("LIVE", "TESTNET") and executed_qty > 0:
-                        half_qty = executed_qty * 0.5
-                        await asyncio.to_thread(emergency_binance_market_close, sym, act, half_qty)
+                        close_qty = executed_qty * tp1_close_ratio
+                        await asyncio.to_thread(emergency_binance_market_close, sym, act, close_qty)
                         if sl_order_id:
                             await asyncio.to_thread(cancel_binance_order, sym, sl_order_id)
-                        remaining_qty = max(0.0, executed_qty - half_qty)
+                        remaining_qty = max(0.0, executed_qty - close_qty)
                         new_sl_id = await asyncio.to_thread(place_binance_stop_loss, sym, act, remaining_qty, be_sl)
                     else:
-                        remaining_qty = executed_qty * 0.5 if executed_qty > 0 else 0.0
+                        remaining_qty = executed_qty * (1.0 - tp1_close_ratio) if executed_qty > 0 else 0.0
                         new_sl_id = sl_order_id
 
                     tag_current = "🎯 TP1_LOCKED"
@@ -531,13 +610,14 @@ async def run_sentinel_cycle(session: aiohttp.ClientSession):
                     remaining_ratio = new_remaining_ratio
                     partial_realized_pnl = new_partial_pnl
                     sl_order_id = new_sl_id
+                    tp1_badge = "(+1.0R SCALP TP1)" if is_scalp_trade else "(+1.2R)"
                     msg = (
-                        f"🎯 <b>TP 1 HIT (+1.2R) — 50% OF REMAINING LOCKED</b>\n\n"
+                        f"🎯 <b>TP 1 HIT {tp1_badge} — {int(tp1_close_ratio*100)}% OF REMAINING LOCKED</b>\n\n"
                         f"• <b>Contract:</b> <code>{sym}</code> ({act})\n"
                         f"• <b>Current Mark:</b> ${curr_price:.6f}\n"
                         f"• <b>Banked on Leg:</b> <code>+{tp1_gain:.2f}%</code>\n\n"
                         f"🤖 <b>AUTOMATED ACTIONS EXECUTED:</b>\n"
-                        f"1. <b>Closed 50% of position</b> on Binance.\n"
+                        f"1. <b>Closed {int(tp1_close_ratio*100)}% of position</b> on Binance.\n"
                         f"2. <b>Moved Stop-Loss to Break-Even: ${be_sl:.6f}</b>.\n"
                         f"• Trade is completely risk-free."
                     )

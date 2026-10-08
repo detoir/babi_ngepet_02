@@ -173,9 +173,44 @@ def calculate_adx_regime(candles: list, period=14) -> dict:
     dx = (abs(plus_di - minus_di) / denom * 100.0) if denom > 0 else 0.0
     return {"regime": "TRENDING" if dx >= 25.0 else "RANGING", "adx": round(dx, 1)}
 
-def calculate_deterministic_trade_levels(price: float, atr_1h: float, direction: str, ema21_1h: float, strat_mode: str = "TREND_MOMENTUM", change_24h: float = 0.0):
+def calculate_deterministic_trade_levels(price: float, atr_1h: float, direction: str, ema21_1h: float, strat_mode: str = "TREND_MOMENTUM", change_24h: float = 0.0, is_scalp: bool = False):
     is_weekend = is_weekend_regime()
     is_sweep = (strat_mode == "SWEEP_REVERSION" or is_weekend)
+
+    if is_scalp or strat_mode == "SCALP":
+        # High-Speed Scalp Sniper: Compressed risk distance (0.8% - 1.3%)
+        raw_risk = atr_1h * 0.75
+        risk_dist = max(raw_risk, price * 0.008)
+        risk_dist = min(risk_dist, price * 0.013)
+
+        # Scalp targets: TP1 at 1.0R (+0.8% to +1.3%), TP2 at 1.8R, TP3 at 2.6R
+        tp1_mult = 1.0
+        tp2_mult = 1.8
+        tp3_mult = 2.6
+
+        # Fast near-market limit entry (0.15% offset for rapid execution)
+        if direction == "LONG":
+            entry = round(price * 0.9985, 6)
+            sl = round(entry - risk_dist, 6)
+            t1 = round(entry + (tp1_mult * risk_dist), 6)
+            t2 = round(entry + (tp2_mult * risk_dist), 6)
+            t3 = round(entry + (tp3_mult * risk_dist), 6)
+        else:
+            entry = round(price * 1.0015, 6)
+            sl = round(entry + risk_dist, 6)
+            t1 = round(entry - (tp1_mult * risk_dist), 6)
+            t2 = round(entry - (tp2_mult * risk_dist), 6)
+            t3 = round(entry - (tp3_mult * risk_dist), 6)
+
+        return {
+            "entry": entry,
+            "sl": sl,
+            "t1": t1,
+            "t2": t2,
+            "t3": t3,
+            "risk_dist": risk_dist,
+            "risk_pct": round((risk_dist / entry) * 100.0, 2) if entry > 0 else 1.0
+        }
 
     # Dynamic risk distance (1.5% to 2.8% max)
     raw_risk = atr_1h * 1.5
@@ -279,11 +314,12 @@ def calculate_objective_quant_score(direction: str, rsi_1h: float, rsi_4h: float
 
     return round(max(0.10, min(0.95, score)), 2)
 
-def calculate_dynamic_position_size(quant_score: float, risk_pct: float, balance=ACCOUNT_BALANCE_SIMULATED) -> float:
+def calculate_dynamic_position_size(quant_score: float, risk_pct: float, balance=ACCOUNT_BALANCE_SIMULATED, is_scalp: bool = False) -> float:
     risk_alloc = 0.0050 if quant_score < 0.78 else (0.0075 if quant_score < 0.85 else 0.0100)
     risk_dollars = balance * risk_alloc
     pos_size = (risk_dollars / (risk_pct / 100.0)) * 2.0 if risk_pct > 0 else 500.0
-    return round(min(pos_size, balance * 0.40), 0)
+    cap_fraction = 0.50 if is_scalp else 0.40
+    return round(min(pos_size, balance * cap_fraction), 0)
 
 async def fetch_microstructure_data_async(session: aiohttp.ClientSession, symbol_clean: str) -> dict:
     oi_url = f"https://fapi.binance.com/fapi/v1/openInterest?symbol={symbol_clean}"
@@ -735,6 +771,92 @@ def analyze_whale_microstructure_with_ai(market_universe: list, btc_regime: dict
         log_event("ERROR", "WHALE_SCANNER", f"AI Whale Scan Error: {e}")
         return {"action": "HOLD", "whale_setups": [], "active_position_directives": [], "watchlist_directives": [], "whale_verdict": f"AI Parsing Error: {e}"}
 
+def analyze_scalp_opportunities_with_ai(market_universe: list, btc_regime: dict, btc_24h_pct: float, capital_info: dict = None, active_positions: list = None, pending_watchlist: list = None) -> dict:
+    top_scalp_candidates = [m for m in market_universe if m.get("v_m", 0) >= 10.0][:25]
+    if not top_scalp_candidates:
+        top_scalp_candidates = market_universe[:20]
+
+    cap_total = capital_info.get("total", 10000.0) if capital_info else 10000.0
+    cap_free = capital_info.get("free", 8000.0) if capital_info else 8000.0
+
+    prompt = f"""
+    You are the Chief High-Speed Scalp Sniper Specialist for {BOT_NAME}.
+    PRIMARY OBJECTIVE:
+    Identify ultra-fast, high-probability SCALP opportunities (5m-15m micro-swings) with MAXIMAL EXPECTED PROFIT (+EV).
+    This evaluation runs strictly on the HOURLY discovery cycle to capture the highest-velocity, highest-profit scalp setups for the upcoming hour.
+
+    [SCALP PROFIT PRIORITIZATION DIRECTIVE]
+    - PRIORITIZE MAXIMUM DOLLAR PROFIT: Focus exclusively on tokens where high order flow momentum, depth imbalance, and volatility provide the largest DOLLAR GAIN potential.
+    - DISQUALIFY DEAD CHOP: Reject low-volatility, low-profit ranging assets where slippage or fees erode edge.
+    - HIGH CONVICTION ONLY: Require clear institutional order book backing (bid/ask depth skew >= 1.30 for LONG, <= 0.70 for SHORT).
+
+    [SCALP TRADING SPECIFICATIONS]
+    - Horizon: High-velocity turnover (< 45 minutes pending, rapid fills).
+    - Profit Targets: TP1 (+1.0R, ~+0.8% to +1.3%), TP2 (+1.8R), TP3 (+2.6R).
+    - Stop-Loss: Tight micro-stop (0.8% to 1.3% risk distance).
+    - Capital Efficiency: 2.0x-2.5x larger position size with 50% early cash banking at +0.5R milestone.
+
+    [PORTFOLIO CAPITAL ANCHOR]
+    • Total Balance: ${cap_total:.2f} USD | Free Margin: ${cap_free:.2f} USD
+
+    [BTC HOURLY MACRO ANCHOR]
+    Regime: {btc_regime.get('regime')} | ADX: {btc_regime.get('adx')} | BTC 24h Change: {btc_24h_pct:+.2f}%
+
+    [TOP LIQUID PERPETUALS FOR SCALPING]
+    Format: [s: symbol, p: price, c: 24h %, v_m: volume M$, fr: funding %, oi_m: Open Interest M$, book_ratio: bid/ask depth, whale_ls_ratio: top trader long/short ratio, hi: 24h high, lo: 24h low]
+    {json.dumps(top_scalp_candidates)}
+
+    SCALP SNIPER CRITERIA:
+    1. ORDERBOOK IMBALANCE:
+       - book_ratio >= 1.30 with flat/healthy funding -> High-conviction LONG scalp.
+       - book_ratio <= 0.70 with negative/flat funding -> High-conviction SHORT scalp.
+    2. LIQUIDITY SWEEP & REVERSAL:
+       - Asset tested 24h high/low with top accounts overextended (whale_ls_ratio > 2.0 or < 0.6) -> Fast mean-reversion scalp.
+    3. MOMENTUM THRUST & PROFIT EXPANSION:
+       - High volume (v_m > $25M) breaking out in alignment with BTC micro-trend.
+    4. NO EXTENDED CHASE:
+       - Disqualify assets already up > +10% or down < -10% in 24h (capitulation/exhaustion danger).
+
+    SCALPING PROBABILITY ASSESSMENT:
+    For each setup, compute an explicit "scalp_probability" integer between 70 and 95 based on technical edge confluence, book depth skew, and market alignment.
+    Only select setups with scalp_probability >= 75.
+
+    Respond ONLY in strict JSON:
+    {{
+        "action": "TRADE" | "HOLD",
+        "scalp_setups": [
+            {{
+                "symbol": "SYMBOL/USDT:USDT",
+                "action": "LONG" | "SHORT",
+                "scalp_probability": 85,
+                "expected_profit_potential": "VERY_HIGH" | "HIGH",
+                "scalp_type": "ORDERBOOK_IMBALANCE" | "LIQUIDITY_SWEEP" | "VOLATILITY_EXPANSION",
+                "trade_speed": "SCALP TRADE",
+                "coin_trend": "SCALP_SNIPER",
+                "scalp_thesis": "1-sentence high-speed scalp justification citing book depth, momentum, and profit edge"
+            }}
+        ],
+        "scalp_verdict": "1-sentence summary of hourly scalp market conditions"
+    }}
+    """
+
+    try:
+        t0 = time.time()
+        res = ai_client.chat.completions.create(
+            model="deepseek-chat",
+            messages=[{"role": "user", "content": prompt}],
+            response_format={"type": "json_object"},
+            temperature=0.15
+        )
+        duration_ms = (time.time() - t0) * 1000.0
+        raw_response = res.choices[0].message.content or "{}"
+        parsed = extract_clean_json(raw_response)
+        log_ai_interaction("SCALP_SNIPER", "HIGH_SPEED_SCALP_SCAN", prompt, raw_response, duration_ms)
+        return parsed
+    except Exception as e:
+        log_event("ERROR", "SCALP_SCANNER", f"AI Scalp Scan Error: {e}")
+        return {"action": "HOLD", "scalp_setups": [], "scalp_verdict": f"AI Parsing Error: {e}"}
+
 # ==============================================================================
 # PIPELINES
 # ==============================================================================
@@ -845,7 +967,7 @@ async def execute_unified_hourly_discovery_pipeline(context: ContextTypes.DEFAUL
         btc_regime = calculate_adx_regime(btc_candles) if btc_candles else {"regime": "RANGING", "adx": 18.0}
         btc_24h_pct = float(btc_ticker.get("percentage") or 0.0)
 
-        # 4. Concurrently Run AI Macro and AI Whale Discovery Prompts
+        # 4. Concurrently Run AI Macro, AI Whale, and AI Scalp Discovery Prompts
         macro_task = asyncio.to_thread(
             analyze_macro_universe_with_ai,
             market_universe, live_news, btc_regime, btc_24h_pct, capital_info, active_positions_payload, pending_watchlist_payload
@@ -854,8 +976,12 @@ async def execute_unified_hourly_discovery_pipeline(context: ContextTypes.DEFAUL
             analyze_whale_microstructure_with_ai,
             market_universe, btc_regime, btc_24h_pct, capital_info, active_positions_payload, pending_watchlist_payload
         )
+        scalp_task = asyncio.to_thread(
+            analyze_scalp_opportunities_with_ai,
+            market_universe, btc_regime, btc_24h_pct, capital_info, active_positions_payload, pending_watchlist_payload
+        )
 
-        macro_decision, whale_decision = await asyncio.gather(macro_task, whale_task)
+        macro_decision, whale_decision, scalp_decision = await asyncio.gather(macro_task, whale_task, scalp_task)
 
         # 5. Apply AI Watchlist Applicability Directives (Purge Invalid Pending Setups)
         all_watchlist_directives = (
@@ -989,6 +1115,24 @@ async def execute_unified_hourly_discovery_pipeline(context: ContextTypes.DEFAUL
                         "whale_pattern": setup.get("whale_pattern", "DISTRIBUTION_TRAP")
                     })
 
+        # Ingest AI Scalp Sniper Setups
+        if scalp_decision.get("action") == "TRADE":
+            for setup in scalp_decision.get("scalp_setups", []):
+                prob = float(setup.get("scalp_probability") or setup.get("movement_probability") or 80.0)
+                if prob >= 75.0:  # Minimum 75% scalp probability required
+                    raw_candidates.append({
+                        "source": "AI_SCALP",
+                        "symbol": setup.get("symbol"),
+                        "action": setup.get("action"),
+                        "strategy_mode": "SCALP",
+                        "trade_speed": "SCALP TRADE",
+                        "coin_trend": "SCALP_SNIPER",
+                        "thesis": setup.get("scalp_thesis", ""),
+                        "confidence": prob / 100.0,
+                        "scalp_probability": prob,
+                        "scalp_type": setup.get("scalp_type", "ORDERBOOK_IMBALANCE")
+                    })
+
         # Calculate Expected Profit Index for every setup
         processed_candidates = []
         for cand in raw_candidates:
@@ -1020,38 +1164,58 @@ async def execute_unified_hourly_discovery_pipeline(context: ContextTypes.DEFAUL
             quant_score = calculate_objective_quant_score(act, rsi_1h, rsi_4h, btc_regime["regime"], vol_m, funding, chg, btc_24h_pct, book_ratio)
             if cand["source"] == "WHALE_FLOW":
                 quant_score = max(quant_score, cand["confidence"])
+            elif cand["source"] == "AI_SCALP":
+                quant_score = max(quant_score, cand["confidence"])
 
             if quant_score < CONFIDENCE_THRESHOLD:
                 continue
 
-            levels = calculate_deterministic_trade_levels(curr_price, atr_1h, act, ema21_1h, cand["strategy_mode"], change_24h=chg)
+            is_scalp = (cand.get("trade_speed") == "SCALP TRADE" or cand.get("strategy_mode") == "SCALP")
+            levels = calculate_deterministic_trade_levels(curr_price, atr_1h, act, ema21_1h, cand["strategy_mode"], change_24h=chg, is_scalp=is_scalp)
             
-            # Expected Profit Index formula: EV = (Prob * Gain_TP1) - ((1 - Prob) * Risk)
+            # Dynamic Position Sizing used to compute EXPECTED CASH PROFIT
+            pos_size_calc = calculate_dynamic_position_size(quant_score, levels["risk_pct"], balance=account_balance, is_scalp=is_scalp)
+
+            # Expected Profit Index formula: EV% = (Prob * Gain_TP1) - ((1 - Prob) * Risk)
             gain_tp1_pct = abs(levels["t1"] - levels["entry"]) / levels["entry"] * 100.0 if levels["entry"] > 0 else 0.0
             risk_pct = levels["risk_pct"]
-            profit_index = (quant_score * gain_tp1_pct) - ((1.0 - quant_score) * risk_pct)
+            ev_pct = (quant_score * gain_tp1_pct) - ((1.0 - quant_score) * risk_pct)
 
-            # Profit Bonus: Confluence between Whale & Macro AI
+            # SCALPING PRIORITIZE PROFIT:
+            # Expected Cash Profit ($) = Pos_Size * (EV% / 100)
+            expected_cash_profit = pos_size_calc * (ev_pct / 100.0)
+
+            # Scalp Profit Velocity Prioritization:
+            # Scalps execute and turn over in <45m, compounding capital faster than swing trades
+            if is_scalp:
+                profit_index = (expected_cash_profit * 1.50) + 10.0
+            else:
+                profit_index = expected_cash_profit
+
+            # Confluence Bonuses: Confluence between Whale, Macro, & Scalp AI
             if any(other["symbol"] == sym and other["source"] != cand["source"] for other in raw_candidates):
-                profit_index += 0.50
+                profit_index += 10.0
 
-            # Profit Bonus: Order book ratio and whale alignment
+            # Order book ratio and whale alignment bonus
             if (act == "SHORT" and book_ratio < 0.70) or (act == "LONG" and book_ratio > 1.30):
-                profit_index += 0.25
+                profit_index += 5.0
             if (act == "SHORT" and whale_ls > 1.8 and btc_24h_pct < -0.5):
-                profit_index += 0.30
+                profit_index += 5.0
 
             processed_candidates.append({
                 "cand": cand,
                 "bridge": bridge,
                 "levels": levels,
                 "quant_score": quant_score,
-                "profit_index": round(profit_index, 3),
+                "profit_index": round(profit_index, 2),
+                "expected_cash_profit": round(expected_cash_profit, 2),
+                "pos_size_usd": pos_size_calc,
                 "curr_price": curr_price,
                 "rsi_1h": rsi_1h,
                 "funding": funding,
                 "book_ratio": book_ratio,
-                "atr_1h": atr_1h
+                "atr_1h": atr_1h,
+                "is_scalp": is_scalp
             })
 
         # 7. PRIORITIZE PROFIT: Sort all setups by Expected Profit Index descending
@@ -1076,9 +1240,8 @@ async def execute_unified_hourly_discovery_pipeline(context: ContextTypes.DEFAUL
             levels = item["levels"]
             quant_score = item["quant_score"]
             curr_price = item["curr_price"]
-            
-            # Dynamic Capital Position Sizing based on real account balance
-            pos_size_usd = calculate_dynamic_position_size(quant_score, levels["risk_pct"], balance=account_balance)
+            is_scalp = item.get("is_scalp", False)
+            pos_size_usd = item.get("pos_size_usd") or calculate_dynamic_position_size(quant_score, levels["risk_pct"], balance=account_balance, is_scalp=is_scalp)
 
             is_immediate_fill = (curr_price <= levels["entry"]) if act == "LONG" else (curr_price >= levels["entry"])
             init_stage = 1 if is_immediate_fill else 0
@@ -1099,12 +1262,32 @@ async def execute_unified_hourly_discovery_pipeline(context: ContextTypes.DEFAUL
 
             if not is_immediate_fill:
                 side_badge = "🟢 BUY / LONG" if act == "LONG" else "🔴 SELL / SHORT"
-                source_badge = "🐋 WHALE FLOW" if cand["source"] == "WHALE_FLOW" else "⚡ AI QUANT"
+                if cand["source"] == "WHALE_FLOW":
+                    source_badge = "🐋 WHALE FLOW"
+                elif cand["source"] == "AI_SCALP":
+                    source_badge = "⚡ SCALP SNIPER"
+                else:
+                    source_badge = "🌐 MACRO FLOW"
                 exec_badge = f"🤖 [AUTO-{TRADING_MODE}]" if TRADING_MODE in ("LIVE", "TESTNET") else "📋 [SIMULATION]"
 
+                if is_scalp:
+                    tp_desc = (
+                        f"• TP1 (60% Qty): <code>${levels['t1']:.6f}</code> (+1.0R)\n"
+                        f"• TP2 (25% Qty): <code>${levels['t2']:.6f}</code> (+1.8R)\n"
+                        f"• TP3 (15% Qty): <code>${levels['t3']:.6f}</code> (+2.6R)"
+                    )
+                else:
+                    tp_desc = (
+                        f"• TP1 (50% Qty): <code>${levels['t1']:.6f}</code> (+1.2R)\n"
+                        f"• TP2 (30% Qty): <code>${levels['t2']:.6f}</code> (+2.0R)\n"
+                        f"• TP3 (20% Qty): <code>${levels['t3']:.6f}</code> (+3.2R)"
+                    )
+
+                prob_line = f" | Scalp Prob: <b>{cand.get('scalp_probability', 80):.0f}%</b>" if is_scalp else ""
+                cash_ev_line = f" (${item.get('expected_cash_profit', 0):+.2f} Cash EV)"
                 msg = (
                     f"🏆 <b>HIGH +EV SETUP DISCOVERED ({source_badge}) {exec_badge}</b>\n"
-                    f"📊 <b>Profit Priority Index:</b> <b>+{item['profit_index']:.2f} EV</b> | Score: <b>{quant_score*100:.0f}%</b>\n\n"
+                    f"📊 <b>Profit Priority Index:</b> <b>+{item['profit_index']:.2f} EV</b>{cash_ev_line} | Score: <b>{quant_score*100:.0f}%</b>{prob_line}\n\n"
                     f"• <b>Contract:</b> <code>{sym}</code> ({side_badge})\n"
                     f"• <b>Allocated Capital:</b> <b>${pos_size_usd:.0f} USD</b> (from ${account_balance:.0f} Total Balance)\n"
                     f"• <b>Metrics:</b> RSI 1H: <code>{item['rsi_1h']}</code> | FR: <code>{item['funding']:+.4f}%</code> | Depth: <code>{item['book_ratio']}x</code>\n"
@@ -1113,9 +1296,7 @@ async def execute_unified_hourly_discovery_pipeline(context: ContextTypes.DEFAUL
                     f"1. <b>Entry Price:</b> <code>${levels['entry']:.6f}</code>\n"
                     f"2. <b>Stop-Loss:</b> <code>${levels['sl']:.6f}</code> (<code>-{levels['risk_pct']}%</code>)\n\n"
                     f"🎯 <b>PROFIT TARGETS:</b>\n"
-                    f"• TP1 (50% Qty): <code>${levels['t1']:.6f}</code> (+1.2R)\n"
-                    f"• TP2 (30% Qty): <code>${levels['t2']:.6f}</code> (+2.0R)\n"
-                    f"• TP3 (20% Qty): <code>${levels['t3']:.6f}</code> (+3.2R)"
+                    f"{tp_desc}"
                 )
                 if chat_id and context:
                     try:
@@ -1131,6 +1312,7 @@ async def execute_unified_hourly_discovery_pipeline(context: ContextTypes.DEFAUL
                 f"• <b>BTC Context:</b> <code>{btc_regime['regime']}</code> (ADX: {btc_regime['adx']}, 24h: {btc_24h_pct:+.2f}%)\n"
                 f"• <b>Macro Verdict:</b> <i>{html.escape(macro_decision.get('macro_verdict', 'Stand aside'))}</i>\n"
                 f"• <b>Whale Verdict:</b> <i>{html.escape(whale_decision.get('whale_verdict', 'No anomalies'))}</i>\n"
+                f"• <b>Scalp Verdict:</b> <i>{html.escape(scalp_decision.get('scalp_verdict', 'No scalp triggers'))}</i>\n"
                 f"• <b>Action:</b> ⚪ No setups passed the profit expectancy gate."
             )
             try:
@@ -1151,6 +1333,9 @@ async def execute_hourly_discovery_pipeline(context: ContextTypes.DEFAULT_TYPE =
 async def execute_whale_discovery_pipeline(context: ContextTypes.DEFAULT_TYPE = None):
     await execute_unified_hourly_discovery_pipeline(context, is_manual_scan=True, scan_type="WHALE")
 
+async def execute_scalp_discovery_pipeline(context: ContextTypes.DEFAULT_TYPE = None):
+    await execute_unified_hourly_discovery_pipeline(context, is_manual_scan=True, scan_type="SCALP")
+
 def auth_guard(update: Update) -> bool:
     if not TELEGRAM_CHAT_ID:
         return True
@@ -1168,6 +1353,7 @@ async def set_bot_menu_commands(application):
     commands = [
         BotCommand("scan", "Run regular CEX technical scan"),
         BotCommand("whale", "Scan Whale & Institutional Order Flow on Binance"),
+        BotCommand("scalp", "Scan High-Speed Scalp Sniper Setups"),
         BotCommand("report", "View & download monthly performance CSV audit"),
         BotCommand("watchlist", "View active orders & positions with speed tag"),
         BotCommand("addwatch", "Add manual pair: /addwatch BTC LONG [entry] [sl] [tp1]"),
@@ -1221,6 +1407,15 @@ async def whale_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not auth_guard(update): return
     status_msg = await update.message.reply_text("🐋 <b>Scanning Binance Derivatives Whale Footprints...</b>", parse_mode="HTML")
     await execute_whale_discovery_pipeline(context)
+    try:
+        await status_msg.delete()
+    except Exception:
+        pass
+
+async def scalp_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not auth_guard(update): return
+    status_msg = await update.message.reply_text("⚡ <b>Scanning High-Speed Scalp Sniper Opportunities...</b>", parse_mode="HTML")
+    await execute_scalp_discovery_pipeline(context)
     try:
         await status_msg.delete()
     except Exception:
@@ -1281,9 +1476,21 @@ async def watchlist_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         trend = item["coin_trend"] or "NEUTRAL"
         tag = item["movement_tag"] or ""
 
-        speed_badge = "⚡ <b>[FAST TRADE]</b>" if speed == "FAST TRADE" else "⏳ <b>[SLOW TRADE]</b>"
+        if speed == "SCALP TRADE":
+            speed_badge = "⚡ <b>[SCALP TRADE]</b>"
+        elif speed == "FAST TRADE":
+            speed_badge = "🚀 <b>[FAST TRADE]</b>"
+        else:
+            speed_badge = "⏳ <b>[SLOW TRADE]</b>"
+
         stage_desc = "⏳ Pending Limit Order" if stage == 0 else f"🟢 Active Position (Stage {stage})"
-        mode_badge = "🐋 WHALE" if trend == "WHALE_FLOW" else "📈 REGULAR"
+
+        if trend == "WHALE_FLOW":
+            mode_badge = "🐋 WHALE"
+        elif "SCALP" in trend:
+            mode_badge = "🎯 SCALP SNIPER"
+        else:
+            mode_badge = "📈 REGULAR"
 
         card = (
             f"<b>{sym}</b> (<code>{act}</code>) — {speed_badge} | {mode_badge}\n"
@@ -1425,6 +1632,7 @@ def main():
     app.add_handler(CommandHandler("stop", stop_cmd))
     app.add_handler(CommandHandler("scan", scan_cmd))
     app.add_handler(CommandHandler("whale", whale_cmd))
+    app.add_handler(CommandHandler("scalp", scalp_cmd))
     app.add_handler(CommandHandler("report", report_cmd))
     app.add_handler(CommandHandler("watchlist", watchlist_cmd))
     app.add_handler(CommandHandler("addwatch", addwatch_cmd))

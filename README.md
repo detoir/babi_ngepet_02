@@ -77,7 +77,7 @@ The system runs as an integrated ASGI supervisor service (`main.py`) exposing he
 
 ## 🚀 Key Features & Upgrades in v02
 
-### 1. Dual AI Discovery Engines & Global Financial News Ingestion
+### 1. Triple AI Discovery Engines & Global Financial News Ingestion
 - **Macro Quant Strategist (`DeepSeek-V3`)**: Analyzes the top 35 liquid perpetual pairs, factoring in real account margin capacity, 1H/4H technical indicators (RSI, ATR, 21 EMA), BTC trend regime (ADX), weekend volatility shifts, and live **multi-stream global financial news**:
   - **Global Financial Markets & Policy**: Yahoo Finance World/Business News RSS & Google News Central Bank / Inflation / FOMC Search Feeds.
   - **Crypto Native Feeds**: CoinTelegraph & CoinDesk Major News.
@@ -89,6 +89,10 @@ The system runs as an integrated ASGI supervisor service (`main.py`) exposing he
   - **Top Trader Long/Short Ratio** via `/futures/data/topLongShortAccountRatio`
   - **Funding Rate Divergence** via `/fapi/v1/premiumIndex`
   - Identifies **Crowded Traps**, **Bid Wall Spoofing**, and **Institutional Distribution Traps**.
+- **High-Speed Scalp Sniper Engine**: Specialized rapid-fire AI engine focused on high-velocity 5m-15m setups:
+  - Targets high-volume tokens ($> \$10\text{M}$ 24h volume) with severe order book depth imbalances (`book_ratio` $\ge 1.30$ or $\le 0.70$) and liquidity sweeps.
+  - Generates tight near-market entries (0.15% limit offset) with compressed 0.8% - 1.3% risk distance.
+  - Delivers **2.0x to 2.5x larger position sizing** for the exact same dollar risk, directly magnifying cash returns on rapid micro-moves!
 
 ### 2. Triple Execution Modes (`TRADING_MODE`)
 - **`SIMULATION`**: 100% risk-free paper trading. Emulates limit fills and dynamically tracks account balance based on closed trade realized PnL.
@@ -98,15 +102,25 @@ The system runs as an integrated ASGI supervisor service (`main.py`) exposing he
 ### 3. Expected Profit Index (+EV) & Correlation Guard
 - Ranks candidate setups by mathematical expected value:
   $$\text{EV} = (\text{Confidence} \times \text{Gain}_{\text{TP1}}\%) - ((1 - \text{Confidence}) \times \text{Risk}\%)$$
-- Awards confluence bonuses (+0.50 EV) when both Whale Flow and Macro AI agree on an asset.
+- Awards confluence bonuses (+0.50 EV) when multiple AI engines (Whale Flow, Macro AI, Scalp Sniper) agree on an asset.
 - **Correlation Limit**: Strictly caps active trades to **maximum 2 positions per side** (e.g., max 2 LONGs or 2 SHORTs) to eliminate directional cluster risk.
 
 ### 4. Dynamic Regime-Adaptive Risk Sentinel (8s Radar)
-- **Regime-Adaptive Auto Break-Even & 33% Milestone Scale-Out**:
+- **High-Speed Scalp Machine**:
+  - **Stage 0 Fast Expiration**: Scalp pending limit orders expire in **45 minutes** (vs 3 hours for swing) to prevent stale fills and keep margin liquid.
+  - **50% Cash Banking at +0.5R Milestone**: Once a scalp reaches $+0.5\text{R}$, banks **50% of the position immediately into realized cash** and moves the remaining 50% to Break-Even (`entry * 1.0015` / `0.9985`).
+  - **Micro-Trailing Profit Floors**:
+    - Peak $\ge +0.8\% \implies$ Trail stop to lock $\ge +0.35\%$ floor.
+    - Peak $\ge +1.2\% \implies$ Trail stop to lock $\ge +0.70\%$ floor.
+    - Peak $\ge +1.8\% \implies$ Trail stop to lock $\ge +1.20\%$ floor.
+    - Peak $\ge +2.5\% \implies$ Trail stop to lock $\ge +1.80\%$ floor.
+  - **Scalp Fast Stagnation Kill**: If a scalp stalls for $\ge 35$ minutes with PnL $\le +0.20\%$, Sentinel automatically closes it at market to recycle capital into active movers.
+  - **Fast TP1 Exit**: At TP1 (+1.0R), locks **60% of remaining position** (leaving 40% runner for TP2/TP3).
+- **Regime-Adaptive Auto Break-Even & 33% Milestone Scale-Out (Standard Swings)**:
   - **Trending (Weekdays)**: At `+1.0R`, banks **33% into realized cash profit** immediately and moves SL on remaining 67% to BE (`entry * 1.0015` / `0.9985`), guaranteeing cash in hand so winning trades never return to scratch.
   - **Sideways / Chop**: Tightens Auto-BE milestone to `+0.6R` with 33% banked to lock fast range scalps.
   - **Weekend Anomaly**: Ultra-fast `+0.5R` trigger with 33% banked to defend against low-liquidity wicks.
-- **Dynamic Tiered Trailing Profit Floors**:
+- **Dynamic Tiered Trailing Profit Floors (Standard Swings)**:
   - Automatically ratchets `current_sl` upwards as unrealized peak gains expand:
     - Peak gain $\ge +1.5\% \implies$ Stop-Loss trailed to lock in at least **$+0.6\%$ profit floor**.
     - Peak gain $\ge +2.2\% \implies$ Stop-Loss trailed to lock in at least **$+1.2\%$ profit floor**.
@@ -248,6 +262,7 @@ The Sentinel runs every **8 seconds** independently of the hourly scanner:
 | `/stop` | `/stop` | Pauses automated discovery scans. Sentinel continues monitoring open positions. |
 | `/scan` | `/scan` | Triggers an on-demand unified CEX technical and DeepSeek AI macro discovery scan. |
 | `/whale` | `/whale` | Triggers an on-demand Binance derivatives Whale & Institutional Order Flow radar scan. |
+| `/scalp` | `/scalp` | Triggers an on-demand High-Speed Scalp Sniper scan on Binance high-volume perps. |
 | `/report` | `/report` | Displays the monthly performance audit and attaches a downloadable `.csv` trade ledger. |
 | `/watchlist` | `/watchlist` | Displays all tracked pending orders and active positions with speed tags and SL/TP levels. |
 | `/addwatch` | `/addwatch SOL LONG`<br>`/addwatch ETH SHORT 2500 2560 2420 SLOW` | Manually tracks a coin. If prices are omitted, ATR brackets are calculated automatically. |
