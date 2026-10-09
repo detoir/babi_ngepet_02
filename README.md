@@ -338,12 +338,16 @@ PORT=8000
 | `BINANCE_API_KEY` | `string` | `""` | Binance API key with Futures trading permission (Required for `TESTNET` and `LIVE`). |
 | `BINANCE_SECRET_KEY` | `string` | `""` | Binance API secret key (Required for `TESTNET` and `LIVE`). |
 | `TRADING_MODE` | `string` | `"SIMULATION"` | Execution mode: `SIMULATION`, `TESTNET`, or `LIVE`. |
-| `DEFAULT_LEVERAGE` | `integer` | `2` | Default leverage set on the exchange (`ISOLATED` margin). |
-| `MAX_CORRELATED_POSITIONS_PER_SIDE` | `integer` | `2` | Max concurrent open trades on one side (max 2 LONGs or max 2 SHORTs). |
+| `DEFAULT_LEVERAGE` | `integer` | `2` | Default leverage set on the exchange (`ISOLATED` margin) for macro/swing setups. |
+| `SCALP_LEVERAGE` | `integer` | `5` | Dedicated aggressive leverage multiplier for High-Speed Scalp Sniper trades. |
+| `SCALP_ENTRY_TYPE` | `string` | `"MARKET"` | Entry style for scalps: `MARKET` (immediate fill at current price) or `LIMIT` (0.02% touch). |
+| `MAX_CORRELATED_POSITIONS_PER_SIDE` | `integer` | `3` | Max concurrent open swing trades on one side (max 3 LONGs or max 3 SHORTs). |
+| `MAX_CORRELATED_SCALPS_PER_SIDE` | `integer` | `4` | Max concurrent open scalp trades on one side for rapid turnover. |
 | `MAX_CONCURRENT_POSITIONS` | `integer` | `30` | Maximum simultaneous watchlist capacity across pending and live orders. |
 | `MAX_DAILY_TRADES` | `integer` | `999999` | Daily trade execution cap within a rolling 24-hour window. |
 | `MIN_RRR` | `float` | `1.8` | Minimum Reward-to-Risk ratio filter for signal validation. |
 | `CONFIDENCE_THRESHOLD` | `float` | `0.75` | Minimum quant score ($75\%$) required for candidate setup eligibility. |
+| `SCALP_MIN_PROBABILITY` | `float` | `70.0` | Minimum probability % required for High-Speed Scalp Sniper setups. |
 | `MAX_24H_LOSS_THRESHOLD` | `float` | `-25.0` | 24-hour drawdown circuit breaker floor in % (triggers 4-hour scan pause). |
 | `ACCOUNT_BALANCE_SIM` | `float` | `10000.0` | Simulated baseline balance in USD for paper trading and position scaling. |
 | `SCAN_INTERVAL_SECONDS` | `integer` | `3600` | Automated discovery scan interval in seconds (default: 1 hour). |

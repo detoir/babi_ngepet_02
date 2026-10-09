@@ -52,7 +52,10 @@ PENDING_TTL_HOURS = get_env_int("PENDING_TTL_HOURS", 3)
 # TRADING_MODE options: "SIMULATION" (virtual alerts/tracking), "TESTNET" (Binance Futures Testnet), "LIVE" (Real Binance Futures)
 TRADING_MODE = get_env_str("TRADING_MODE", "SIMULATION").upper()
 DEFAULT_LEVERAGE = get_env_int("DEFAULT_LEVERAGE", 2)
-MAX_CORRELATED_POSITIONS_PER_SIDE = get_env_int("MAX_CORRELATED_POSITIONS_PER_SIDE", 2)
+SCALP_LEVERAGE = get_env_int("SCALP_LEVERAGE", 5)  # More aggressive leverage for scalps
+SCALP_ENTRY_TYPE = get_env_str("SCALP_ENTRY_TYPE", "MARKET").upper()  # MARKET for immediate fills, LIMIT for resting
+MAX_CORRELATED_POSITIONS_PER_SIDE = get_env_int("MAX_CORRELATED_POSITIONS_PER_SIDE", 3)
+MAX_CORRELATED_SCALPS_PER_SIDE = get_env_int("MAX_CORRELATED_SCALPS_PER_SIDE", 4)
 
 # Risk & Gate Parameters
 MIN_RRR = get_env_float("MIN_RRR", 1.8)
@@ -66,6 +69,7 @@ ACCOUNT_BALANCE_SIMULATED = get_env_float("ACCOUNT_BALANCE_SIM", 10000.0)
 STAGNATION_MINS = get_env_float("STAGNATION_MINS", 180.0)
 STAGNATION_PNL_FLOOR = get_env_float("STAGNATION_PNL_FLOOR", -1.5)
 WHALE_MIN_PROBABILITY = get_env_float("WHALE_MIN_PROBABILITY", 75.0)
+SCALP_MIN_PROBABILITY = get_env_float("SCALP_MIN_PROBABILITY", 70.0)
 
 # Database Storage Path
 DATA_DIR = get_env_str("DATA_DIR", ".")
@@ -437,14 +441,43 @@ def format_order_price(symbol: str, price: float) -> float:
     except Exception:
         return round(price, 4)
 
-def place_binance_entry_limit(symbol: str, side: str, qty_usd: float, price: float) -> str:
+def place_binance_market_entry(symbol: str, side: str, qty_usd: float, leverage: int = None) -> dict:
+    if TRADING_MODE not in ("LIVE", "TESTNET"):
+        return {"id": "SIMULATED_MARKET_ENTRY", "filled": 0.0, "price": 0.0}
+    bridge = bridge_symbol_formats(symbol)
+    target_sym = bridge["ccxt"]
+    order_side = "buy" if side.upper() == "LONG" else "sell"
+    lev = leverage if leverage is not None else DEFAULT_LEVERAGE
+    try:
+        set_symbol_leverage_and_margin(target_sym, lev)
+        # Fetch current price to estimate initial qty
+        ticker = exchange.fetch_ticker(target_sym)
+        price = float(ticker.get("last") or ticker.get("close") or 1.0)
+        formatted_qty = format_order_quantity(target_sym, qty_usd, price)
+        order = exchange.create_order(
+            symbol=target_sym,
+            type="MARKET",
+            side=order_side,
+            amount=formatted_qty
+        )
+        order_id = str(order.get("id"))
+        filled_qty = float(order.get("filled") or formatted_qty)
+        avg_price = float(order.get("average") or order.get("price") or price)
+        log_event("INFO", "BINANCE_MARKET_ENTRY", f"Filled MARKET {order_side.upper()} for {filled_qty} {target_sym} at ${avg_price:.6f} (ID: {order_id})")
+        return {"id": order_id, "filled": filled_qty, "price": avg_price}
+    except Exception as e:
+        log_event("ERROR", "BINANCE_MARKET_ENTRY", f"Market entry failed on {target_sym}: {e}")
+        return {"id": "", "filled": 0.0, "price": 0.0}
+
+def place_binance_entry_limit(symbol: str, side: str, qty_usd: float, price: float, leverage: int = None) -> str:
     if TRADING_MODE not in ("LIVE", "TESTNET"):
         return "SIMULATED_ENTRY"
     bridge = bridge_symbol_formats(symbol)
     target_sym = bridge["ccxt"]
     order_side = "buy" if side.upper() == "LONG" else "sell"
+    lev = leverage if leverage is not None else DEFAULT_LEVERAGE
     try:
-        set_symbol_leverage_and_margin(target_sym, DEFAULT_LEVERAGE)
+        set_symbol_leverage_and_margin(target_sym, lev)
         formatted_price = format_order_price(target_sym, price)
         formatted_qty = format_order_quantity(target_sym, qty_usd, price)
         order = exchange.create_limit_order(target_sym, order_side, formatted_qty, formatted_price, {

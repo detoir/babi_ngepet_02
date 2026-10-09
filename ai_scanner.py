@@ -33,12 +33,16 @@ from config_db import (
     MAX_CONCURRENT_POSITIONS,
     MAX_DAILY_TRADES,
     MAX_CORRELATED_POSITIONS_PER_SIDE,
+    MAX_CORRELATED_SCALPS_PER_SIDE,
+    SCALP_LEVERAGE,
+    SCALP_ENTRY_TYPE,
     TRADING_MODE,
     DEEPSEEK_API_KEY,
     TELEGRAM_BOT_TOKEN,
     TELEGRAM_CHAT_ID,
     ACCOUNT_BALANCE_SIMULATED,
     WHALE_MIN_PROBABILITY,
+    SCALP_MIN_PROBABILITY,
     is_weekend_regime,
     generate_monthly_performance_report,
     export_monthly_report_csv,
@@ -61,6 +65,7 @@ from config_db import (
     log_ai_interaction,
     get_recent_system_logs,
     prune_old_logs,
+    place_binance_market_entry,
     place_binance_entry_limit,
     place_binance_stop_loss,
     cancel_binance_order,
@@ -188,15 +193,21 @@ def calculate_deterministic_trade_levels(price: float, atr_1h: float, direction:
         tp2_mult = 1.8
         tp3_mult = 2.6
 
-        # Fast near-market limit entry (0.15% offset for rapid execution)
+        # Fast aggressive scalp entry: Use current mark price for immediate fill
+        # when SCALP_ENTRY_TYPE is MARKET, entry is mark price; otherwise tight 0.02% touch
+        if SCALP_ENTRY_TYPE == "MARKET":
+            entry = round(price, 6)
+        elif direction == "LONG":
+            entry = round(price * 0.9998, 6)
+        else:
+            entry = round(price * 1.0002, 6)
+
         if direction == "LONG":
-            entry = round(price * 0.9985, 6)
             sl = round(entry - risk_dist, 6)
             t1 = round(entry + (tp1_mult * risk_dist), 6)
             t2 = round(entry + (tp2_mult * risk_dist), 6)
             t3 = round(entry + (tp3_mult * risk_dist), 6)
         else:
-            entry = round(price * 1.0015, 6)
             sl = round(entry + risk_dist, 6)
             t1 = round(entry - (tp1_mult * risk_dist), 6)
             t2 = round(entry - (tp2_mult * risk_dist), 6)
@@ -1119,7 +1130,7 @@ async def execute_unified_hourly_discovery_pipeline(context: ContextTypes.DEFAUL
         if scalp_decision.get("action") == "TRADE":
             for setup in scalp_decision.get("scalp_setups", []):
                 prob = float(setup.get("scalp_probability") or setup.get("movement_probability") or 80.0)
-                if prob >= 75.0:  # Minimum 75% scalp probability required
+                if prob >= SCALP_MIN_PROBABILITY:  # Configurable scalp probability gate (default 70.0%)
                     raw_candidates.append({
                         "source": "AI_SCALP",
                         "symbol": setup.get("symbol"),
@@ -1132,6 +1143,14 @@ async def execute_unified_hourly_discovery_pipeline(context: ContextTypes.DEFAUL
                         "scalp_probability": prob,
                         "scalp_type": setup.get("scalp_type", "ORDERBOOK_IMBALANCE")
                     })
+
+        # Filter candidates by scan_type when called specifically (e.g. /scalp or /whale)
+        if scan_type == "SCALP":
+            raw_candidates = [c for c in raw_candidates if c["source"] == "AI_SCALP"]
+        elif scan_type == "WHALE":
+            raw_candidates = [c for c in raw_candidates if c["source"] == "WHALE_FLOW"]
+        elif scan_type == "MACRO":
+            raw_candidates = [c for c in raw_candidates if c["source"] == "AI_MACRO"]
 
         # Calculate Expected Profit Index for every setup
         processed_candidates = []
@@ -1231,10 +1250,11 @@ async def execute_unified_hourly_discovery_pipeline(context: ContextTypes.DEFAUL
             act = cand["action"]
             sym = bridge["ccxt"]
 
-            # Enforce correlation / cluster limit
+            # Enforce correlation / cluster limit (Scalps have separate higher concurrency)
             dir_count = count_active_positions_by_direction(act)
-            if dir_count >= MAX_CORRELATED_POSITIONS_PER_SIDE:
-                log_event("INFO", "PROFIT_ENGINE", f"Correlated {act} limit ({dir_count}/{MAX_CORRELATED_POSITIONS_PER_SIDE}) reached. Skipping {sym}.")
+            max_allowed_dir = MAX_CORRELATED_SCALPS_PER_SIDE if is_scalp else MAX_CORRELATED_POSITIONS_PER_SIDE
+            if dir_count >= max_allowed_dir:
+                log_event("INFO", "PROFIT_ENGINE", f"Correlated {act} limit ({dir_count}/{max_allowed_dir}) reached. Skipping {sym}.")
                 continue
 
             levels = item["levels"]
@@ -1243,53 +1263,88 @@ async def execute_unified_hourly_discovery_pipeline(context: ContextTypes.DEFAUL
             is_scalp = item.get("is_scalp", False)
             pos_size_usd = item.get("pos_size_usd") or calculate_dynamic_position_size(quant_score, levels["risk_pct"], balance=account_balance, is_scalp=is_scalp)
 
-            is_immediate_fill = (curr_price <= levels["entry"]) if act == "LONG" else (curr_price >= levels["entry"])
+            # Execution Logic: Aggressive scalps fill immediately at market
+            is_market_entry = (is_scalp and SCALP_ENTRY_TYPE == "MARKET")
+            is_immediate_fill = is_market_entry or ((curr_price <= levels["entry"]) if act == "LONG" else (curr_price >= levels["entry"]))
             init_stage = 1 if is_immediate_fill else 0
 
-            # Place Binance Limit Order if in Live or Testnet mode
             binance_order_id = ""
-            if not is_immediate_fill and TRADING_MODE in ("LIVE", "TESTNET"):
-                binance_order_id = place_binance_entry_limit(sym, act, pos_size_usd, levels["entry"])
+            executed_qty = 0.0
+            actual_fill_price = levels["entry"]
+            target_leverage = SCALP_LEVERAGE if is_scalp else DEFAULT_LEVERAGE
+
+            if is_immediate_fill:
+                actual_fill_price = curr_price
+                if TRADING_MODE in ("LIVE", "TESTNET"):
+                    # Fire immediate Market Entry on Binance for Aggressive Scalp
+                    market_res = place_binance_market_entry(sym, act, pos_size_usd, leverage=target_leverage)
+                    binance_order_id = market_res.get("id", "")
+                    executed_qty = float(market_res.get("filled", 0.0))
+                    if market_res.get("price", 0.0) > 0:
+                        actual_fill_price = float(market_res["price"])
+                    
+                    # Immediately place protective Stop-Loss on exchange
+                    if executed_qty > 0:
+                        place_binance_stop_loss(sym, act, executed_qty, levels["sl"])
+            else:
+                # Place Resting Limit Order on Binance
+                if TRADING_MODE in ("LIVE", "TESTNET"):
+                    binance_order_id = place_binance_entry_limit(sym, act, pos_size_usd, levels["entry"], leverage=target_leverage)
 
             upsert_watched_signal(
-                sym, act, levels["entry"], levels["sl"],
+                sym, act, actual_fill_price, levels["sl"],
                 levels["t1"], levels["t2"], levels["t3"],
                 item["atr_1h"], pos_size_usd, cand["trade_speed"], cand["coin_trend"], cand["thesis"],
                 confidence=quant_score, stage_init=init_stage,
-                binance_entry_order_id=binance_order_id
+                binance_entry_order_id=binance_order_id,
+                executed_qty=executed_qty
             )
             emitted_count += 1
 
-            if not is_immediate_fill:
-                side_badge = "🟢 BUY / LONG" if act == "LONG" else "🔴 SELL / SHORT"
-                if cand["source"] == "WHALE_FLOW":
-                    source_badge = "🐋 WHALE FLOW"
-                elif cand["source"] == "AI_SCALP":
-                    source_badge = "⚡ SCALP SNIPER"
-                else:
-                    source_badge = "🌐 MACRO FLOW"
-                exec_badge = f"🤖 [AUTO-{TRADING_MODE}]" if TRADING_MODE in ("LIVE", "TESTNET") else "📋 [SIMULATION]"
+            side_badge = "🟢 BUY / LONG" if act == "LONG" else "🔴 SELL / SHORT"
+            if cand["source"] == "WHALE_FLOW":
+                source_badge = "🐋 WHALE FLOW"
+            elif cand["source"] == "AI_SCALP":
+                source_badge = "⚡ SCALP SNIPER"
+            else:
+                source_badge = "🌐 MACRO FLOW"
+            exec_badge = f"🤖 [AUTO-{TRADING_MODE}]" if TRADING_MODE in ("LIVE", "TESTNET") else "📋 [SIMULATION]"
 
-                if is_scalp:
-                    tp_desc = (
-                        f"• TP1 (60% Qty): <code>${levels['t1']:.6f}</code> (+1.0R)\n"
-                        f"• TP2 (25% Qty): <code>${levels['t2']:.6f}</code> (+1.8R)\n"
-                        f"• TP3 (15% Qty): <code>${levels['t3']:.6f}</code> (+2.6R)"
-                    )
-                else:
-                    tp_desc = (
-                        f"• TP1 (50% Qty): <code>${levels['t1']:.6f}</code> (+1.2R)\n"
-                        f"• TP2 (30% Qty): <code>${levels['t2']:.6f}</code> (+2.0R)\n"
-                        f"• TP3 (20% Qty): <code>${levels['t3']:.6f}</code> (+3.2R)"
-                    )
+            if is_scalp:
+                tp_desc = (
+                    f"• TP1 (60% Qty): <code>${levels['t1']:.6f}</code> (+1.0R)\n"
+                    f"• TP2 (25% Qty): <code>${levels['t2']:.6f}</code> (+1.8R)\n"
+                    f"• TP3 (15% Qty): <code>${levels['t3']:.6f}</code> (+2.6R)"
+                )
+            else:
+                tp_desc = (
+                    f"• TP1 (50% Qty): <code>${levels['t1']:.6f}</code> (+1.2R)\n"
+                    f"• TP2 (30% Qty): <code>${levels['t2']:.6f}</code> (+2.0R)\n"
+                    f"• TP3 (20% Qty): <code>${levels['t3']:.6f}</code> (+3.2R)"
+                )
 
-                prob_line = f" | Scalp Prob: <b>{cand.get('scalp_probability', 80):.0f}%</b>" if is_scalp else ""
-                cash_ev_line = f" (${item.get('expected_cash_profit', 0):+.2f} Cash EV)"
+            prob_line = f" | Scalp Prob: <b>{cand.get('scalp_probability', 80):.0f}%</b>" if is_scalp else ""
+            cash_ev_line = f" (${item.get('expected_cash_profit', 0):+.2f} Cash EV)"
+
+            if is_immediate_fill:
+                msg = (
+                    f"⚡ <b>IMMEDIATE AGGRESSIVE ENTRY EXECUTED ({source_badge}) {exec_badge}</b>\n"
+                    f"📊 <b>Profit Priority Index:</b> <b>+{item['profit_index']:.2f} EV</b>{cash_ev_line} | Score: <b>{quant_score*100:.0f}%</b>{prob_line}\n\n"
+                    f"• <b>Contract:</b> <code>{sym}</code> ({side_badge})\n"
+                    f"• <b>Filled Entry Mark:</b> <code>${actual_fill_price:.6f}</code> ({target_leverage}x Leverage)\n"
+                    f"• <b>Position Size:</b> <b>${pos_size_usd:.0f} USD</b>\n"
+                    f"• <b>Hard SL on Binance:</b> <code>${levels['sl']:.6f}</code> (<code>-{levels['risk_pct']}%</code>)\n"
+                    f"• <b>Edge Thesis:</b> <i>{html.escape(cand['thesis'])}</i>\n\n"
+                    f"🎯 <b>PROFIT TARGETS:</b>\n"
+                    f"{tp_desc}\n\n"
+                    f"🛡️ <i>Sentinel 8s radar is actively managing early cash milestones and micro-floors.</i>"
+                )
+            else:
                 msg = (
                     f"🏆 <b>HIGH +EV SETUP DISCOVERED ({source_badge}) {exec_badge}</b>\n"
                     f"📊 <b>Profit Priority Index:</b> <b>+{item['profit_index']:.2f} EV</b>{cash_ev_line} | Score: <b>{quant_score*100:.0f}%</b>{prob_line}\n\n"
                     f"• <b>Contract:</b> <code>{sym}</code> ({side_badge})\n"
-                    f"• <b>Allocated Capital:</b> <b>${pos_size_usd:.0f} USD</b> (from ${account_balance:.0f} Total Balance)\n"
+                    f"• <b>Allocated Capital:</b> <b>${pos_size_usd:.0f} USD</b> ({target_leverage}x Leverage)\n"
                     f"• <b>Metrics:</b> RSI 1H: <code>{item['rsi_1h']}</code> | FR: <code>{item['funding']:+.4f}%</code> | Depth: <code>{item['book_ratio']}x</code>\n"
                     f"• <b>Edge Thesis:</b> <i>{html.escape(cand['thesis'])}</i>\n\n"
                     f"📍 <b>BINANCE LIMIT BRACKETS:</b>\n"
@@ -1298,11 +1353,12 @@ async def execute_unified_hourly_discovery_pipeline(context: ContextTypes.DEFAUL
                     f"🎯 <b>PROFIT TARGETS:</b>\n"
                     f"{tp_desc}"
                 )
-                if chat_id and context:
-                    try:
-                        await context.bot.send_message(chat_id=int(chat_id), text=msg, parse_mode="HTML")
-                    except Exception:
-                        pass
+
+            if chat_id and context:
+                try:
+                    await context.bot.send_message(chat_id=int(chat_id), text=msg, parse_mode="HTML")
+                except Exception:
+                    pass
             await asyncio.sleep(0.5)
 
         if is_manual_scan and emitted_count == 0 and chat_id and context:
@@ -1328,7 +1384,7 @@ async def execute_unified_hourly_discovery_pipeline(context: ContextTypes.DEFAUL
             conn.execute("UPDATE bot_state SET value = '0' WHERE key = 'eval_running'")
 
 async def execute_hourly_discovery_pipeline(context: ContextTypes.DEFAULT_TYPE = None, is_manual_scan: bool = False):
-    await execute_unified_hourly_discovery_pipeline(context, is_manual_scan=is_manual_scan, scan_type="MACRO")
+    await execute_unified_hourly_discovery_pipeline(context, is_manual_scan=is_manual_scan, scan_type="ALL")
 
 async def execute_whale_discovery_pipeline(context: ContextTypes.DEFAULT_TYPE = None):
     await execute_unified_hourly_discovery_pipeline(context, is_manual_scan=True, scan_type="WHALE")
