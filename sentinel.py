@@ -22,6 +22,8 @@ from config_db import (
     TELEGRAM_BOT_TOKEN,
     TELEGRAM_CHAT_ID,
     TRADING_MODE,
+    DEFAULT_LEVERAGE,
+    SCALP_LEVERAGE,
     is_weekend_regime,
     utc_now,
     get_exchange_instance,
@@ -35,6 +37,7 @@ from config_db import (
     emergency_binance_market_close,
     fetch_binance_order_status,
     format_order_quantity,
+    set_symbol_leverage_and_margin,
 )
 
 exchange = get_exchange_instance()
@@ -238,6 +241,10 @@ async def run_sentinel_cycle(session: aiohttp.ClientSession):
 
             if is_entry_touched or is_order_filled:
                 stage = 1
+                target_leverage = SCALP_LEVERAGE if is_scalp_trade else DEFAULT_LEVERAGE
+                if TRADING_MODE in ("LIVE", "TESTNET"):
+                    await asyncio.to_thread(set_symbol_leverage_and_margin, sym, target_leverage)
+
                 if executed_qty <= 0:
                     executed_qty = format_order_quantity(sym, pos_size_usd, curr_price)
 
