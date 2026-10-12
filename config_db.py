@@ -97,6 +97,9 @@ def get_exchange_instance():
         print(f"[{BOT_NAME}] Exchange initialization warning: {e}")
     return ex
 
+# Initialize module-level exchange instance for trading functions in config_db
+exchange = get_exchange_instance()
+
 def get_db_connection():
     conn = sqlite3.connect(DB_FILE, timeout=60.0, check_same_thread=False, isolation_level=None)
     conn.execute("PRAGMA journal_mode = WAL;")
