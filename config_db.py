@@ -376,14 +376,41 @@ def count_active_positions_by_direction(direction: str) -> int:
 def fetch_current_account_capital() -> dict:
     try:
         if TRADING_MODE in ("LIVE", "TESTNET"):
-            bal = exchange.fetch_balance()
-            usdt_info = bal.get("USDT", {})
-            total_bal = float(usdt_info.get("total") or bal.get("total", {}).get("USDT") or 0.0)
-            free_bal = float(usdt_info.get("free") or bal.get("free", {}).get("USDT") or 0.0)
-            if total_bal > 0:
-                with get_db_connection() as conn:
-                    conn.execute("INSERT OR REPLACE INTO bot_state (key, value) VALUES ('current_capital_usd', ?)", (str(total_bal),))
-                return {"total": total_bal, "free": free_bal, "mode": TRADING_MODE}
+            if not BINANCE_API_KEY or not BINANCE_SECRET_KEY:
+                log_event("WARN", "CAPITAL_FETCH", f"TRADING_MODE is {TRADING_MODE} but BINANCE_API_KEY / SECRET is missing. Using simulated balance.")
+            else:
+                bal = exchange.fetch_balance()
+                total_bal = 0.0
+                free_bal = 0.0
+
+                # 1. Try standard CCXT USDT balance
+                usdt_info = bal.get("USDT", {})
+                total_bal = float(usdt_info.get("total") or bal.get("total", {}).get("USDT") or 0.0)
+                free_bal = float(usdt_info.get("free") or bal.get("free", {}).get("USDT") or 0.0)
+
+                # 2. If 0, inspect native Binance USD-M futures response structure
+                if total_bal <= 0:
+                    info_assets = bal.get("info", {}).get("assets", [])
+                    for a in info_assets:
+                        if a.get("asset") in ("USDT", "USDC"):
+                            wb = float(a.get("walletBalance") or a.get("marginBalance") or 0.0)
+                            av = float(a.get("availableBalance") or a.get("maxWithdrawAmount") or 0.0)
+                            if wb > total_bal:
+                                total_bal = wb
+                                free_bal = av
+
+                # 3. If still 0, check top-level totalWalletBalance / availableBalance
+                if total_bal <= 0:
+                    raw_info = bal.get("info", {})
+                    total_bal = float(raw_info.get("totalWalletBalance") or raw_info.get("totalMarginBalance") or 0.0)
+                    free_bal = float(raw_info.get("availableBalance") or 0.0)
+
+                if total_bal > 0:
+                    with get_db_connection() as conn:
+                        conn.execute("INSERT OR REPLACE INTO bot_state (key, value) VALUES ('current_capital_usd', ?)", (str(total_bal),))
+                    return {"total": round(total_bal, 2), "free": round(free_bal, 2), "mode": TRADING_MODE}
+                else:
+                    log_event("WARN", "CAPITAL_FETCH", f"Live balance fetched as 0.0 USDT. Check Futures wallet funding.")
     except Exception as e:
         log_event("WARN", "CAPITAL_FETCH", f"Exchange balance fetch error: {e}")
 
@@ -654,7 +681,6 @@ def upsert_watched_signal(symbol, action, entry, sl, t1, t2, t3, atr_val, pos_si
                 executed_qty=excluded.executed_qty,
                 trading_mode=excluded.trading_mode,
                 last_updated=CURRENT_TIMESTAMP
-            WHERE watched_signals.stage = 0
         """, (symbol, action, entry, sl, sl, t1, t2, t3, atr_val, pos_size, stage_init, entry, confidence, trade_speed, coin_trend, strategic_thesis, movement_tag, binance_entry_order_id, executed_qty, TRADING_MODE))
 
         risk_dist = abs(entry - sl) if entry > 0 else 1.0
