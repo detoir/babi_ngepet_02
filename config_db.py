@@ -390,7 +390,7 @@ def fetch_current_account_capital() -> dict:
     # Fallback to simulated balance + realized PnL
     with get_db_connection() as conn:
         c = conn.cursor()
-        c.execute("SELECT SUM(realized_pnl) as total_pnl FROM watched_signals WHERE status IN ('COMPLETED', 'INVALIDATED')")
+        c.execute("SELECT SUM(realized_pnl) as total_pnl FROM watched_signals WHERE status IN ('COMPLETED', 'INVALIDATED', 'STOPPED_OUT')")
         row = c.fetchone()
         realized_pnl_pct = float(row["total_pnl"] or 0.0)
         sim_balance = ACCOUNT_BALANCE_SIMULATED * (1.0 + (realized_pnl_pct / 100.0))
