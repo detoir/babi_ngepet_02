@@ -479,9 +479,10 @@ async def run_sentinel_cycle(session: aiohttp.ClientSession):
                 with get_db_connection() as conn:
                     conn.execute("""
                         UPDATE watched_signals 
-                        SET status = 'COMPLETED', realized_pnl = ?, remaining_ratio = 0.0, movement_tag = '🎯 REVERSAL_HARVEST', last_updated = CURRENT_TIMESTAMP 
+                        SET status = 'COMPLETED', realized_pnl = ?, remaining_ratio = 0.0, exit_reason = 'REVERSAL_HARVEST', movement_tag = '🎯 REVERSAL_HARVEST', last_updated = CURRENT_TIMESTAMP 
                         WHERE id = ?
                     """, (final_pnl, w_id))
+                log_event("INFO", "SENTINEL_EXIT", f"Trade {sym} {act} closed via REVERSAL_HARVEST at {final_pnl:+.2f}% after {holding_mins:.0f}m")
                 msg = (
                     f"💰 <b>PROFIT HARVEST: SUDDEN REVERSAL DEFENDED [{regime_label}]</b>\n\n"
                     f"• <b>Contract:</b> <code>{sym}</code> ({act})\n"
@@ -509,13 +510,15 @@ async def run_sentinel_cycle(session: aiohttp.ClientSession):
                 with get_db_connection() as conn:
                     conn.execute("""
                         UPDATE watched_signals 
-                        SET status = ?, realized_pnl = ?, remaining_ratio = 0.0, movement_tag = '⚡ SCALP_STAGNATION_KILL', last_updated = CURRENT_TIMESTAMP 
+                        SET status = ?, realized_pnl = ?, remaining_ratio = 0.0, exit_reason = 'SCALP_STAGNATION_KILL', movement_tag = '⚡ SCALP_STAGNATION_KILL', last_updated = CURRENT_TIMESTAMP 
                         WHERE id = ?
                     """, (close_status, final_pnl, w_id))
                     conn.execute("""
                         INSERT INTO loss_diagnostics (symbol, action, entry_price, exit_price, stop_loss_price, exit_type, holding_duration_mins, market_regime, diagnostic_reason)
                         VALUES (?, ?, ?, ?, ?, 'SCALP_STAGNATION', ?, 'SCALP_SNIPER', ?)
                     """, (sym, act, entry, exit_price, current_sl, holding_mins, f"Scalp stalled at {pnl_approx:+.2f}% after {holding_mins:.0f}m."))
+
+                log_event("INFO", "SENTINEL_EXIT", f"Trade {sym} {act} closed via SCALP_STAGNATION_KILL at {final_pnl:+.2f}% after {holding_mins:.0f}m")
 
                 msg = (
                     f"⚡ <b>SCALP STAGNATION KILL ({holding_mins:.0f}m)</b>\n\n"
@@ -559,20 +562,28 @@ async def run_sentinel_cycle(session: aiohttp.ClientSession):
 
                 cooldown_time = (utc_now() + datetime.timedelta(hours=4)).strftime("%Y-%m-%d %H:%M:%S")
                 close_status = "COMPLETED" if final_pnl >= 0 else "STOPPED_OUT"
+                exit_reason_text = "BE_PROFIT_STOP" if final_pnl >= 0 else "HARD_STOP_LOSS"
                 with get_db_connection() as conn:
-                    conn.execute("UPDATE watched_signals SET status = ?, realized_pnl = ?, remaining_ratio = 0.0, last_updated = CURRENT_TIMESTAMP WHERE id = ?", (close_status, final_pnl, w_id))
+                    conn.execute("""
+                        UPDATE watched_signals 
+                        SET status = ?, realized_pnl = ?, remaining_ratio = 0.0, exit_reason = ?, last_updated = CURRENT_TIMESTAMP 
+                        WHERE id = ?
+                    """, (close_status, final_pnl, exit_reason_text, w_id))
                     if final_pnl < 0:
                         conn.execute("INSERT OR REPLACE INTO symbol_cooldowns (symbol, cooldown_until) VALUES (?, ?)", (sym, cooldown_time))
                         conn.execute("""
                             INSERT INTO loss_diagnostics (symbol, action, entry_price, exit_price, stop_loss_price, exit_type, holding_duration_mins, market_regime, diagnostic_reason)
-                            VALUES (?, ?, ?, ?, ?, 'STOP_LOSS', ?, 'UNCERTAIN', ?)
-                        """, (sym, act, entry, exit_price, current_sl, holding_mins, f"Hit SL at ${current_sl:.6f}."))
+                            VALUES (?, ?, ?, ?, ?, 'STOP_LOSS', ?, ?, ?)
+                        """, (sym, act, entry, exit_price, current_sl, holding_mins, regime_label, f"Hit SL at ${current_sl:.6f} after {holding_mins:.0f}m ({final_pnl:+.2f}% PnL)."))
+
+                log_event("INFO", "SENTINEL_EXIT", f"Trade {sym} {act} closed via {exit_reason_text}. Realized: {final_pnl:+.2f}%, Duration: {holding_mins:.0f}m")
 
                 emoji = "🛑 <b>STOP-LOSS HIT ON BINANCE</b>" if final_pnl < 0 else "🛡️ <b>BREAK-EVEN / PROFIT STOP TRIGGERED</b>"
                 msg = (
                     f"{emoji}\n\n"
                     f"• <b>Contract:</b> <code>{sym}</code> ({act})\n"
                     f"• <b>Exit Price:</b> ${exit_price:.6f}\n"
+                    f"• <b>Holding Time:</b> <code>{holding_mins:.0f} mins</code>\n"
                     f"• <b>Total Realized Result:</b> <code>{final_pnl:+.2f}%</code>\n"
                     f"🤖 <b>Position closed and orders cleaned up on Binance.</b>"
                 )
@@ -690,7 +701,7 @@ async def run_sentinel_cycle(session: aiohttp.ClientSession):
                     with get_db_connection() as conn:
                         conn.execute("""
                             UPDATE watched_signals 
-                            SET status = 'COMPLETED', realized_pnl = ?, remaining_ratio = 0.0, movement_tag = '🏆 TP3_FULL', last_updated = CURRENT_TIMESTAMP 
+                            SET status = 'COMPLETED', realized_pnl = ?, remaining_ratio = 0.0, exit_reason = 'TP3_FULL_TARGET', movement_tag = '🏆 TP3_FULL', last_updated = CURRENT_TIMESTAMP 
                             WHERE id = ?
                         """, (final_pnl, w_id))
                     msg = (

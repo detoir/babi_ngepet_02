@@ -175,7 +175,15 @@ def init_db():
             ("executed_qty", "REAL DEFAULT 0.0"),
             ("remaining_ratio", "REAL DEFAULT 1.0"),
             ("partial_realized_pnl", "REAL DEFAULT 0.0"),
-            ("trading_mode", "TEXT DEFAULT 'SIMULATION'")
+            ("trading_mode", "TEXT DEFAULT 'SIMULATION'"),
+            ("leverage", "INTEGER DEFAULT 1"),
+            ("rsi_1h", "REAL DEFAULT 50.0"),
+            ("funding_rate", "REAL DEFAULT 0.0"),
+            ("book_ratio", "REAL DEFAULT 1.0"),
+            ("whale_ls_ratio", "REAL DEFAULT 1.0"),
+            ("btc_24h_pct", "REAL DEFAULT 0.0"),
+            ("profit_index", "REAL DEFAULT 0.0"),
+            ("exit_reason", "TEXT DEFAULT ''")
         ]:
             try:
                 c.execute(f"ALTER TABLE watched_signals ADD COLUMN {col_name} {col_def};")
@@ -639,7 +647,11 @@ def get_cooldown_symbols() -> list:
         c.execute("SELECT symbol FROM symbol_cooldowns WHERE cooldown_until > CURRENT_TIMESTAMP")
         return [r["symbol"] for r in c.fetchall()]
 
-def upsert_watched_signal(symbol, action, entry, sl, t1, t2, t3, atr_val, pos_size, trade_speed, coin_trend, strategic_thesis="", confidence=0.75, stage_init=0, binance_entry_order_id="", executed_qty=0.0):
+def upsert_watched_signal(
+    symbol, action, entry, sl, t1, t2, t3, atr_val, pos_size, trade_speed, coin_trend, 
+    strategic_thesis="", confidence=0.75, stage_init=0, binance_entry_order_id="", executed_qty=0.0,
+    leverage=1, rsi_1h=50.0, funding_rate=0.0, book_ratio=1.0, whale_ls_ratio=1.0, btc_24h_pct=0.0, profit_index=0.0
+):
     with get_db_connection() as conn:
         c = conn.cursor()
         c.execute("SELECT stage, status, action, confidence, entry_limit, binance_entry_order_id FROM watched_signals WHERE symbol = ?", (symbol,))
@@ -659,8 +671,8 @@ def upsert_watched_signal(symbol, action, entry, sl, t1, t2, t3, atr_val, pos_si
 
         conn.execute("""
             INSERT INTO watched_signals 
-            (symbol, action, entry_limit, initial_sl, current_sl, target_1, target_2, target_3, atr_val, position_size_usd, stage, highest_favorable_price, status, realized_pnl, confidence, trade_speed, coin_trend, strategic_thesis, movement_tag, binance_entry_order_id, executed_qty, trading_mode, last_updated)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'WATCHING', 0.0, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            (symbol, action, entry_limit, initial_sl, current_sl, target_1, target_2, target_3, atr_val, position_size_usd, stage, highest_favorable_price, status, realized_pnl, confidence, trade_speed, coin_trend, strategic_thesis, movement_tag, binance_entry_order_id, executed_qty, trading_mode, leverage, rsi_1h, funding_rate, book_ratio, whale_ls_ratio, btc_24h_pct, profit_index, last_updated)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'WATCHING', 0.0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
             ON CONFLICT(symbol) DO UPDATE SET
                 action=excluded.action,
                 entry_limit=excluded.entry_limit,
@@ -683,8 +695,21 @@ def upsert_watched_signal(symbol, action, entry, sl, t1, t2, t3, atr_val, pos_si
                 binance_entry_order_id=excluded.binance_entry_order_id,
                 executed_qty=excluded.executed_qty,
                 trading_mode=excluded.trading_mode,
+                leverage=excluded.leverage,
+                rsi_1h=excluded.rsi_1h,
+                funding_rate=excluded.funding_rate,
+                book_ratio=excluded.book_ratio,
+                whale_ls_ratio=excluded.whale_ls_ratio,
+                btc_24h_pct=excluded.btc_24h_pct,
+                profit_index=excluded.profit_index,
+                exit_reason='',
                 last_updated=CURRENT_TIMESTAMP
-        """, (symbol, action, entry, sl, sl, t1, t2, t3, atr_val, pos_size, stage_init, entry, confidence, trade_speed, coin_trend, strategic_thesis, movement_tag, binance_entry_order_id, executed_qty, TRADING_MODE))
+        """, (
+            symbol, action, entry, sl, sl, t1, t2, t3, atr_val, pos_size, stage_init, entry, 
+            confidence, trade_speed, coin_trend, strategic_thesis, movement_tag, binance_entry_order_id, 
+            executed_qty, TRADING_MODE, leverage, rsi_1h, funding_rate, book_ratio, whale_ls_ratio, 
+            btc_24h_pct, profit_index
+        ))
 
         risk_dist = abs(entry - sl) if entry > 0 else 1.0
         reward_dist = abs(t1 - entry) if entry > 0 else 0.0
@@ -804,6 +829,10 @@ def generate_monthly_performance_report() -> dict:
         c.execute("SELECT COUNT(*) as pending_cnt FROM watched_signals WHERE status = 'WATCHING' AND stage = 0")
         pending_orders = c.fetchone()["pending_cnt"] or 0
 
+        cap_info = fetch_current_account_capital()
+        avg_win = (sum(float(t["realized_pnl"] or 0) for t in wins) / win_count) if win_count > 0 else 0.0
+        avg_loss = (sum(float(t["realized_pnl"] or 0) for t in losses) / loss_count) if loss_count > 0 else 0.0
+
         return {
             "month": utc_now().strftime("%B %Y"),
             "start_date": start_of_month.split(" ")[0],
@@ -814,8 +843,13 @@ def generate_monthly_performance_report() -> dict:
             "losses": loss_count,
             "win_rate": round(win_rate, 1),
             "net_pnl": round(net_pnl, 2),
+            "avg_win": round(avg_win, 2),
+            "avg_loss": round(avg_loss, 2),
             "active_positions": active_positions,
             "pending_orders": pending_orders,
+            "capital_usd": cap_info.get("total", 0.0),
+            "free_margin_usd": cap_info.get("free", 0.0),
+            "mode": cap_info.get("mode", TRADING_MODE),
             "regime": "WEEKEND (Mean-Reversion Only)" if is_weekend_regime() else "WEEKDAY (Institutional Momentum)"
         }
 
@@ -828,6 +862,7 @@ def export_monthly_report_csv() -> tuple:
         c.execute("""
             SELECT id, symbol, action, entry_limit, current_sl, target_1, target_2, target_3, 
                    realized_pnl, status, confidence, trade_speed, coin_trend, strategic_thesis, 
+                   trading_mode, leverage, rsi_1h, funding_rate, book_ratio, whale_ls_ratio, btc_24h_pct, profit_index, exit_reason,
                    timestamp, last_updated
             FROM watched_signals
             WHERE last_updated >= ?
@@ -839,16 +874,30 @@ def export_monthly_report_csv() -> tuple:
     writer = csv.writer(output)
     writer.writerow([
         "ID", "Symbol", "Direction", "Entry Price", "Exit SL", "TP1", "TP2", "TP3",
-        "Realized PnL %", "Final Status", "Confidence", "Mode", "Trend", "Thesis",
+        "Realized PnL %", "Final Status", "Confidence", "Mode", "Leverage",
+        "RSI 1H", "Funding Rate %", "Book Ratio", "Whale L/S Ratio", "BTC 24h %", "Profit Index EV",
+        "Speed", "Trend", "Exit Reason", "Thesis",
         "Signal Timestamp (UTC)", "Closed Timestamp (UTC)"
     ])
 
     for r in rows:
+        r_dict = dict(r)
+        lev = r_dict.get("leverage") or (SCALP_LEVERAGE if r_dict.get("trade_speed") == "SCALP TRADE" else DEFAULT_LEVERAGE)
+        rsi = round(float(r_dict.get("rsi_1h") or 50.0), 1)
+        fr = f"{float(r_dict.get('funding_rate') or 0.0):+.4f}%"
+        br = round(float(r_dict.get("book_ratio") or 1.0), 2)
+        wls = round(float(r_dict.get("whale_ls_ratio") or 1.0), 2)
+        btc_chg = f"{float(r_dict.get('btc_24h_pct') or 0.0):+.2f}%"
+        p_idx = round(float(r_dict.get("profit_index") or 0.0), 2)
+        ex_reason = r_dict.get("exit_reason") or r_dict.get("movement_tag") or ""
+
         writer.writerow([
             r["id"], r["symbol"], r["action"], r["entry_limit"], r["current_sl"],
             r["target_1"], r["target_2"], r["target_3"], f"{float(r['realized_pnl'] or 0):+.2f}%",
-            r["status"], f"{float(r['confidence'] or 0)*100:.0f}%", r["trade_speed"],
-            r["coin_trend"], r["strategic_thesis"], r["timestamp"], r["last_updated"]
+            r["status"], f"{float(r['confidence'] or 0)*100:.0f}%", r_dict.get("trading_mode", "LIVE"), f"{lev}x",
+            rsi, fr, br, wls, btc_chg, p_idx,
+            r["trade_speed"], r["coin_trend"], ex_reason, r["strategic_thesis"],
+            r["timestamp"], r["last_updated"]
         ])
 
     csv_data = output.getvalue().encode("utf-8")

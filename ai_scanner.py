@@ -1298,7 +1298,14 @@ async def execute_unified_hourly_discovery_pipeline(context: ContextTypes.DEFAUL
                 item["atr_1h"], pos_size_usd, cand["trade_speed"], cand["coin_trend"], cand["thesis"],
                 confidence=quant_score, stage_init=init_stage,
                 binance_entry_order_id=binance_order_id,
-                executed_qty=executed_qty
+                executed_qty=executed_qty,
+                leverage=target_leverage,
+                rsi_1h=float(item.get("rsi_1h") or 50.0),
+                funding_rate=float(item.get("funding") or 0.0),
+                book_ratio=float(item.get("book_ratio") or 1.0),
+                whale_ls_ratio=float(cand_info.get("whale_ls_ratio") if cand_info else 1.0),
+                btc_24h_pct=float(btc_24h_pct),
+                profit_index=float(item.get("profit_index") or 0.0)
             )
             emitted_count += 1
 
@@ -1487,18 +1494,20 @@ async def report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     summary_text = (
         f"📊 <b>MONTHLY PERFORMANCE AUDIT ({rep['month'].upper()})</b>\n"
         f"<i>Cycle Baseline: {rep['start_date']} (Resets monthly)</i>\n\n"
-        f"🏛️ <b>Market Regime:</b> <code>{rep['regime']}</code>\n\n"
+        f"💰 <b>ACCOUNT CAPITAL & TELEMETRY:</b>\n"
+        f"• <b>Total Balance:</b> <code>${rep['capital_usd']:.2f} USD</code> ({rep['mode']})\n"
+        f"• <b>Free Margin:</b> <code>${rep['free_margin_usd']:.2f} USD</code>\n"
+        f"• <b>Market Regime:</b> <code>{rep['regime']}</code>\n\n"
         f"🔍 <b>DISCOVERY METRICS:</b>\n"
         f"• <b>Total AI Scans:</b> <code>{rep['total_scans']}</code> cycles\n"
         f"• <b>Signals Produced:</b> <code>{rep['total_signals']}</code> setups\n"
-        f"• <b>Active Positions:</b> <code>{rep['active_positions']}</code> live\n"
-        f"• <b>Pending In-Zone:</b> <code>{rep['pending_orders']}</code> orders\n\n"
+        f"• <b>Active Positions:</b> <code>{rep['active_positions']}</code> live | <b>Pending:</b> <code>{rep['pending_orders']}</code>\n\n"
         f"📈 <b>EXECUTION OUTCOMES:</b>\n"
-        f"• <b>Closed Trades:</b> <code>{rep['total_closed']}</code>\n"
-        f"• <b>Wins:</b> <code>{rep['wins']}</code> | <b>Losses:</b> <code>{rep['losses']}</code>\n"
+        f"• <b>Closed Trades:</b> <code>{rep['total_closed']}</code> (Wins: <code>{rep['wins']}</code> | Losses: <code>{rep['losses']}</code>)\n"
         f"• <b>Win Rate:</b> <b>{rep['win_rate']}%</b>\n"
+        f"• <b>Avg Win:</b> <code>+{rep['avg_win']:.2f}%</code> | <b>Avg Loss:</b> <code>{rep['avg_loss']:.2f}%</code>\n"
         f"• <b>Net Realized PnL:</b> {pnl_color} <b>{rep['net_pnl']:+.2f}%</b>\n\n"
-        f"📥 <i>Generating and attaching full CSV audit ledger below...</i>"
+        f"📥 <i>Attached CSV contains full debug variables (RSI, Funding, Depth Ratio, Whale L/S, Leverage, EV).</i>"
     )
     await update.message.reply_text(summary_text, parse_mode="HTML")
 
