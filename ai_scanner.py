@@ -1270,6 +1270,7 @@ async def execute_unified_hourly_discovery_pipeline(context: ContextTypes.DEFAUL
             init_stage = 1 if is_immediate_fill else 0
 
             binance_order_id = ""
+            binance_sl_id = ""
             executed_qty = 0.0
             actual_fill_price = levels["entry"]
             target_leverage = SCALP_LEVERAGE if is_scalp else DEFAULT_LEVERAGE
@@ -1286,7 +1287,7 @@ async def execute_unified_hourly_discovery_pipeline(context: ContextTypes.DEFAUL
                     
                     # Immediately place protective Stop-Loss on exchange
                     if executed_qty > 0:
-                        place_binance_stop_loss(sym, act, executed_qty, levels["sl"])
+                        binance_sl_id = place_binance_stop_loss(sym, act, executed_qty, levels["sl"])
             else:
                 # Place Resting Limit Order on Binance
                 if TRADING_MODE in ("LIVE", "TESTNET"):
@@ -1305,7 +1306,8 @@ async def execute_unified_hourly_discovery_pipeline(context: ContextTypes.DEFAUL
                 book_ratio=float(item.get("book_ratio") or 1.0),
                 whale_ls_ratio=float(cand_info.get("whale_ls_ratio") if cand_info else 1.0),
                 btc_24h_pct=float(btc_24h_pct),
-                profit_index=float(item.get("profit_index") or 0.0)
+                profit_index=float(item.get("profit_index") or 0.0),
+                binance_sl_order_id=binance_sl_id
             )
             emitted_count += 1
 

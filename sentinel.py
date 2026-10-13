@@ -307,6 +307,17 @@ async def run_sentinel_cycle(session: aiohttp.ClientSession):
 
         # 3. STAGE 1+: ACTIVE POSITION RISK DEFENSE & DYNAMIC TP/SL MANAGEMENT
         if stage >= 1:
+            # SAFETY GUARD: Ensure every active live position has a resting Stop-Loss on Binance
+            # If there was network lag or delay when the entry was submitted, place the missing SL right now
+            if TRADING_MODE in ("LIVE", "TESTNET") and (not sl_order_id or sl_order_id.startswith("SIMULATED")) and executed_qty > 0 and current_sl > 0:
+                log_event("WARN", "SL_SAFETY_GUARD", f"Missing on-exchange SL detected on {sym} ({act}). Placing emergency Stop-Loss now at ${current_sl:.6f}...")
+                recovered_sl_id = await asyncio.to_thread(place_binance_stop_loss, sym, act, executed_qty, current_sl)
+                if recovered_sl_id:
+                    sl_order_id = recovered_sl_id
+                    with get_db_connection() as conn_sl:
+                        conn_sl.execute("UPDATE watched_signals SET binance_sl_order_id = ? WHERE id = ?", (recovered_sl_id, w_id))
+                    log_event("INFO", "SL_SAFETY_GUARD", f"Recovered and bound live Stop-Loss {recovered_sl_id} for {sym}")
+
             created_at = parse_database_timestamp(item["timestamp"])
             holding_mins = (utc_now() - created_at).total_seconds() / 60.0
             pnl_approx = ((curr_price - entry) / entry * 100.0) if act == "LONG" else ((entry - curr_price) / entry * 100.0)

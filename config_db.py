@@ -650,11 +650,12 @@ def get_cooldown_symbols() -> list:
 def upsert_watched_signal(
     symbol, action, entry, sl, t1, t2, t3, atr_val, pos_size, trade_speed, coin_trend, 
     strategic_thesis="", confidence=0.75, stage_init=0, binance_entry_order_id="", executed_qty=0.0,
-    leverage=1, rsi_1h=50.0, funding_rate=0.0, book_ratio=1.0, whale_ls_ratio=1.0, btc_24h_pct=0.0, profit_index=0.0
+    leverage=1, rsi_1h=50.0, funding_rate=0.0, book_ratio=1.0, whale_ls_ratio=1.0, btc_24h_pct=0.0, profit_index=0.0,
+    binance_sl_order_id=""
 ):
     with get_db_connection() as conn:
         c = conn.cursor()
-        c.execute("SELECT stage, status, action, confidence, entry_limit, binance_entry_order_id FROM watched_signals WHERE symbol = ?", (symbol,))
+        c.execute("SELECT stage, status, action, confidence, entry_limit, binance_entry_order_id, binance_sl_order_id FROM watched_signals WHERE symbol = ?", (symbol,))
         existing = c.fetchone()
 
         if existing and existing["status"] == 'WATCHING' and existing["stage"] >= 1:
@@ -671,8 +672,8 @@ def upsert_watched_signal(
 
         conn.execute("""
             INSERT INTO watched_signals 
-            (symbol, action, entry_limit, initial_sl, current_sl, target_1, target_2, target_3, atr_val, position_size_usd, stage, highest_favorable_price, status, realized_pnl, confidence, trade_speed, coin_trend, strategic_thesis, movement_tag, binance_entry_order_id, executed_qty, trading_mode, leverage, rsi_1h, funding_rate, book_ratio, whale_ls_ratio, btc_24h_pct, profit_index, last_updated)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'WATCHING', 0.0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            (symbol, action, entry_limit, initial_sl, current_sl, target_1, target_2, target_3, atr_val, position_size_usd, stage, highest_favorable_price, status, realized_pnl, confidence, trade_speed, coin_trend, strategic_thesis, movement_tag, binance_entry_order_id, binance_sl_order_id, executed_qty, trading_mode, leverage, rsi_1h, funding_rate, book_ratio, whale_ls_ratio, btc_24h_pct, profit_index, last_updated)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'WATCHING', 0.0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
             ON CONFLICT(symbol) DO UPDATE SET
                 action=excluded.action,
                 entry_limit=excluded.entry_limit,
@@ -693,6 +694,7 @@ def upsert_watched_signal(
                 strategic_thesis=excluded.strategic_thesis,
                 movement_tag=excluded.movement_tag,
                 binance_entry_order_id=excluded.binance_entry_order_id,
+                binance_sl_order_id=excluded.binance_sl_order_id,
                 executed_qty=excluded.executed_qty,
                 trading_mode=excluded.trading_mode,
                 leverage=excluded.leverage,
@@ -707,8 +709,8 @@ def upsert_watched_signal(
         """, (
             symbol, action, entry, sl, sl, t1, t2, t3, atr_val, pos_size, stage_init, entry, 
             confidence, trade_speed, coin_trend, strategic_thesis, movement_tag, binance_entry_order_id, 
-            executed_qty, TRADING_MODE, leverage, rsi_1h, funding_rate, book_ratio, whale_ls_ratio, 
-            btc_24h_pct, profit_index
+            binance_sl_order_id, executed_qty, TRADING_MODE, leverage, rsi_1h, funding_rate, book_ratio, 
+            whale_ls_ratio, btc_24h_pct, profit_index
         ))
 
         risk_dist = abs(entry - sl) if entry > 0 else 1.0
