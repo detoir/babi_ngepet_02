@@ -309,14 +309,29 @@ async def run_sentinel_cycle(session: aiohttp.ClientSession):
         if stage >= 1:
             # SAFETY GUARD: Ensure every active live position has a resting Stop-Loss on Binance
             # If there was network lag or delay when the entry was submitted, place the missing SL right now
-            if TRADING_MODE in ("LIVE", "TESTNET") and (not sl_order_id or sl_order_id.startswith("SIMULATED")) and executed_qty > 0 and current_sl > 0:
-                log_event("WARN", "SL_SAFETY_GUARD", f"Missing on-exchange SL detected on {sym} ({act}). Placing emergency Stop-Loss now at ${current_sl:.6f}...")
-                recovered_sl_id = await asyncio.to_thread(place_binance_stop_loss, sym, act, executed_qty, current_sl)
-                if recovered_sl_id:
-                    sl_order_id = recovered_sl_id
-                    with get_db_connection() as conn_sl:
-                        conn_sl.execute("UPDATE watched_signals SET binance_sl_order_id = ? WHERE id = ?", (recovered_sl_id, w_id))
-                    log_event("INFO", "SL_SAFETY_GUARD", f"Recovered and bound live Stop-Loss {recovered_sl_id} for {sym}")
+            if TRADING_MODE in ("LIVE", "TESTNET") and (not sl_order_id or sl_order_id.startswith("SIMULATED")) and current_sl > 0:
+                if executed_qty <= 0:
+                    try:
+                        bridge_pos = bridge_symbol_formats(sym)
+                        positions = await asyncio.to_thread(exchange.fetch_positions, [bridge_pos["ccxt"]])
+                        for p in positions:
+                            contracts = abs(float(p.get("contracts") or 0.0))
+                            if contracts > 0:
+                                executed_qty = contracts
+                                break
+                    except Exception:
+                        pass
+                    if executed_qty <= 0:
+                        executed_qty = format_order_quantity(sym, pos_size_usd, curr_price)
+
+                if executed_qty > 0:
+                    log_event("WARN", "SL_SAFETY_GUARD", f"Missing on-exchange SL detected on {sym} ({act}). Placing emergency Stop-Loss now at ${current_sl:.6f} for {executed_qty} contracts...")
+                    recovered_sl_id = await asyncio.to_thread(place_binance_stop_loss, sym, act, executed_qty, current_sl)
+                    if recovered_sl_id:
+                        sl_order_id = recovered_sl_id
+                        with get_db_connection() as conn_sl:
+                            conn_sl.execute("UPDATE watched_signals SET binance_sl_order_id = ?, executed_qty = ? WHERE id = ?", (recovered_sl_id, executed_qty, w_id))
+                        log_event("INFO", "SL_SAFETY_GUARD", f"Recovered and bound live Stop-Loss {recovered_sl_id} for {sym}")
 
             created_at = parse_database_timestamp(item["timestamp"])
             holding_mins = (utc_now() - created_at).total_seconds() / 60.0
@@ -344,7 +359,7 @@ async def run_sentinel_cycle(session: aiohttp.ClientSession):
                 be_r_trigger = 0.5            # Milestone bank at +0.5R
                 reversal_min_gain = 0.85      # Catch reversals starting at +0.85%
                 reversal_pullback_threshold = 0.35
-                stagnation_limit_mins = 35.0  # Rapid capital recycling (>35m stall is closed)
+                stagnation_limit_mins = 75.0  # Allow setups sufficient breathing room before recycling capital
             elif is_weekend:
                 # WEEKEND ANOMALY REGIME: Low CME liquidity & erratic manipulation
                 regime_label = "WEEKEND ANOMALY"
@@ -374,7 +389,8 @@ async def run_sentinel_cycle(session: aiohttp.ClientSession):
                 r_gain = (curr_price - entry) / risk_span if act == "LONG" else (entry - curr_price) / risk_span
                 is_milestone_banked = ("BE_LOCKED" in tag_current or "BANKED" in tag_current or remaining_ratio < 0.90)
                 if r_gain >= be_r_trigger and not is_milestone_banked:
-                    be_sl = round(entry * 1.0015, 6) if act == "LONG" else round(entry * 0.9985, 6)
+                    # Pad BE stop to +0.25% to guarantee covering exchange taker fees (0.05% in + 0.05% out)
+                    be_sl = round(entry * 1.0025, 6) if act == "LONG" else round(entry * 0.9975, 6)
                     
                     # Scale out milestone: Scalps bank 50% immediately; Swings bank 33%
                     bank_ratio = 0.50 if is_scalp_trade else 0.33
@@ -606,7 +622,7 @@ async def run_sentinel_cycle(session: aiohttp.ClientSession):
                 hit_t1 = (curr_price >= t1) if act == "LONG" else (curr_price <= t1)
                 if hit_t1:
                     stage = 2
-                    be_sl = round(entry * 1.0015, 6) if act == "LONG" else round(entry * 0.9985, 6)
+                    be_sl = round(entry * 1.0025, 6) if act == "LONG" else round(entry * 0.9975, 6)
                     current_sl = be_sl
                     
                     # Close position on Binance: 60% for Scalp, 50% for Swing

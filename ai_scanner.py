@@ -71,6 +71,7 @@ from config_db import (
     place_binance_stop_loss,
     cancel_binance_order,
     emergency_binance_market_close,
+    format_order_quantity,
     parse_database_timestamp,
     utc_now,
 )
@@ -1655,16 +1656,30 @@ async def enter_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         atr_1h = calculate_atr(c1h, 14) if c1h else (curr_price * 0.018)
         levels = calculate_deterministic_trade_levels(curr_price, atr_1h, row["action"], curr_price, "TREND_MOMENTUM")
 
+        sl_id = ""
+        exec_qty = float(row["executed_qty"] or 0.0)
+        pos_size = float(row["position_size_usd"] or 500.0)
+        if TRADING_MODE in ("LIVE", "TESTNET"):
+            lev = int(row["leverage"] or DEFAULT_LEVERAGE)
+            m_res = place_binance_market_entry(row["symbol"], row["action"], pos_size, leverage=lev)
+            if float(m_res.get("filled", 0.0)) > 0:
+                exec_qty = float(m_res["filled"])
+                curr_price = float(m_res.get("price") or curr_price)
+            else:
+                exec_qty = format_order_quantity(row["symbol"], pos_size, curr_price)
+            sl_id = place_binance_stop_loss(row["symbol"], row["action"], exec_qty, levels["sl"])
+
         conn.execute("""
             UPDATE watched_signals 
-            SET stage = 1, entry_limit = ?, initial_sl = ?, current_sl = ?, target_1 = ?, target_2 = ?, target_3 = ?, highest_favorable_price = ?, last_updated = CURRENT_TIMESTAMP 
+            SET stage = 1, entry_limit = ?, initial_sl = ?, current_sl = ?, target_1 = ?, target_2 = ?, target_3 = ?, highest_favorable_price = ?, executed_qty = ?, binance_sl_order_id = ?, last_updated = CURRENT_TIMESTAMP 
             WHERE id = ?
-        """, (curr_price, levels["sl"], levels["sl"], levels["t1"], levels["t2"], levels["t3"], curr_price, row["id"]))
+        """, (curr_price, levels["sl"], levels["sl"], levels["t1"], levels["t2"], levels["t3"], curr_price, exec_qty, sl_id, row["id"]))
 
+    sl_note = f" (Placed on Binance: {sl_id})" if sl_id else ""
     await update.message.reply_text(
         f"🟢 <b>ACTIVATED ON BOT — {row['symbol']}</b> (⚡ FAST TRADE)\n\n"
         f"• <b>Fill Mark:</b> ${curr_price:.6f}\n"
-        f"• <b>Set Hard SL on Binance:</b> ${levels['sl']:.6f}\n"
+        f"• <b>Hard SL:</b> ${levels['sl']:.6f}{sl_note}\n"
         f"• <b>Set TPs:</b> TP1: ${levels['t1']:.6f} | TP2: ${levels['t2']:.6f} | TP3: ${levels['t3']:.6f}",
         parse_mode="HTML"
     )

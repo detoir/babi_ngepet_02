@@ -566,7 +566,12 @@ def cancel_binance_order(symbol: str, order_id: str) -> bool:
         log_event("INFO", "BINANCE_CANCEL", f"Cancelled order {order_id} on {target_sym}")
         return True
     except Exception as e:
-        log_event("WARN", "BINANCE_CANCEL", f"Cancel order {order_id} exception on {target_sym}: {e}")
+        err_msg = str(e)
+        if "-2011" in err_msg or "Unknown order" in err_msg:
+            # Order was already executed, cancelled, or expired on exchange
+            log_event("INFO", "BINANCE_CANCEL", f"Order {order_id} already resolved/closed on {target_sym}")
+        else:
+            log_event("WARN", "BINANCE_CANCEL", f"Cancel order {order_id} exception on {target_sym}: {e}")
         return False
 
 def emergency_binance_market_close(symbol: str, side: str, qty_contracts: float = 0.0) -> bool:
