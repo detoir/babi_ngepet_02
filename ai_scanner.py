@@ -185,24 +185,29 @@ def calculate_deterministic_trade_levels(price: float, atr_1h: float, direction:
     is_sweep = (strat_mode == "SWEEP_REVERSION" or is_weekend)
 
     if is_scalp or strat_mode == "SCALP":
-        # High-Speed Scalp Sniper: Compressed risk distance (0.8% - 1.3%)
-        raw_risk = atr_1h * 0.75
-        risk_dist = max(raw_risk, price * 0.008)
-        risk_dist = min(risk_dist, price * 0.013)
+        # Professional Scalp Sniper (Aligned with 5m/1m EMA + Pullback Framework):
+        # Use local ATR swing risk (0.6% - 1.2% max)
+        raw_risk = atr_1h * 0.70
+        risk_dist = max(raw_risk, price * 0.006)
+        risk_dist = min(risk_dist, price * 0.012)
 
-        # Scalp targets: TP1 at 1.0R (+0.8% to +1.3%), TP2 at 1.8R, TP3 at 2.6R
-        tp1_mult = 1.0
-        tp2_mult = 1.8
-        tp3_mult = 2.6
+        # Asymmetric Scalp Targets: TP1 at 1.5R (covers taker fee + secures profit), TP2 at 2.2R, TP3 at 3.0R
+        tp1_mult = 1.5
+        tp2_mult = 2.2
+        tp3_mult = 3.0
 
-        # Fast aggressive scalp entry: Use current mark price for immediate fill
-        # when SCALP_ENTRY_TYPE is MARKET, entry is mark price; otherwise tight 0.02% touch
+        # Smart Pullback Entry: Never buy the exact market top / short the exact market bottom
+        # If MARKET mode is explicitly set, use mark price; otherwise place limit at a smart discount
         if SCALP_ENTRY_TYPE == "MARKET":
             entry = round(price, 6)
         elif direction == "LONG":
-            entry = round(price * 0.9998, 6)
+            # Long pullback entry: Target a slight dip toward EMA21 or 0.25% discount
+            pullback_target = max(price * 0.9970, min(price * 0.9985, ema21_1h)) if ema21_1h < price else (price * 0.9975)
+            entry = round(pullback_target, 6)
         else:
-            entry = round(price * 1.0002, 6)
+            # Short pullback entry: Target a slight relief bounce toward EMA21 or 0.25% premium
+            bounce_target = min(price * 1.0030, max(price * 1.0015, ema21_1h)) if ema21_1h > price else (price * 1.0025)
+            entry = round(bounce_target, 6)
 
         if direction == "LONG":
             sl = round(entry - risk_dist, 6)
@@ -912,7 +917,44 @@ async def execute_unified_hourly_discovery_pipeline(context: ContextTypes.DEFAUL
         account_balance = float(capital_info.get("total", 10000.0))
         log_event("INFO", "CAPITAL", f"Current Capital Checked: ${account_balance:.2f} USD ({capital_info.get('mode', 'SIMULATION')})")
 
-        # 2. Fetch Active Positions & Pending Watchlist Setups
+        # 2. Fetch Active Positions & Pending Watchlist Setups (Auto-Sync from Binance)
+        if TRADING_MODE in ("LIVE", "TESTNET"):
+            try:
+                live_positions = await asyncio.to_thread(exchange.fetch_positions)
+                for lp in live_positions:
+                    contracts = abs(float(lp.get("contracts") or 0.0))
+                    if contracts > 0:
+                        raw_sym = lp.get("symbol", "")
+                        b_side = str(lp.get("side", "long")).upper()
+                        entry_px = float(lp.get("entryPrice") or lp.get("markPrice") or 0.0)
+                        pos_notional = float(lp.get("notional") or (contracts * entry_px))
+                        
+                        # Check if already present in database
+                        with get_db_connection() as c_check:
+                            c_cur = c_check.cursor()
+                            c_cur.execute("SELECT id, status, stage FROM watched_signals WHERE symbol = ? AND status = 'WATCHING'", (raw_sym,))
+                            existing_row = c_cur.fetchone()
+                            if not existing_row:
+                                # Auto-import manual or external Binance trade into bot tracking
+                                est_sl = round(entry_px * 0.990, 6) if b_side == "LONG" else round(entry_px * 1.010, 6)
+                                est_t1 = round(entry_px * 1.015, 6) if b_side == "LONG" else round(entry_px * 0.985, 6)
+                                est_t2 = round(entry_px * 1.025, 6) if b_side == "LONG" else round(entry_px * 0.975, 6)
+                                est_t3 = round(entry_px * 1.035, 6) if b_side == "LONG" else round(entry_px * 0.965, 6)
+                                c_check.execute("""
+                                    INSERT INTO watched_signals
+                                    (symbol, action, entry_limit, initial_sl, current_sl, target_1, target_2, target_3,
+                                     position_size_usd, stage, highest_favorable_price, status, confidence, trade_speed,
+                                     coin_trend, strategic_thesis, movement_tag, executed_qty, trading_mode, last_updated)
+                                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, 'WATCHING', 0.90, 'FAST TRADE', 'BINANCE_SYNC', 'Auto-synced from active Binance position', '🔄 BINANCE_SYNC', ?, ?, CURRENT_TIMESTAMP)
+                                    ON CONFLICT(symbol) DO UPDATE SET
+                                        status = 'WATCHING', stage = 1, executed_qty = excluded.executed_qty,
+                                        entry_limit = excluded.entry_limit, current_sl = excluded.current_sl,
+                                        movement_tag = '🔄 BINANCE_SYNC', last_updated = CURRENT_TIMESTAMP
+                                """, (raw_sym, b_side, entry_px, est_sl, est_sl, est_t1, est_t2, est_t3, pos_notional, entry_px, contracts, TRADING_MODE))
+                                log_event("INFO", "BINANCE_SYNC", f"Auto-synced open Binance {b_side} position on {raw_sym}: {contracts} contracts (${pos_notional:.1f})")
+            except Exception as e_pos:
+                log_event("WARN", "BINANCE_SYNC", f"Live position sync warning: {e_pos}")
+
         active_positions_payload = []
         pending_watchlist_payload = []
         with get_db_connection() as conn:
@@ -1192,6 +1234,17 @@ async def execute_unified_hourly_discovery_pipeline(context: ContextTypes.DEFAUL
                 continue
 
             is_scalp = (cand.get("trade_speed") == "SCALP TRADE" or cand.get("strategy_mode") == "SCALP")
+
+            # Strict Professional Scalp Trend Alignment Gate (EMA21 + RSI 50 Rule):
+            # Eliminates counter-trend knife-catching on lower timeframes
+            if is_scalp:
+                if act == "LONG" and (curr_price < ema21_1h or rsi_1h < 48.0 or btc_24h_pct < -1.0):
+                    log_event("INFO", "SCALP_GATE", f"Filtered LONG scalp on {sym}: Counter-trend (Price ${curr_price:.4f} < EMA21 ${ema21_1h:.4f} or RSI {rsi_1h:.1f} < 48).")
+                    continue
+                elif act == "SHORT" and (curr_price > ema21_1h or rsi_1h > 52.0 or btc_24h_pct > 1.5):
+                    log_event("INFO", "SCALP_GATE", f"Filtered SHORT scalp on {sym}: Counter-trend (Price ${curr_price:.4f} > EMA21 ${ema21_1h:.4f} or RSI {rsi_1h:.1f} > 52).")
+                    continue
+
             levels = calculate_deterministic_trade_levels(curr_price, atr_1h, act, ema21_1h, cand["strategy_mode"], change_24h=chg, is_scalp=is_scalp)
             
             # Dynamic Position Sizing used to compute EXPECTED CASH PROFIT
@@ -1251,6 +1304,13 @@ async def execute_unified_hourly_discovery_pipeline(context: ContextTypes.DEFAUL
             bridge = item["bridge"]
             act = cand["action"]
             sym = bridge["ccxt"]
+            is_scalp = item.get("is_scalp", False)
+
+            # Prevent Duplicate Orders: Never open a new setup on a symbol that is already active/watching
+            active_symbols = [p["symbol"] for p in active_positions_payload] + [p["symbol"] for p in pending_watchlist_payload]
+            if sym in active_symbols:
+                log_event("INFO", "PROFIT_ENGINE", f"Symbol {sym} already active on watchlist/position. Skipping duplicate emission.")
+                continue
 
             # Enforce correlation / cluster limit (Scalps have separate higher concurrency)
             dir_count = count_active_positions_by_direction(act)
@@ -1262,7 +1322,6 @@ async def execute_unified_hourly_discovery_pipeline(context: ContextTypes.DEFAUL
             levels = item["levels"]
             quant_score = item["quant_score"]
             curr_price = item["curr_price"]
-            is_scalp = item.get("is_scalp", False)
             pos_size_usd = item.get("pos_size_usd") or calculate_dynamic_position_size(quant_score, levels["risk_pct"], balance=account_balance, is_scalp=is_scalp)
 
             # Execution Logic: Aggressive scalps fill immediately at market

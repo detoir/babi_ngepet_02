@@ -52,16 +52,16 @@ PENDING_TTL_HOURS = get_env_int("PENDING_TTL_HOURS", 3)
 # TRADING_MODE options: "SIMULATION" (virtual alerts/tracking), "TESTNET" (Binance Futures Testnet), "LIVE" (Real Binance Futures)
 TRADING_MODE = get_env_str("TRADING_MODE", "SIMULATION").upper()
 DEFAULT_LEVERAGE = get_env_int("DEFAULT_LEVERAGE", 2)
-SCALP_LEVERAGE = get_env_int("SCALP_LEVERAGE", 5)  # More aggressive leverage for scalps
-SCALP_ENTRY_TYPE = get_env_str("SCALP_ENTRY_TYPE", "MARKET").upper()  # MARKET for immediate fills, LIMIT for resting
-MAX_CORRELATED_POSITIONS_PER_SIDE = get_env_int("MAX_CORRELATED_POSITIONS_PER_SIDE", 3)
-MAX_CORRELATED_SCALPS_PER_SIDE = get_env_int("MAX_CORRELATED_SCALPS_PER_SIDE", 4)
+SCALP_LEVERAGE = get_env_int("SCALP_LEVERAGE", 3)  # Conservative 3x leverage to protect small account equity
+SCALP_ENTRY_TYPE = get_env_str("SCALP_ENTRY_TYPE", "LIMIT").upper()  # LIMIT for discount pullback fills, avoiding maker fee drag
+MAX_CORRELATED_POSITIONS_PER_SIDE = get_env_int("MAX_CORRELATED_POSITIONS_PER_SIDE", 2)
+MAX_CORRELATED_SCALPS_PER_SIDE = get_env_int("MAX_CORRELATED_SCALPS_PER_SIDE", 1)  # 1 scalp at a time to prevent margin exhaustion
 
 # Risk & Gate Parameters
 MIN_RRR = get_env_float("MIN_RRR", 1.8)
 CONFIDENCE_THRESHOLD = get_env_float("CONFIDENCE_THRESHOLD", 0.75)
 MAX_24H_LOSS_THRESHOLD = get_env_float("MAX_24H_LOSS_THRESHOLD", -25.0)
-MAX_CONCURRENT_POSITIONS = get_env_int("MAX_CONCURRENT_POSITIONS", 30)
+MAX_CONCURRENT_POSITIONS = get_env_int("MAX_CONCURRENT_POSITIONS", 2)  # Max 2 concurrent positions for $30 balance
 MAX_DAILY_TRADES = get_env_int("MAX_DAILY_TRADES", 999999)  # Fully uncapped by default
 ACCOUNT_BALANCE_SIMULATED = get_env_float("ACCOUNT_BALANCE_SIM", 10000.0)
 
