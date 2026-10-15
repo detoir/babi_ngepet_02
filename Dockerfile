@@ -6,10 +6,12 @@ ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PORT=8000
 
-# Install dependensi sistem dasar yang dibutuhkan (gcc, curl untuk healthcheck)
+# Install dependensi sistem dasar yang dibutuhkan (gcc, curl untuk healthcheck, git & procps untuk debugging)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc \
     curl \
+    git \
+    procps \
     && rm -rf /var/lib/apt/lists/*
 
 # Tentukan direktori kerja di dalam container
