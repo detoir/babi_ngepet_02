@@ -41,6 +41,7 @@ from config_db import (
     DEEPSEEK_API_KEY,
     TELEGRAM_BOT_TOKEN,
     TELEGRAM_CHAT_ID,
+    ACCOUNT_BALANCE_SIMULATED,
     WHALE_MIN_PROBABILITY,
     SCALP_MIN_PROBABILITY,
     ENABLE_WHALE_SIGNALS,
@@ -332,12 +333,13 @@ def calculate_objective_quant_score(direction: str, rsi_1h: float, rsi_4h: float
 
     return round(max(0.10, min(0.95, score)), 2)
 
-def calculate_dynamic_position_size(quant_score: float, risk_pct: float, balance=ACCOUNT_BALANCE_SIMULATED, is_scalp: bool = False) -> float:
+def calculate_dynamic_position_size(quant_score: float, risk_pct: float, balance=None, is_scalp: bool = False) -> float:
+    bal = float(balance) if balance is not None else float(ACCOUNT_BALANCE_SIMULATED)
     risk_alloc = 0.0050 if quant_score < 0.78 else (0.0075 if quant_score < 0.85 else 0.0100)
-    risk_dollars = balance * risk_alloc
+    risk_dollars = bal * risk_alloc
     pos_size = (risk_dollars / (risk_pct / 100.0)) * 2.0 if risk_pct > 0 else 500.0
     cap_fraction = 0.50 if is_scalp else 0.40
-    return round(min(pos_size, balance * cap_fraction), 0)
+    return round(min(pos_size, bal * cap_fraction), 0)
 
 async def fetch_microstructure_data_async(session: aiohttp.ClientSession, symbol_clean: str) -> dict:
     oi_url = f"https://fapi.binance.com/fapi/v1/openInterest?symbol={symbol_clean}"
