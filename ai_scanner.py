@@ -41,9 +41,9 @@ from config_db import (
     DEEPSEEK_API_KEY,
     TELEGRAM_BOT_TOKEN,
     TELEGRAM_CHAT_ID,
-    ACCOUNT_BALANCE_SIMULATED,
     WHALE_MIN_PROBABILITY,
     SCALP_MIN_PROBABILITY,
+    ENABLE_WHALE_SIGNALS,
     is_weekend_regime,
     generate_monthly_performance_report,
     export_monthly_report_csv,
@@ -1153,8 +1153,8 @@ async def execute_unified_hourly_discovery_pipeline(context: ContextTypes.DEFAUL
                     "confidence": 0.80
                 })
 
-        # Ingest Whale Order Flow Setups
-        if whale_decision.get("action") == "TRADE":
+        # Ingest Whale Order Flow Setups (FROZEN by default to eliminate counter-trend drag)
+        if ENABLE_WHALE_SIGNALS and whale_decision.get("action") == "TRADE":
             for setup in whale_decision.get("whale_setups", []):
                 prob = float(setup.get("movement_probability") or 75.0)
                 if prob >= WHALE_MIN_PROBABILITY:
@@ -1169,6 +1169,8 @@ async def execute_unified_hourly_discovery_pipeline(context: ContextTypes.DEFAUL
                         "confidence": prob / 100.0,
                         "whale_pattern": setup.get("whale_pattern", "DISTRIBUTION_TRAP")
                     })
+        elif not ENABLE_WHALE_SIGNALS and whale_decision.get("action") == "TRADE":
+            log_event("INFO", "PROFIT_ENGINE", "Whale setups frozen: Focusing exclusively on high-win-rate Scalp & Swing momentum.")
 
         # Ingest AI Scalp Sniper Setups
         if scalp_decision.get("action") == "TRADE":

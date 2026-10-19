@@ -65,9 +65,10 @@ MAX_CONCURRENT_POSITIONS = get_env_int("MAX_CONCURRENT_POSITIONS", 2)  # Max 2 c
 MAX_DAILY_TRADES = get_env_int("MAX_DAILY_TRADES", 999999)  # Fully uncapped by default
 ACCOUNT_BALANCE_SIMULATED = get_env_float("ACCOUNT_BALANCE_SIM", 10000.0)
 
-# Stagnation & Whale Thresholds
+# Stagnation & Strategy Flags
 STAGNATION_MINS = get_env_float("STAGNATION_MINS", 180.0)
 STAGNATION_PNL_FLOOR = get_env_float("STAGNATION_PNL_FLOOR", -1.5)
+ENABLE_WHALE_SIGNALS = get_env_bool("ENABLE_WHALE_SIGNALS", False)  # Frozen: Focus on high-win-rate Scalp & Swing
 WHALE_MIN_PROBABILITY = get_env_float("WHALE_MIN_PROBABILITY", 75.0)
 SCALP_MIN_PROBABILITY = get_env_float("SCALP_MIN_PROBABILITY", 70.0)
 
@@ -536,8 +537,13 @@ def place_binance_stop_loss(symbol: str, side: str, qty_contracts: float, stop_p
     # If position is LONG, exit stop is SELL; if SHORT, exit stop is BUY
     order_side = "sell" if side.upper() == "LONG" else "buy"
     try:
+        market = exchange.market(target_sym)
+        min_qty = float(market.get("limits", {}).get("amount", {}).get("min") or 0.001)
         formatted_stop = format_order_price(target_sym, stop_price)
         formatted_qty = float(exchange.amount_to_precision(target_sym, qty_contracts))
+        if formatted_qty < min_qty:
+            log_event("WARN", "BINANCE_SL", f"Qty {formatted_qty} on {target_sym} below min amount {min_qty}. Adjusting to minimum contract size {min_qty}.")
+            formatted_qty = min_qty
         order = exchange.create_order(
             symbol=target_sym,
             type="STOP_MARKET",
