@@ -36,6 +36,12 @@ def get_env_float(key: str, default: float) -> float:
     except (ValueError, AttributeError):
         return default
 
+def get_env_bool(key: str, default: bool = False) -> bool:
+    val = os.getenv(key)
+    if val is None:
+        return default
+    return str(val).strip().lower() in ("1", "true", "yes", "on")
+
 # Credentials & API Keys
 DEEPSEEK_API_KEY = get_env_str("DEEPSEEK_API_KEY", "")
 TELEGRAM_BOT_TOKEN = get_env_str("TELEGRAM_BOT_TOKEN", "")
