@@ -74,7 +74,7 @@ ACCOUNT_BALANCE_SIMULATED = get_env_float("ACCOUNT_BALANCE_SIM", 10000.0)
 # Stagnation & Strategy Flags
 STAGNATION_MINS = get_env_float("STAGNATION_MINS", 180.0)
 STAGNATION_PNL_FLOOR = get_env_float("STAGNATION_PNL_FLOOR", -1.5)
-ENABLE_WHALE_SIGNALS = get_env_bool("ENABLE_WHALE_SIGNALS", False)  # Frozen: Focus on high-win-rate Scalp & Swing
+ENABLE_WHALE_SIGNALS = str(os.getenv("ENABLE_WHALE_SIGNALS", "false")).strip().lower() in ("1", "true", "yes", "on")  # Frozen: Focus on high-win-rate Scalp & Swing
 WHALE_MIN_PROBABILITY = get_env_float("WHALE_MIN_PROBABILITY", 75.0)
 SCALP_MIN_PROBABILITY = get_env_float("SCALP_MIN_PROBABILITY", 70.0)
 
