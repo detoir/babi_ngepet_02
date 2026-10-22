@@ -357,30 +357,30 @@ async def run_sentinel_cycle(session: aiohttp.ClientSession):
                 # HIGH-SPEED SCALP SNIPER REGIME: Fast turnover, early cash harvesting
                 regime_label = "⚡ HIGH-SPEED SCALP SNIPER"
                 be_r_trigger = 0.5            # Milestone bank at +0.5R
-                reversal_min_gain = 0.85      # Catch reversals starting at +0.85%
-                reversal_pullback_threshold = 0.35
-                stagnation_limit_mins = 75.0  # Allow setups sufficient breathing room before recycling capital
+                reversal_min_gain = 1.25      # Give trades room to breathe: require at least +1.25% peak gain
+                reversal_pullback_threshold = 0.65  # Don't panic on normal 0.35%-0.50% 1-minute candle noise
+                stagnation_limit_mins = 120.0 # Sufficient breathing room before stagnation defense
             elif is_weekend:
                 # WEEKEND ANOMALY REGIME: Low CME liquidity & erratic manipulation
                 regime_label = "WEEKEND ANOMALY"
                 be_r_trigger = 0.5
-                reversal_min_gain = 1.0
-                reversal_pullback_threshold = 0.4
-                stagnation_limit_mins = 60.0
+                reversal_min_gain = 1.35
+                reversal_pullback_threshold = 0.60
+                stagnation_limit_mins = 90.0
             elif is_sideways:
                 # SIDEWAYS / CHOP REGIME: Quick range-bound mean reversion
                 regime_label = "SIDEWAYS CHOP"
                 be_r_trigger = 0.6
-                reversal_min_gain = 1.4
-                reversal_pullback_threshold = 0.5
-                stagnation_limit_mins = 90.0
+                reversal_min_gain = 1.50
+                reversal_pullback_threshold = 0.65
+                stagnation_limit_mins = 120.0
             else:
                 # TRENDING MOMENTUM REGIME (Weekday Institutional Flow):
                 # Allow winners room to breathe so full TP1 (+1.2R) and TP2 (+2.0R) can be achieved
                 regime_label = "TRENDING MOMENTUM"
-                be_r_trigger = 1.0
-                reversal_min_gain = 2.2
-                reversal_pullback_threshold = 1.0
+                be_r_trigger = 0.8
+                reversal_min_gain = 2.20
+                reversal_pullback_threshold = 1.00
                 stagnation_limit_mins = STAGNATION_MINS  # 180.0
 
             # RULE A: ADAPTIVE AUTO BREAK-EVEN & MILESTONE PROFIT SCALE-OUT
@@ -439,7 +439,7 @@ async def run_sentinel_cycle(session: aiohttp.ClientSession):
             floor_label = None
 
             if is_scalp_trade:
-                # High-speed scalp micro-floors
+                # High-speed scalp micro-floors: engage early to lock in fee-covered break-even and gains
                 if peak_gain_pct >= 2.5:
                     target_floor_sl = round(entry * 1.018, 6) if act == "LONG" else round(entry * 0.982, 6)
                     floor_label = "🔒 SCALP_FLOOR_+1.8%"
@@ -449,9 +449,13 @@ async def run_sentinel_cycle(session: aiohttp.ClientSession):
                 elif peak_gain_pct >= 1.2:
                     target_floor_sl = round(entry * 1.007, 6) if act == "LONG" else round(entry * 0.993, 6)
                     floor_label = "🔒 SCALP_FLOOR_+0.7%"
-                elif peak_gain_pct >= 0.8:
+                elif peak_gain_pct >= 0.75:
                     target_floor_sl = round(entry * 1.0035, 6) if act == "LONG" else round(entry * 0.9965, 6)
                     floor_label = "🔒 SCALP_FLOOR_+0.35%"
+                elif peak_gain_pct >= 0.45:
+                    # Locks in Break-Even + 0.15% to cover round-trip exchange fees (0.05% in + 0.05% out)
+                    target_floor_sl = round(entry * 1.0015, 6) if act == "LONG" else round(entry * 0.9985, 6)
+                    floor_label = "🔒 SCALP_FLOOR_+0.15% (BE+FEES)"
             else:
                 if peak_gain_pct >= 3.0:
                     target_floor_sl = round(entry * 1.020, 6) if act == "LONG" else round(entry * 0.980, 6)
@@ -462,6 +466,9 @@ async def run_sentinel_cycle(session: aiohttp.ClientSession):
                 elif peak_gain_pct >= 1.5:
                     target_floor_sl = round(entry * 1.006, 6) if act == "LONG" else round(entry * 0.994, 6)
                     floor_label = "🔒 PROFIT_FLOOR_+0.6%"
+                elif peak_gain_pct >= 0.8:
+                    target_floor_sl = round(entry * 1.002, 6) if act == "LONG" else round(entry * 0.998, 6)
+                    floor_label = "🔒 PROFIT_FLOOR_+0.2% (BE+FEES)"
 
             if target_floor_sl is not None:
                 is_better_sl = (target_floor_sl > current_sl) if act == "LONG" else (target_floor_sl < current_sl)
@@ -522,40 +529,57 @@ async def run_sentinel_cycle(session: aiohttp.ClientSession):
                 await send_telegram_alert(session, msg)
                 continue
 
-            # Fast Scalp Stagnation Kill (Recycle capital if scalp goes nowhere after 35m)
-            if is_scalp_trade and stage == 1 and holding_mins >= stagnation_limit_mins and pnl_approx <= 0.20:
-                if sl_order_id:
-                    await asyncio.to_thread(cancel_binance_order, sym, sl_order_id)
-                if TRADING_MODE in ("LIVE", "TESTNET"):
-                    await asyncio.to_thread(emergency_binance_market_close, sym, act, executed_qty)
+            # Fast Scalp Stagnation Defense:
+            # If trade is flat or stagnant after stagnation limit, ratchet SL to BE+fees rather than paying taker fee on emergency market close
+            if is_scalp_trade and stage == 1 and holding_mins >= stagnation_limit_mins:
+                if pnl_approx >= 0.0 and "STAGNANT" not in tag_current:
+                    # Stagnant but green: Lock SL to Break-Even + Fees so it exits cost-free without an emergency dump
+                    be_safe_sl = round(entry * 1.0015, 6) if act == "LONG" else round(entry * 0.9985, 6)
+                    is_better_sl = (be_safe_sl > current_sl) if act == "LONG" else (be_safe_sl < current_sl)
+                    if is_better_sl:
+                        if TRADING_MODE in ("LIVE", "TESTNET") and executed_qty > 0:
+                            if sl_order_id:
+                                await asyncio.to_thread(cancel_binance_order, sym, sl_order_id)
+                            sl_order_id = await asyncio.to_thread(place_binance_stop_loss, sym, act, executed_qty, be_safe_sl)
+                        current_sl = be_safe_sl
+                    tag_current = "⏳ STAGNANT_BE_LOCKED"
+                    with get_db_connection() as conn:
+                        conn.execute("UPDATE watched_signals SET current_sl = ?, binance_sl_order_id = ?, movement_tag = ? WHERE id = ?", (current_sl, sl_order_id, tag_current, w_id))
+                    log_event("INFO", "SENTINEL_DEFENSE", f"Stagnant scalp {sym} ({pnl_approx:+.2f}% after {holding_mins:.0f}m) secured at BE Stop-Loss ${current_sl:.6f}")
+                elif pnl_approx < -0.50 and holding_mins >= 180.0:
+                    # Prolonged negative stagnation (> 3 hours): Close on Binance to reclaim margin
+                    if sl_order_id:
+                        await asyncio.to_thread(cancel_binance_order, sym, sl_order_id)
+                    if TRADING_MODE in ("LIVE", "TESTNET"):
+                        await asyncio.to_thread(emergency_binance_market_close, sym, act, executed_qty)
 
-                exit_price = curr_price
-                exit_pnl = ((exit_price - entry) / entry * 100.0) if act == "LONG" else ((entry - exit_price) / entry * 100.0)
-                final_pnl = round(partial_realized_pnl + (remaining_ratio * exit_pnl), 2)
+                    exit_price = curr_price
+                    exit_pnl = ((exit_price - entry) / entry * 100.0) if act == "LONG" else ((entry - exit_price) / entry * 100.0)
+                    final_pnl = round(partial_realized_pnl + (remaining_ratio * exit_pnl), 2)
 
-                close_status = "COMPLETED" if final_pnl >= 0 else "STOPPED_OUT"
-                with get_db_connection() as conn:
-                    conn.execute("""
-                        UPDATE watched_signals 
-                        SET status = ?, realized_pnl = ?, remaining_ratio = 0.0, exit_reason = 'SCALP_STAGNATION_KILL', movement_tag = '⚡ SCALP_STAGNATION_KILL', last_updated = CURRENT_TIMESTAMP 
-                        WHERE id = ?
-                    """, (close_status, final_pnl, w_id))
-                    conn.execute("""
-                        INSERT INTO loss_diagnostics (symbol, action, entry_price, exit_price, stop_loss_price, exit_type, holding_duration_mins, market_regime, diagnostic_reason)
-                        VALUES (?, ?, ?, ?, ?, 'SCALP_STAGNATION', ?, 'SCALP_SNIPER', ?)
-                    """, (sym, act, entry, exit_price, current_sl, holding_mins, f"Scalp stalled at {pnl_approx:+.2f}% after {holding_mins:.0f}m."))
+                    close_status = "COMPLETED" if final_pnl >= 0 else "STOPPED_OUT"
+                    with get_db_connection() as conn:
+                        conn.execute("""
+                            UPDATE watched_signals 
+                            SET status = ?, realized_pnl = ?, remaining_ratio = 0.0, exit_reason = 'SCALP_STAGNATION_KILL', movement_tag = '⚡ SCALP_STAGNATION_KILL', last_updated = CURRENT_TIMESTAMP 
+                            WHERE id = ?
+                        """, (close_status, final_pnl, w_id))
+                        conn.execute("""
+                            INSERT INTO loss_diagnostics (symbol, action, entry_price, exit_price, stop_loss_price, exit_type, holding_duration_mins, market_regime, diagnostic_reason)
+                            VALUES (?, ?, ?, ?, ?, 'SCALP_STAGNATION', ?, 'SCALP_SNIPER', ?)
+                        """, (sym, act, entry, exit_price, current_sl, holding_mins, f"Scalp stalled at {pnl_approx:+.2f}% after {holding_mins:.0f}m."))
 
-                log_event("INFO", "SENTINEL_EXIT", f"Trade {sym} {act} closed via SCALP_STAGNATION_KILL at {final_pnl:+.2f}% after {holding_mins:.0f}m")
+                    log_event("INFO", "SENTINEL_EXIT", f"Trade {sym} {act} closed via SCALP_STAGNATION_KILL at {final_pnl:+.2f}% after {holding_mins:.0f}m")
 
-                msg = (
-                    f"⚡ <b>SCALP STAGNATION KILL ({holding_mins:.0f}m)</b>\n\n"
-                    f"• <b>Contract:</b> <code>{sym}</code> ({act})\n"
-                    f"• <b>Exit Mark:</b> ${exit_price:.6f} (<code>{exit_pnl:+.2f}%</code>)\n"
-                    f"• <b>Total Realized Trade PnL:</b> <code>{final_pnl:+.2f}%</code>\n"
-                    f"🤖 <b>Closed on Binance to recycle capital for fresh active movers.</b>"
-                )
-                await send_telegram_alert(session, msg)
-                continue
+                    msg = (
+                        f"⚡ <b>SCALP STAGNATION RECYCLE ({holding_mins:.0f}m)</b>\n\n"
+                        f"• <b>Contract:</b> <code>{sym}</code> ({act})\n"
+                        f"• <b>Exit Mark:</b> ${exit_price:.6f} (<code>{exit_pnl:+.2f}%</code>)\n"
+                        f"• <b>Total Realized Trade PnL:</b> <code>{final_pnl:+.2f}%</code>\n"
+                        f"🤖 <b>Prolonged drawdown recycled to protect capital.</b>"
+                    )
+                    await send_telegram_alert(session, msg)
+                    continue
 
             # Stagnation Defense: Adaptive time in chop (Standard Swings)
             if stage == 1 and holding_mins >= stagnation_limit_mins and pnl_approx <= STAGNATION_PNL_FLOOR and "STAGNANT" not in tag_current:
