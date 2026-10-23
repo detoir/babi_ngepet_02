@@ -33,6 +33,7 @@ from config_db import (
     is_system_shutdown_requested,
     fetch_current_account_capital,
     place_binance_stop_loss,
+    place_binance_take_profit,
     cancel_binance_order,
     emergency_binance_market_close,
     fetch_binance_order_status,
@@ -133,6 +134,9 @@ async def run_sentinel_cycle(session: aiohttp.ClientSession):
         partial_realized_pnl = float(item_dict.get("partial_realized_pnl", 0.0) or 0.0)
         entry_order_id = str(item["binance_entry_order_id"] or "")
         sl_order_id = str(item["binance_sl_order_id"] or "")
+        tp1_order_id = str(item_dict.get("binance_tp1_id", "") or "")
+        tp2_order_id = str(item_dict.get("binance_tp2_id", "") or "")
+        tp3_order_id = str(item_dict.get("binance_tp3_id", "") or "")
         try:
             high_fav = float(item["highest_favorable_price"] or entry if entry > 0 else 1.0)
         except (ValueError, TypeError):
@@ -172,27 +176,32 @@ async def run_sentinel_cycle(session: aiohttp.ClientSession):
                 await send_telegram_alert(session, msg)
                 continue
             elif stage >= 1 and "SHOCK_BE_DEFENDED" not in tag_current:
-                tighter_sl = entry
-                if sl_order_id and executed_qty > 0:
-                    await asyncio.to_thread(cancel_binance_order, sym, sl_order_id)
-                    new_sl_id = await asyncio.to_thread(place_binance_stop_loss, sym, act, executed_qty, tighter_sl)
-                else:
-                    new_sl_id = sl_order_id
+                # Only move SL to entry if current price is safely on the profitable side (>=0.30% cushion)
+                tighter_sl = round(entry * 1.0015, 6) if act == "LONG" else round(entry * 0.9985, 6)
+                is_better = (tighter_sl > current_sl) if act == "LONG" else (tighter_sl < current_sl)
+                is_safe_side = (curr_price >= tighter_sl * 1.003) if act == "LONG" else (curr_price <= tighter_sl * 0.997)
+                if is_better and is_safe_side:
+                    if sl_order_id and executed_qty > 0:
+                        await asyncio.to_thread(cancel_binance_order, sym, sl_order_id)
+                        new_sl_id = await asyncio.to_thread(place_binance_stop_loss, sym, act, executed_qty, tighter_sl)
+                    else:
+                        new_sl_id = sl_order_id
 
-                with get_db_connection() as conn:
-                    conn.execute("""
-                        UPDATE watched_signals 
-                        SET current_sl = ?, binance_sl_order_id = ?, movement_tag = '⚠️ SHOCK_BE_DEFENDED', last_updated = CURRENT_TIMESTAMP 
-                        WHERE id = ?
-                    """, (tighter_sl, new_sl_id, w_id))
-                current_sl = tighter_sl
-                msg = (
-                    f"🛡️ <b>EMERGENCY ACTION: MOVE SL TO BREAK-EVEN</b>\n\n"
-                    f"• <b>Contract:</b> <code>{sym}</code> ({act})\n"
-                    f"• <b>Reason:</b> BTC Flash {btc_shock}.\n"
-                    f"🤖 <b>Adjusted live Binance Stop-Loss to Entry: ${entry:.6f}.</b>"
-                )
-                await send_telegram_alert(session, msg)
+                    with get_db_connection() as conn:
+                        conn.execute("""
+                            UPDATE watched_signals 
+                            SET current_sl = ?, binance_sl_order_id = ?, movement_tag = '⚠️ SHOCK_BE_DEFENDED', last_updated = CURRENT_TIMESTAMP 
+                            WHERE id = ?
+                        """, (tighter_sl, new_sl_id, w_id))
+                    current_sl = tighter_sl
+                    sl_order_id = new_sl_id
+                    msg = (
+                        f"🛡️ <b>EMERGENCY ACTION: MOVE SL TO BREAK-EVEN</b>\n\n"
+                        f"• <b>Contract:</b> <code>{sym}</code> ({act})\n"
+                        f"• <b>Reason:</b> BTC Flash {btc_shock}.\n"
+                        f"🤖 <b>Adjusted live Binance Stop-Loss to Break-Even: ${tighter_sl:.6f}.</b>"
+                    )
+                    await send_telegram_alert(session, msg)
 
         # 2. STAGE 0: PENDING LIMIT ORDER TRACKING & AUTO FILL
         if stage == 0:
@@ -228,58 +237,64 @@ async def run_sentinel_cycle(session: aiohttp.ClientSession):
                 await send_telegram_alert(session, expired_msg)
                 continue
 
-            # Check fill: either price touched entry or Binance order is FILLED/CLOSED
+            # Check fill: In LIVE/TESTNET with an entry_order_id, require actual exchange fill confirmation
             is_entry_touched = (curr_price <= entry) if act == "LONG" else (curr_price >= entry)
             is_order_filled = False
 
-            if entry_order_id and TRADING_MODE in ("LIVE", "TESTNET"):
+            if TRADING_MODE in ("LIVE", "TESTNET") and entry_order_id and not entry_order_id.startswith("SIMULATED"):
                 ord_status = await asyncio.to_thread(fetch_binance_order_status, sym, entry_order_id)
-                if ord_status.get("status") == "CLOSED":
+                if ord_status.get("status") == "CLOSED" or ord_status.get("filled", 0) > 0:
                     is_order_filled = True
                     if ord_status.get("filled", 0) > 0:
-                        executed_qty = ord_status["filled"]
+                        executed_qty = float(ord_status["filled"])
+                    if ord_status.get("average", 0) > 0:
+                        entry = float(ord_status["average"])
+            elif TRADING_MODE == "SIMULATION":
+                is_order_filled = is_entry_touched
 
-            if is_entry_touched or is_order_filled:
+            if is_order_filled:
                 stage = 1
                 target_leverage = SCALP_LEVERAGE if is_scalp_trade else DEFAULT_LEVERAGE
                 if TRADING_MODE in ("LIVE", "TESTNET"):
                     await asyncio.to_thread(set_symbol_leverage_and_margin, sym, target_leverage)
 
                 if executed_qty <= 0:
-                    executed_qty = format_order_quantity(sym, pos_size_usd, curr_price)
+                    executed_qty = format_order_quantity(sym, pos_size_usd, entry)
 
-                # Automatically submit Hard Stop-Loss order on Binance
+                # Automatically submit Hard Stop-Loss and Resting Limit TP1 (50% size) on Binance
                 new_sl_id = ""
+                new_tp1_id = ""
                 if TRADING_MODE in ("LIVE", "TESTNET") and executed_qty > 0:
                     new_sl_id = await asyncio.to_thread(place_binance_stop_loss, sym, act, executed_qty, current_sl)
+                    new_tp1_id = await asyncio.to_thread(place_binance_take_profit, sym, act, executed_qty * 0.50, t1)
 
                 with get_db_connection() as conn:
                     conn.execute("""
                         UPDATE watched_signals 
-                        SET stage = 1, highest_favorable_price = ?, executed_qty = ?, remaining_ratio = 1.0, partial_realized_pnl = 0.0, binance_sl_order_id = ?, last_updated = CURRENT_TIMESTAMP 
+                        SET stage = 1, entry_limit = ?, highest_favorable_price = ?, executed_qty = ?, remaining_ratio = 1.0, partial_realized_pnl = 0.0, binance_sl_order_id = ?, binance_tp1_id = ?, timestamp = CURRENT_TIMESTAMP, last_updated = CURRENT_TIMESTAMP 
                         WHERE id = ?
-                    """, (entry, executed_qty, new_sl_id, w_id))
+                    """, (entry, entry, executed_qty, new_sl_id, new_tp1_id, w_id))
 
                 if is_scalp_trade:
                     speed_badge = "⚡ SCALP SNIPER"
                     tp_display = (
-                        f"   • TP1 (60% Size): <code>${t1:.6f}</code> (+1.0R)\n"
-                        f"   • TP2 (25% Size): <code>${t2:.6f}</code> (+1.8R)\n"
-                        f"   • TP3 (15% Size): <code>${t3:.6f}</code> (+2.6R)"
+                        f"   • TP1 (50% Size): <code>${t1:.6f}</code> (+1.4R)\n"
+                        f"   • TP2 (25% Size): <code>${t2:.6f}</code> (+2.2R)\n"
+                        f"   • TP3 (25% Size): <code>${t3:.6f}</code> (+3.2R)"
                     )
                 else:
                     speed_badge = "🚀 FAST TRADE" if speed_tag == "FAST TRADE" else "⏳ SLOW TRADE"
                     tp_display = (
-                        f"   • TP1 (50% Size): <code>${t1:.6f}</code> (+1.2R)\n"
-                        f"   • TP2 (30% Size): <code>${t2:.6f}</code> (+2.0R)\n"
-                        f"   • TP3 (20% Size): <code>${t3:.6f}</code> (+3.2R)"
+                        f"   • TP1 (50% Size): <code>${t1:.6f}</code> (+1.5R)\n"
+                        f"   • TP2 (25% Size): <code>${t2:.6f}</code> (+2.4R)\n"
+                        f"   • TP3 (25% Size): <code>${t3:.6f}</code> (+3.5R)"
                     )
 
                 exec_mode_tag = f"🤖 [AUTO-{TRADING_MODE}]" if TRADING_MODE in ("LIVE", "TESTNET") else "📋 [SIMULATION]"
                 msg = (
                     f"🟢 <b>TRADE TRIGGERED / ENTRY FILLED ({speed_badge}) {exec_mode_tag}</b>\n\n"
                     f"• <b>Contract:</b> <code>{sym}</code> (<code>{act}</code>)\n"
-                    f"• <b>Fill Price:</b> <b>${curr_price:.6f}</b>\n"
+                    f"• <b>Fill Price:</b> <b>${entry:.6f}</b>\n"
                     f"• <b>Position Qty:</b> <code>{executed_qty} contracts</code> (${pos_size_usd:.0f} USD)\n\n"
                     f"📋 <b>ACTIVE RISK BRACKETS:</b>\n"
                     f"1. <b>Hard Stop-Loss:</b> <code>${current_sl:.6f}</code> {'(Active on Binance)' if new_sl_id else ''}\n"
@@ -289,7 +304,7 @@ async def run_sentinel_cycle(session: aiohttp.ClientSession):
                 await send_telegram_alert(session, msg)
 
             is_sl_blown = (curr_price <= current_sl) if act == "LONG" else (curr_price >= current_sl)
-            if is_sl_blown and not is_entry_touched and not is_order_filled:
+            if is_sl_blown and not is_order_filled:
                 if entry_order_id:
                     await asyncio.to_thread(cancel_binance_order, sym, entry_order_id)
                 with get_db_connection() as conn:
@@ -307,9 +322,50 @@ async def run_sentinel_cycle(session: aiohttp.ClientSession):
 
         # 3. STAGE 1+: ACTIVE POSITION RISK DEFENSE & DYNAMIC TP/SL MANAGEMENT
         if stage >= 1:
-            # SAFETY GUARD: Ensure every active live position has a resting Stop-Loss on Binance
-            # If there was network lag or delay when the entry was submitted, place the missing SL right now
-            if TRADING_MODE in ("LIVE", "TESTNET") and (not sl_order_id or sl_order_id.startswith("SIMULATED")) and current_sl > 0:
+            created_at = parse_database_timestamp(item["timestamp"])
+            holding_mins = (utc_now() - created_at).total_seconds() / 60.0
+
+            # STEP 3.0: Verify if the native Binance Stop-Loss order ALREADY filled on exchange
+            if TRADING_MODE in ("LIVE", "TESTNET") and sl_order_id and not sl_order_id.startswith("SIMULATED"):
+                sl_ord_info = await asyncio.to_thread(fetch_binance_order_status, sym, sl_order_id)
+                if sl_ord_info.get("status") == "CLOSED":
+                    # Native SL order triggered on Binance! Clean up any open TP orders
+                    for tp_oid in (tp1_order_id, tp2_order_id, tp3_order_id):
+                        if tp_oid:
+                            await asyncio.to_thread(cancel_binance_order, sym, tp_oid)
+                    exit_price = float(sl_ord_info.get("average") or current_sl)
+                    exit_pnl = ((exit_price - entry) / entry * 100.0) if act == "LONG" else ((entry - exit_price) / entry * 100.0)
+                    final_pnl = round(partial_realized_pnl + (remaining_ratio * exit_pnl), 2)
+                    cooldown_time = (utc_now() + datetime.timedelta(hours=4)).strftime("%Y-%m-%d %H:%M:%S")
+                    close_status = "COMPLETED" if final_pnl >= 0 else "STOPPED_OUT"
+                    exit_reason_text = "BE_PROFIT_STOP" if final_pnl >= 0 else "HARD_STOP_LOSS"
+                    with get_db_connection() as conn:
+                        conn.execute("""
+                            UPDATE watched_signals 
+                            SET status = ?, realized_pnl = ?, remaining_ratio = 0.0, exit_reason = ?, last_updated = CURRENT_TIMESTAMP 
+                            WHERE id = ?
+                        """, (close_status, final_pnl, exit_reason_text, w_id))
+                        if final_pnl < 0:
+                            conn.execute("INSERT OR REPLACE INTO symbol_cooldowns (symbol, cooldown_until) VALUES (?, ?)", (sym, cooldown_time))
+                            conn.execute("""
+                                INSERT INTO loss_diagnostics (symbol, action, entry_price, exit_price, stop_loss_price, exit_type, holding_duration_mins, market_regime, diagnostic_reason)
+                                VALUES (?, ?, ?, ?, ?, 'STOP_LOSS', ?, 'LIVE_EXCHANGE_SL', ?)
+                            """, (sym, act, entry, exit_price, current_sl, holding_mins, f"Exchange SL filled at ${exit_price:.6f} after {holding_mins:.0f}m ({final_pnl:+.2f}% PnL)."))
+                    log_event("INFO", "SENTINEL_EXIT", f"Trade {sym} {act} closed by exchange SL ({exit_reason_text}). Realized: {final_pnl:+.2f}%, Duration: {holding_mins:.0f}m")
+                    emoji = "🛑 <b>STOP-LOSS FILLED ON BINANCE</b>" if final_pnl < 0 else "🛡️ <b>PROFIT / BREAK-EVEN STOP FILLED</b>"
+                    msg = (
+                        f"{emoji}\n\n"
+                        f"• <b>Contract:</b> <code>{sym}</code> ({act})\n"
+                        f"• <b>Exit Price:</b> ${exit_price:.6f}\n"
+                        f"• <b>Holding Time:</b> <code>{holding_mins:.0f} mins</code>\n"
+                        f"• <b>Total Realized Result:</b> <code>{final_pnl:+.2f}%</code>\n"
+                        f"🤖 <b>Position closed on Binance and resting TP orders cleaned up.</b>"
+                    )
+                    await send_telegram_alert(session, msg)
+                    continue
+
+            # SAFETY GUARD: Ensure every active live position has a resting Stop-Loss and TP order on Binance
+            if TRADING_MODE in ("LIVE", "TESTNET") and current_sl > 0:
                 if executed_qty <= 0:
                     try:
                         bridge_pos = bridge_symbol_formats(sym)
@@ -324,8 +380,8 @@ async def run_sentinel_cycle(session: aiohttp.ClientSession):
                     if executed_qty <= 0:
                         executed_qty = format_order_quantity(sym, pos_size_usd, curr_price)
 
-                if executed_qty > 0:
-                    log_event("WARN", "SL_SAFETY_GUARD", f"Missing on-exchange SL detected on {sym} ({act}). Placing emergency Stop-Loss now at ${current_sl:.6f} for {executed_qty} contracts...")
+                if executed_qty > 0 and (not sl_order_id or sl_order_id.startswith("SIMULATED")):
+                    log_event("WARN", "SL_SAFETY_GUARD", f"Missing on-exchange SL detected on {sym} ({act}). Placing Stop-Loss at ${current_sl:.6f} for {executed_qty} contracts...")
                     recovered_sl_id = await asyncio.to_thread(place_binance_stop_loss, sym, act, executed_qty, current_sl)
                     if recovered_sl_id:
                         sl_order_id = recovered_sl_id
@@ -333,8 +389,13 @@ async def run_sentinel_cycle(session: aiohttp.ClientSession):
                             conn_sl.execute("UPDATE watched_signals SET binance_sl_order_id = ?, executed_qty = ? WHERE id = ?", (recovered_sl_id, executed_qty, w_id))
                         log_event("INFO", "SL_SAFETY_GUARD", f"Recovered and bound live Stop-Loss {recovered_sl_id} for {sym}")
 
-            created_at = parse_database_timestamp(item["timestamp"])
-            holding_mins = (utc_now() - created_at).total_seconds() / 60.0
+                if executed_qty > 0 and stage == 1 and (not tp1_order_id or tp1_order_id.startswith("SIMULATED")) and t1 > 0:
+                    recovered_tp1_id = await asyncio.to_thread(place_binance_take_profit, sym, act, executed_qty * 0.50, t1)
+                    if recovered_tp1_id:
+                        tp1_order_id = recovered_tp1_id
+                        with get_db_connection() as conn_tp:
+                            conn_tp.execute("UPDATE watched_signals SET binance_tp1_id = ? WHERE id = ?", (recovered_tp1_id, w_id))
+
             pnl_approx = ((curr_price - entry) / entry * 100.0) if act == "LONG" else ((entry - curr_price) / entry * 100.0)
 
             if act == "LONG":
@@ -354,132 +415,251 @@ async def run_sentinel_cycle(session: aiohttp.ClientSession):
             is_sideways = ("NEUTRAL" in coin_trend_str or "CONSOLIDATION" in coin_trend_str or speed_tag == "SWEEP_REVERSION")
 
             if is_scalp_trade:
-                # HIGH-SPEED SCALP SNIPER REGIME: Fast turnover, early cash harvesting
                 regime_label = "⚡ HIGH-SPEED SCALP SNIPER"
-                be_r_trigger = 0.5            # Milestone bank at +0.5R
-                reversal_min_gain = 1.25      # Give trades room to breathe: require at least +1.25% peak gain
-                reversal_pullback_threshold = 0.65  # Don't panic on normal 0.35%-0.50% 1-minute candle noise
-                stagnation_limit_mins = 120.0 # Sufficient breathing room before stagnation defense
+                reversal_min_gain = 1.40      # Require at least +1.40% peak gain before reversal harvest checks
+                reversal_pullback_threshold = 0.70  # Allow normal 0.50% crypto candle breathing room
+                stagnation_limit_mins = 120.0
             elif is_weekend:
-                # WEEKEND ANOMALY REGIME: Low CME liquidity & erratic manipulation
                 regime_label = "WEEKEND ANOMALY"
-                be_r_trigger = 0.5
-                reversal_min_gain = 1.35
-                reversal_pullback_threshold = 0.60
-                stagnation_limit_mins = 90.0
-            elif is_sideways:
-                # SIDEWAYS / CHOP REGIME: Quick range-bound mean reversion
-                regime_label = "SIDEWAYS CHOP"
-                be_r_trigger = 0.6
                 reversal_min_gain = 1.50
                 reversal_pullback_threshold = 0.65
+                stagnation_limit_mins = 90.0
+            elif is_sideways:
+                regime_label = "SIDEWAYS CHOP"
+                reversal_min_gain = 1.60
+                reversal_pullback_threshold = 0.70
                 stagnation_limit_mins = 120.0
             else:
-                # TRENDING MOMENTUM REGIME (Weekday Institutional Flow):
-                # Allow winners room to breathe so full TP1 (+1.2R) and TP2 (+2.0R) can be achieved
                 regime_label = "TRENDING MOMENTUM"
-                be_r_trigger = 0.8
                 reversal_min_gain = 2.20
                 reversal_pullback_threshold = 1.00
                 stagnation_limit_mins = STAGNATION_MINS  # 180.0
 
-            # RULE A: ADAPTIVE AUTO BREAK-EVEN & MILESTONE PROFIT SCALE-OUT
-            risk_span = abs(entry - float(item["initial_sl"] or current_sl))
-            if risk_span > 0:
-                r_gain = (curr_price - entry) / risk_span if act == "LONG" else (entry - curr_price) / risk_span
-                is_milestone_banked = ("BE_LOCKED" in tag_current or "BANKED" in tag_current or remaining_ratio < 0.90)
-                if r_gain >= be_r_trigger and not is_milestone_banked:
-                    # Pad BE stop to +0.25% to guarantee covering exchange taker fees (0.05% in + 0.05% out)
-                    be_sl = round(entry * 1.0025, 6) if act == "LONG" else round(entry * 0.9975, 6)
-                    
-                    # Scale out milestone: Scalps bank 50% immediately; Swings bank 33%
-                    bank_ratio = 0.50 if is_scalp_trade else 0.33
-                    bank_fraction = round(remaining_ratio * bank_ratio, 4)
-                    banked_gain = round(bank_fraction * pnl_approx, 4)
-                    new_partial_pnl = round(partial_realized_pnl + banked_gain, 4)
-                    new_remaining_ratio = round(remaining_ratio - bank_fraction, 4)
+            # ------------------------------------------------------------------
+            # STEP 3.1: TAKE-PROFIT EXECUTION (Check Resting Binance TP Orders & Targets FIRST)
+            # Keep 100% of position size intact until TP1 (+1.4R/+1.5R) so winners pay on full size!
+            # Scale out: 50% at TP1 -> 25% at TP2 -> 25% at TP3
+            # ------------------------------------------------------------------
+            if stage == 1:
+                tp1_order_filled = False
+                tp1_fill_price = curr_price
+                if TRADING_MODE in ("LIVE", "TESTNET") and tp1_order_id and not tp1_order_id.startswith("SIMULATED"):
+                    tp1_info = await asyncio.to_thread(fetch_binance_order_status, sym, tp1_order_id)
+                    if tp1_info.get("status") == "CLOSED":
+                        tp1_order_filled = True
+                        if tp1_info.get("average", 0) > 0:
+                            tp1_fill_price = float(tp1_info["average"])
 
-                    new_sl_id = sl_order_id
+                hit_t1 = tp1_order_filled or ((curr_price >= t1) if act == "LONG" else (curr_price <= t1))
+                if hit_t1:
+                    stage = 2
+                    # Move SL to Break-Even + 0.25% (or keep higher SL if already ratcheted above BE!)
+                    be_sl = round(entry * 1.0025, 6) if act == "LONG" else round(entry * 0.9975, 6)
+                    new_sl_target = max(current_sl, be_sl) if act == "LONG" else min(current_sl, be_sl)
+
+                    # Scale out 50% at TP1 (leaving full 50% for TP2 + TP3 runners)
+                    tp1_close_ratio = 0.50
+                    closed_fraction = round(remaining_ratio * tp1_close_ratio, 4)
+                    leg_pnl = ((tp1_fill_price - entry) / entry * 100.0) if act == "LONG" else ((entry - tp1_fill_price) / entry * 100.0)
+                    tp1_gain = round(closed_fraction * leg_pnl, 4)
+                    new_partial_pnl = round(partial_realized_pnl + tp1_gain, 4)
+                    new_remaining_ratio = round(remaining_ratio - closed_fraction, 4)
+
+                    new_tp2_id = ""
                     if TRADING_MODE in ("LIVE", "TESTNET") and executed_qty > 0:
-                        bank_qty = executed_qty * bank_ratio
-                        await asyncio.to_thread(emergency_binance_market_close, sym, act, bank_qty)
+                        close_qty = executed_qty * tp1_close_ratio
+                        if not tp1_order_filled:
+                            if tp1_order_id:
+                                await asyncio.to_thread(cancel_binance_order, sym, tp1_order_id)
+                            await asyncio.to_thread(emergency_binance_market_close, sym, act, close_qty)
                         if sl_order_id:
                             await asyncio.to_thread(cancel_binance_order, sym, sl_order_id)
-                        rem_qty = max(0.0, executed_qty - bank_qty)
-                        new_sl_id = await asyncio.to_thread(place_binance_stop_loss, sym, act, rem_qty, be_sl)
+                        remaining_qty = max(0.0, executed_qty - close_qty)
+                        new_sl_id = await asyncio.to_thread(place_binance_stop_loss, sym, act, remaining_qty, new_sl_target)
+                        # Place resting Limit TP2 for 50% of remaining (25% of original total)
+                        new_tp2_id = await asyncio.to_thread(place_binance_take_profit, sym, act, remaining_qty * 0.50, t2)
                     else:
-                        rem_qty = executed_qty * (1.0 - bank_ratio) if executed_qty > 0 else 0.0
+                        remaining_qty = executed_qty * (1.0 - tp1_close_ratio) if executed_qty > 0 else 0.0
+                        new_sl_id = sl_order_id
 
-                    tag_current = f"🛡️ BE_LOCKED + {int(bank_ratio*100)}% BANKED"
+                    current_sl = new_sl_target
+                    tag_current = "🎯 TP1_LOCKED"
                     with get_db_connection() as conn:
                         conn.execute("""
                             UPDATE watched_signals 
-                            SET current_sl = ?, binance_sl_order_id = ?, executed_qty = ?, remaining_ratio = ?, partial_realized_pnl = ?, movement_tag = ? 
+                            SET stage = 2, current_sl = ?, binance_sl_order_id = ?, binance_tp2_id = ?, executed_qty = ?, remaining_ratio = ?, partial_realized_pnl = ?, highest_favorable_price = ?, movement_tag = ?, last_updated = CURRENT_TIMESTAMP 
                             WHERE id = ?
-                        """, (be_sl, new_sl_id, rem_qty, new_remaining_ratio, new_partial_pnl, tag_current, w_id))
-                    
-                    current_sl = be_sl
-                    sl_order_id = new_sl_id
-                    executed_qty = rem_qty
+                        """, (current_sl, new_sl_id, new_tp2_id, remaining_qty, new_remaining_ratio, new_partial_pnl, updated_high_fav, tag_current, w_id))
+
+                    executed_qty = remaining_qty
                     remaining_ratio = new_remaining_ratio
                     partial_realized_pnl = new_partial_pnl
+                    sl_order_id = new_sl_id
+                    tp2_order_id = new_tp2_id
+                    tp1_badge = "(+1.4R SCALP TP1)" if is_scalp_trade else "(+1.5R)"
                     msg = (
-                        f"🛡️ <b>BREAK-EVEN & MILESTONE PROFIT SECURED (+{be_r_trigger:.1f}R [{regime_label}])</b>\n\n"
+                        f"🎯 <b>TP 1 HIT {tp1_badge} — 50% POSITION BANKED</b>\n\n"
                         f"• <b>Contract:</b> <code>{sym}</code> ({act})\n"
-                        f"• <b>Current Mark:</b> ${curr_price:.6f} (<code>{pnl_approx:+.2f}%</code>)\n"
-                        f"• <b>Banked to Realized Cash:</b> <code>+{banked_gain:.2f}%</code> ({int(bank_ratio*100)}% scaled out)\n"
-                        f"🤖 <b>Updated Stop-Loss to Break-Even: ${be_sl:.6f}</b>.\n"
-                        f"• Trade is now completely risk-free with guaranteed cash gain."
+                        f"• <b>Fill Price:</b> ${tp1_fill_price:.6f} (<code>{leg_pnl:+.2f}%</code>)\n"
+                        f"• <b>Banked on Leg:</b> <code>+{tp1_gain:.2f}%</code>\n\n"
+                        f"🤖 <b>AUTOMATED ACTIONS EXECUTED:</b>\n"
+                        f"1. <b>Closed 50% of position</b> on Binance.\n"
+                        f"2. <b>Locked Stop-Loss at: ${current_sl:.6f}</b>.\n"
+                        f"3. <b>Placed Resting Limit TP2 at: ${t2:.6f}</b>."
                     )
                     await send_telegram_alert(session, msg)
+                    continue
 
-            # RULE A.2: DYNAMIC TIERED PROFIT FLOOR RATCHET
-            # As peak gain expands, ratchet current_sl up to lock in guaranteed profit floors
+            elif stage == 2:
+                tp2_order_filled = False
+                tp2_fill_price = curr_price
+                if TRADING_MODE in ("LIVE", "TESTNET") and tp2_order_id and not tp2_order_id.startswith("SIMULATED"):
+                    tp2_info = await asyncio.to_thread(fetch_binance_order_status, sym, tp2_order_id)
+                    if tp2_info.get("status") == "CLOSED":
+                        tp2_order_filled = True
+                        if tp2_info.get("average", 0) > 0:
+                            tp2_fill_price = float(tp2_info["average"])
+
+                hit_t2 = tp2_order_filled or ((curr_price >= t2) if act == "LONG" else (curr_price <= t2))
+                if hit_t2:
+                    stage = 3
+                    new_sl_target = max(current_sl, t1) if act == "LONG" else min(current_sl, t1)
+
+                    # Close 50% of remaining position on Binance (25% of total, leaving 25% runner for TP3)
+                    closed_fraction = round(remaining_ratio * 0.50, 4)
+                    leg_pnl = ((tp2_fill_price - entry) / entry * 100.0) if act == "LONG" else ((entry - tp2_fill_price) / entry * 100.0)
+                    tp2_gain = round(closed_fraction * leg_pnl, 4)
+                    new_partial_pnl = round(partial_realized_pnl + tp2_gain, 4)
+                    new_remaining_ratio = round(remaining_ratio - closed_fraction, 4)
+
+                    new_tp3_id = ""
+                    if TRADING_MODE in ("LIVE", "TESTNET") and executed_qty > 0:
+                        tp2_qty = executed_qty * 0.50
+                        if not tp2_order_filled:
+                            if tp2_order_id:
+                                await asyncio.to_thread(cancel_binance_order, sym, tp2_order_id)
+                            await asyncio.to_thread(emergency_binance_market_close, sym, act, tp2_qty)
+                        if sl_order_id:
+                            await asyncio.to_thread(cancel_binance_order, sym, sl_order_id)
+                        remaining_qty = max(0.0, executed_qty - tp2_qty)
+                        new_sl_id = await asyncio.to_thread(place_binance_stop_loss, sym, act, remaining_qty, new_sl_target)
+                        # Place resting Limit TP3 for final 25% runner
+                        new_tp3_id = await asyncio.to_thread(place_binance_take_profit, sym, act, remaining_qty, t3)
+                    else:
+                        remaining_qty = executed_qty * 0.50 if executed_qty > 0 else 0.0
+                        new_sl_id = sl_order_id
+
+                    current_sl = new_sl_target
+                    tag_current = "🎯🎯 TP2_LOCKED"
+                    with get_db_connection() as conn:
+                        conn.execute("""
+                            UPDATE watched_signals 
+                            SET stage = 3, current_sl = ?, binance_sl_order_id = ?, binance_tp3_id = ?, executed_qty = ?, remaining_ratio = ?, partial_realized_pnl = ?, highest_favorable_price = ?, movement_tag = ?, last_updated = CURRENT_TIMESTAMP 
+                            WHERE id = ?
+                        """, (current_sl, new_sl_id, new_tp3_id, remaining_qty, new_remaining_ratio, new_partial_pnl, updated_high_fav, tag_current, w_id))
+
+                    executed_qty = remaining_qty
+                    remaining_ratio = new_remaining_ratio
+                    partial_realized_pnl = new_partial_pnl
+                    sl_order_id = new_sl_id
+                    tp3_order_id = new_tp3_id
+                    msg = (
+                        f"🎯🎯 <b>TP 2 HIT (+2.2R) — 75% TOTAL POSITION BANKED</b>\n\n"
+                        f"• <b>Contract:</b> <code>{sym}</code> ({act})\n"
+                        f"• <b>Fill Price:</b> ${tp2_fill_price:.6f} (<code>{leg_pnl:+.2f}%</code>)\n"
+                        f"• <b>Banked on Leg:</b> <code>+{tp2_gain:.2f}%</code>\n\n"
+                        f"🤖 <b>AUTOMATED ACTIONS EXECUTED:</b>\n"
+                        f"1. <b>Closed 50% of remaining</b> on Binance.\n"
+                        f"2. <b>Trailed Stop-Loss to TP1: ${current_sl:.6f}</b>.\n"
+                        f"3. <b>Placed Resting Limit TP3 at: ${t3:.6f}</b>."
+                    )
+                    await send_telegram_alert(session, msg)
+                    continue
+
+            elif stage == 3:
+                tp3_order_filled = False
+                tp3_fill_price = curr_price
+                if TRADING_MODE in ("LIVE", "TESTNET") and tp3_order_id and not tp3_order_id.startswith("SIMULATED"):
+                    tp3_info = await asyncio.to_thread(fetch_binance_order_status, sym, tp3_order_id)
+                    if tp3_info.get("status") == "CLOSED":
+                        tp3_order_filled = True
+                        if tp3_info.get("average", 0) > 0:
+                            tp3_fill_price = float(tp3_info["average"])
+
+                hit_t3 = tp3_order_filled or ((curr_price >= t3) if act == "LONG" else (curr_price <= t3))
+                if hit_t3:
+                    if sl_order_id:
+                        await asyncio.to_thread(cancel_binance_order, sym, sl_order_id)
+                    if TRADING_MODE in ("LIVE", "TESTNET") and not tp3_order_filled:
+                        if tp3_order_id:
+                            await asyncio.to_thread(cancel_binance_order, sym, tp3_order_id)
+                        await asyncio.to_thread(emergency_binance_market_close, sym, act, executed_qty)
+
+                    leg_pnl = ((tp3_fill_price - entry) / entry * 100.0) if act == "LONG" else ((entry - tp3_fill_price) / entry * 100.0)
+                    final_pnl = round(partial_realized_pnl + (remaining_ratio * leg_pnl), 2)
+                    with get_db_connection() as conn:
+                        conn.execute("""
+                            UPDATE watched_signals 
+                            SET status = 'COMPLETED', realized_pnl = ?, remaining_ratio = 0.0, exit_reason = 'TP3_FULL_TARGET', movement_tag = '🏆 TP3_FULL', last_updated = CURRENT_TIMESTAMP 
+                            WHERE id = ?
+                        """, (final_pnl, w_id))
+                    msg = (
+                        f"🏆 <b>FULL TAKE-PROFIT ACHIEVED (+3.2R)!</b>\n\n"
+                        f"• <b>Contract:</b> <code>{sym}</code> ({act})\n"
+                        f"• <b>Final Fill:</b> ${tp3_fill_price:.6f}\n"
+                        f"• <b>Total Net Trade Return:</b> <code>{final_pnl:+.2f}%</code>\n\n"
+                        f"🤖 <b>Closed final runner on Binance. Trade complete!</b>"
+                    )
+                    await send_telegram_alert(session, msg)
+                    continue
+
+            # ------------------------------------------------------------------
+            # STEP 3.2: DYNAMIC TIERED PROFIT FLOOR RATCHET (RUNNING STOP-LOSS)
+            # Enforces a strict >= 0.35% breathing cushion between curr_price and target_floor_sl
+            # so normal 1-minute candle wicks NEVER prematurely stop out winning trades!
+            # ------------------------------------------------------------------
             target_floor_sl = None
             floor_label = None
 
             if is_scalp_trade:
-                # High-speed scalp micro-floors: engage early to lock in fee-covered break-even and gains
-                if peak_gain_pct >= 2.5:
-                    target_floor_sl = round(entry * 1.018, 6) if act == "LONG" else round(entry * 0.982, 6)
-                    floor_label = "🔒 SCALP_FLOOR_+1.8%"
-                elif peak_gain_pct >= 1.8:
-                    target_floor_sl = round(entry * 1.012, 6) if act == "LONG" else round(entry * 0.988, 6)
-                    floor_label = "🔒 SCALP_FLOOR_+1.2%"
-                elif peak_gain_pct >= 1.2:
-                    target_floor_sl = round(entry * 1.007, 6) if act == "LONG" else round(entry * 0.993, 6)
-                    floor_label = "🔒 SCALP_FLOOR_+0.7%"
-                elif peak_gain_pct >= 0.75:
-                    target_floor_sl = round(entry * 1.0035, 6) if act == "LONG" else round(entry * 0.9965, 6)
-                    floor_label = "🔒 SCALP_FLOOR_+0.35%"
-                elif peak_gain_pct >= 0.45:
-                    # Locks in Break-Even + 0.15% to cover round-trip exchange fees (0.05% in + 0.05% out)
-                    target_floor_sl = round(entry * 1.0015, 6) if act == "LONG" else round(entry * 0.9985, 6)
-                    floor_label = "🔒 SCALP_FLOOR_+0.15% (BE+FEES)"
+                if peak_gain_pct >= 2.40 and pnl_approx >= 1.95:
+                    target_floor_sl = round(entry * 1.0150, 6) if act == "LONG" else round(entry * 0.9850, 6)
+                    floor_label = "🔒 SCALP_FLOOR_+1.50%"
+                elif peak_gain_pct >= 1.75 and pnl_approx >= 1.35:
+                    target_floor_sl = round(entry * 1.0095, 6) if act == "LONG" else round(entry * 0.9905, 6)
+                    floor_label = "🔒 SCALP_FLOOR_+0.95%"
+                elif peak_gain_pct >= 1.25 and pnl_approx >= 0.95:
+                    target_floor_sl = round(entry * 1.0050, 6) if act == "LONG" else round(entry * 0.9950, 6)
+                    floor_label = "🔒 SCALP_FLOOR_+0.50%"
+                elif peak_gain_pct >= 0.80 and pnl_approx >= 0.60:
+                    # Locks in Break-Even + 0.20% once trade has >= 0.60% current gain (>= 0.40% safe buffer)
+                    target_floor_sl = round(entry * 1.0020, 6) if act == "LONG" else round(entry * 0.9980, 6)
+                    floor_label = "🔒 SCALP_FLOOR_+0.20% (BE+FEES)"
             else:
-                if peak_gain_pct >= 3.0:
-                    target_floor_sl = round(entry * 1.020, 6) if act == "LONG" else round(entry * 0.980, 6)
-                    floor_label = "🔒 PROFIT_FLOOR_+2.0%"
-                elif peak_gain_pct >= 2.2:
-                    target_floor_sl = round(entry * 1.012, 6) if act == "LONG" else round(entry * 0.988, 6)
-                    floor_label = "🔒 PROFIT_FLOOR_+1.2%"
-                elif peak_gain_pct >= 1.5:
-                    target_floor_sl = round(entry * 1.006, 6) if act == "LONG" else round(entry * 0.994, 6)
-                    floor_label = "🔒 PROFIT_FLOOR_+0.6%"
-                elif peak_gain_pct >= 0.8:
-                    target_floor_sl = round(entry * 1.002, 6) if act == "LONG" else round(entry * 0.998, 6)
-                    floor_label = "🔒 PROFIT_FLOOR_+0.2% (BE+FEES)"
+                if peak_gain_pct >= 3.00 and pnl_approx >= 2.40:
+                    target_floor_sl = round(entry * 1.0180, 6) if act == "LONG" else round(entry * 0.9820, 6)
+                    floor_label = "🔒 PROFIT_FLOOR_+1.80%"
+                elif peak_gain_pct >= 2.10 and pnl_approx >= 1.65:
+                    target_floor_sl = round(entry * 1.0110, 6) if act == "LONG" else round(entry * 0.9890, 6)
+                    floor_label = "🔒 PROFIT_FLOOR_+1.10%"
+                elif peak_gain_pct >= 1.45 and pnl_approx >= 1.05:
+                    target_floor_sl = round(entry * 1.0055, 6) if act == "LONG" else round(entry * 0.9945, 6)
+                    floor_label = "🔒 PROFIT_FLOOR_+0.55%"
+                elif peak_gain_pct >= 0.95 and pnl_approx >= 0.65:
+                    target_floor_sl = round(entry * 1.0020, 6) if act == "LONG" else round(entry * 0.9980, 6)
+                    floor_label = "🔒 PROFIT_FLOOR_+0.20% (BE+FEES)"
 
             if target_floor_sl is not None:
                 is_better_sl = (target_floor_sl > current_sl) if act == "LONG" else (target_floor_sl < current_sl)
-                if is_better_sl:
+                has_safe_buffer = (curr_price >= target_floor_sl * 1.0035) if act == "LONG" else (curr_price <= target_floor_sl * 0.9965)
+                if is_better_sl and has_safe_buffer:
                     new_sl_id = sl_order_id
                     if TRADING_MODE in ("LIVE", "TESTNET") and executed_qty > 0:
                         if sl_order_id:
                             await asyncio.to_thread(cancel_binance_order, sym, sl_order_id)
                         new_sl_id = await asyncio.to_thread(place_binance_stop_loss, sym, act, executed_qty, target_floor_sl)
 
-                    tag_current = f"{tag_current} | {floor_label}" if ("BE_LOCKED" in tag_current or "BANKED" in tag_current) else floor_label
+                    tag_current = f"{tag_current} | {floor_label}" if ("TP" in tag_current or "LOCKED" in tag_current) else floor_label
                     with get_db_connection() as conn:
                         conn.execute("""
                             UPDATE watched_signals 
@@ -491,18 +671,21 @@ async def run_sentinel_cycle(session: aiohttp.ClientSession):
                     msg = (
                         f"<b>{floor_label} (Peak: +{peak_gain_pct:.2f}%)</b>\n\n"
                         f"• <b>Contract:</b> <code>{sym}</code> ({act})\n"
-                        f"• <b>Current Mark:</b> ${curr_price:.6f}\n"
+                        f"• <b>Current Mark:</b> ${curr_price:.6f} (<code>{pnl_approx:+.2f}%</code>)\n"
                         f"🤖 <b>Ratcheted Stop-Loss to: ${current_sl:.6f}</b> (Locking guaranteed profit floor)."
                     )
                     await send_telegram_alert(session, msg)
 
-            # RULE B: ADAPTIVE SUDDEN REVERSAL & PROFIT HARVEST DEFENSE
-            is_sudden_reversal = (peak_gain_pct >= reversal_min_gain and pullback_from_peak >= reversal_pullback_threshold and pnl_approx > 0.3)
-            is_peak_giveback = (peak_gain_pct >= 2.8 and pullback_from_peak >= 1.2)
+            # ------------------------------------------------------------------
+            # STEP 3.3: ADAPTIVE SUDDEN REVERSAL & PROFIT HARVEST DEFENSE
+            # ------------------------------------------------------------------
+            is_sudden_reversal = (peak_gain_pct >= reversal_min_gain and pullback_from_peak >= reversal_pullback_threshold and pnl_approx >= 0.55)
+            is_peak_giveback = (peak_gain_pct >= 2.8 and pullback_from_peak >= 1.2 and pnl_approx >= 0.80)
 
             if (is_sudden_reversal or is_peak_giveback) and stage == 1 and "PEAK_EXIT" not in tag_current:
-                if sl_order_id:
-                    await asyncio.to_thread(cancel_binance_order, sym, sl_order_id)
+                for oid in (sl_order_id, tp1_order_id, tp2_order_id, tp3_order_id):
+                    if oid:
+                        await asyncio.to_thread(cancel_binance_order, sym, oid)
                 if TRADING_MODE in ("LIVE", "TESTNET"):
                     await asyncio.to_thread(emergency_binance_market_close, sym, act, executed_qty)
 
@@ -529,27 +712,30 @@ async def run_sentinel_cycle(session: aiohttp.ClientSession):
                 await send_telegram_alert(session, msg)
                 continue
 
-            # Fast Scalp Stagnation Defense:
-            # If trade is flat or stagnant after stagnation limit, ratchet SL to BE+fees rather than paying taker fee on emergency market close
+            # ------------------------------------------------------------------
+            # STEP 3.4: STAGNATION DEFENSE (Safe Buffer Enforced)
+            # ------------------------------------------------------------------
             if is_scalp_trade and stage == 1 and holding_mins >= stagnation_limit_mins:
-                if pnl_approx >= 0.0 and "STAGNANT" not in tag_current:
-                    # Stagnant but green: Lock SL to Break-Even + Fees so it exits cost-free without an emergency dump
+                if pnl_approx >= 0.50 and "STAGNANT" not in tag_current:
+                    # Stagnant but safely green (>= +0.50%): Lock SL to Break-Even + Fees (+0.15%) with >=0.35% buffer
                     be_safe_sl = round(entry * 1.0015, 6) if act == "LONG" else round(entry * 0.9985, 6)
                     is_better_sl = (be_safe_sl > current_sl) if act == "LONG" else (be_safe_sl < current_sl)
-                    if is_better_sl:
+                    has_safe_buffer = (curr_price >= be_safe_sl * 1.003) if act == "LONG" else (curr_price <= be_safe_sl * 0.997)
+                    if is_better_sl and has_safe_buffer:
                         if TRADING_MODE in ("LIVE", "TESTNET") and executed_qty > 0:
                             if sl_order_id:
                                 await asyncio.to_thread(cancel_binance_order, sym, sl_order_id)
                             sl_order_id = await asyncio.to_thread(place_binance_stop_loss, sym, act, executed_qty, be_safe_sl)
                         current_sl = be_safe_sl
-                    tag_current = "⏳ STAGNANT_BE_LOCKED"
-                    with get_db_connection() as conn:
-                        conn.execute("UPDATE watched_signals SET current_sl = ?, binance_sl_order_id = ?, movement_tag = ? WHERE id = ?", (current_sl, sl_order_id, tag_current, w_id))
-                    log_event("INFO", "SENTINEL_DEFENSE", f"Stagnant scalp {sym} ({pnl_approx:+.2f}% after {holding_mins:.0f}m) secured at BE Stop-Loss ${current_sl:.6f}")
-                elif pnl_approx < -0.50 and holding_mins >= 180.0:
-                    # Prolonged negative stagnation (> 3 hours): Close on Binance to reclaim margin
-                    if sl_order_id:
-                        await asyncio.to_thread(cancel_binance_order, sym, sl_order_id)
+                        tag_current = "⏳ STAGNANT_BE_LOCKED"
+                        with get_db_connection() as conn:
+                            conn.execute("UPDATE watched_signals SET current_sl = ?, binance_sl_order_id = ?, movement_tag = ? WHERE id = ?", (current_sl, sl_order_id, tag_current, w_id))
+                        log_event("INFO", "SENTINEL_DEFENSE", f"Stagnant scalp {sym} ({pnl_approx:+.2f}% after {holding_mins:.0f}m) secured at BE Stop-Loss ${current_sl:.6f}")
+                elif pnl_approx < -0.60 and holding_mins >= 240.0:
+                    # Prolonged negative stagnation (> 4 hours): Close on Binance to reclaim margin
+                    for oid in (sl_order_id, tp1_order_id, tp2_order_id, tp3_order_id):
+                        if oid:
+                            await asyncio.to_thread(cancel_binance_order, sym, oid)
                     if TRADING_MODE in ("LIVE", "TESTNET"):
                         await asyncio.to_thread(emergency_binance_market_close, sym, act, executed_qty)
 
@@ -581,7 +767,7 @@ async def run_sentinel_cycle(session: aiohttp.ClientSession):
                     await send_telegram_alert(session, msg)
                     continue
 
-            # Stagnation Defense: Adaptive time in chop (Standard Swings)
+            # Stagnation Defense: Advisory for Standard Swings
             if stage == 1 and holding_mins >= stagnation_limit_mins and pnl_approx <= STAGNATION_PNL_FLOOR and "STAGNANT" not in tag_current:
                 with get_db_connection() as conn:
                     conn.execute("UPDATE watched_signals SET movement_tag = '⚠️ STAGNANT_WARNED' WHERE id = ?", (w_id,))
@@ -598,15 +784,17 @@ async def run_sentinel_cycle(session: aiohttp.ClientSession):
                 )
                 await send_telegram_alert(session, msg)
 
+            # ------------------------------------------------------------------
+            # STEP 3.5: STOP-LOSS HIT CHECK
+            # ------------------------------------------------------------------
             is_sl_hit = (curr_price <= current_sl) if act == "LONG" else (curr_price >= current_sl)
             if is_sl_hit:
-                if sl_order_id:
-                    await asyncio.to_thread(cancel_binance_order, sym, sl_order_id)
+                for oid in (sl_order_id, tp1_order_id, tp2_order_id, tp3_order_id):
+                    if oid:
+                        await asyncio.to_thread(cancel_binance_order, sym, oid)
                 if TRADING_MODE in ("LIVE", "TESTNET"):
                     await asyncio.to_thread(emergency_binance_market_close, sym, act, executed_qty)
 
-                # In SIMULATION mode, the resting stop order executes at current_sl
-                # In LIVE/TESTNET mode, exchange execution fills at current_sl (with small slippage)
                 exit_price = current_sl if TRADING_MODE == "SIMULATION" else curr_price
                 exit_pnl = ((exit_price - entry) / entry * 100.0) if act == "LONG" else ((entry - exit_price) / entry * 100.0)
                 final_pnl = round(partial_realized_pnl + (remaining_ratio * exit_pnl), 2)
@@ -640,130 +828,6 @@ async def run_sentinel_cycle(session: aiohttp.ClientSession):
                 )
                 await send_telegram_alert(session, msg)
                 continue
-
-            # Strict non-cascading TP execution
-            if stage == 1:
-                hit_t1 = (curr_price >= t1) if act == "LONG" else (curr_price <= t1)
-                if hit_t1:
-                    stage = 2
-                    be_sl = round(entry * 1.0025, 6) if act == "LONG" else round(entry * 0.9975, 6)
-                    current_sl = be_sl
-                    
-                    # Close position on Binance: 60% for Scalp, 50% for Swing
-                    tp1_close_ratio = 0.60 if is_scalp_trade else 0.50
-                    closed_fraction = round(remaining_ratio * tp1_close_ratio, 4)
-                    tp1_gain = round(closed_fraction * pnl_approx, 4)
-                    new_partial_pnl = round(partial_realized_pnl + tp1_gain, 4)
-                    new_remaining_ratio = round(remaining_ratio - closed_fraction, 4)
-
-                    if TRADING_MODE in ("LIVE", "TESTNET") and executed_qty > 0:
-                        close_qty = executed_qty * tp1_close_ratio
-                        await asyncio.to_thread(emergency_binance_market_close, sym, act, close_qty)
-                        if sl_order_id:
-                            await asyncio.to_thread(cancel_binance_order, sym, sl_order_id)
-                        remaining_qty = max(0.0, executed_qty - close_qty)
-                        new_sl_id = await asyncio.to_thread(place_binance_stop_loss, sym, act, remaining_qty, be_sl)
-                    else:
-                        remaining_qty = executed_qty * (1.0 - tp1_close_ratio) if executed_qty > 0 else 0.0
-                        new_sl_id = sl_order_id
-
-                    tag_current = "🎯 TP1_LOCKED"
-                    with get_db_connection() as conn:
-                        conn.execute("""
-                            UPDATE watched_signals 
-                            SET stage = 2, current_sl = ?, binance_sl_order_id = ?, executed_qty = ?, remaining_ratio = ?, partial_realized_pnl = ?, highest_favorable_price = ?, movement_tag = ?, last_updated = CURRENT_TIMESTAMP 
-                            WHERE id = ?
-                        """, (be_sl, new_sl_id, remaining_qty, new_remaining_ratio, new_partial_pnl, updated_high_fav, tag_current, w_id))
-                    
-                    executed_qty = remaining_qty
-                    remaining_ratio = new_remaining_ratio
-                    partial_realized_pnl = new_partial_pnl
-                    sl_order_id = new_sl_id
-                    tp1_badge = "(+1.0R SCALP TP1)" if is_scalp_trade else "(+1.2R)"
-                    msg = (
-                        f"🎯 <b>TP 1 HIT {tp1_badge} — {int(tp1_close_ratio*100)}% OF REMAINING LOCKED</b>\n\n"
-                        f"• <b>Contract:</b> <code>{sym}</code> ({act})\n"
-                        f"• <b>Current Mark:</b> ${curr_price:.6f}\n"
-                        f"• <b>Banked on Leg:</b> <code>+{tp1_gain:.2f}%</code>\n\n"
-                        f"🤖 <b>AUTOMATED ACTIONS EXECUTED:</b>\n"
-                        f"1. <b>Closed {int(tp1_close_ratio*100)}% of position</b> on Binance.\n"
-                        f"2. <b>Moved Stop-Loss to Break-Even: ${be_sl:.6f}</b>.\n"
-                        f"• Trade is completely risk-free."
-                    )
-                    await send_telegram_alert(session, msg)
-                    continue
-
-            elif stage == 2:
-                hit_t2 = (curr_price >= t2) if act == "LONG" else (curr_price <= t2)
-                if hit_t2:
-                    stage = 3
-                    current_sl = t1
-                    
-                    # Close 60% of remaining position on Binance (leaving runner for TP3)
-                    closed_fraction = round(remaining_ratio * 0.6, 4)
-                    tp2_gain = round(closed_fraction * pnl_approx, 4)
-                    new_partial_pnl = round(partial_realized_pnl + tp2_gain, 4)
-                    new_remaining_ratio = round(remaining_ratio - closed_fraction, 4)
-
-                    if TRADING_MODE in ("LIVE", "TESTNET") and executed_qty > 0:
-                        tp2_qty = executed_qty * 0.6
-                        await asyncio.to_thread(emergency_binance_market_close, sym, act, tp2_qty)
-                        if sl_order_id:
-                            await asyncio.to_thread(cancel_binance_order, sym, sl_order_id)
-                        remaining_qty = max(0.0, executed_qty - tp2_qty)
-                        new_sl_id = await asyncio.to_thread(place_binance_stop_loss, sym, act, remaining_qty, t1)
-                    else:
-                        remaining_qty = executed_qty * 0.4 if executed_qty > 0 else 0.0
-                        new_sl_id = sl_order_id
-
-                    tag_current = "🎯🎯 TP2_LOCKED"
-                    with get_db_connection() as conn:
-                        conn.execute("""
-                            UPDATE watched_signals 
-                            SET stage = 3, current_sl = ?, binance_sl_order_id = ?, executed_qty = ?, remaining_ratio = ?, partial_realized_pnl = ?, highest_favorable_price = ?, movement_tag = ?, last_updated = CURRENT_TIMESTAMP 
-                            WHERE id = ?
-                        """, (t1, new_sl_id, remaining_qty, new_remaining_ratio, new_partial_pnl, updated_high_fav, tag_current, w_id))
-                    
-                    executed_qty = remaining_qty
-                    remaining_ratio = new_remaining_ratio
-                    partial_realized_pnl = new_partial_pnl
-                    sl_order_id = new_sl_id
-                    msg = (
-                        f"🎯🎯 <b>TP 2 HIT (+2.0R) — 60% OF REMAINING LOCKED</b>\n\n"
-                        f"• <b>Contract:</b> <code>{sym}</code> ({act})\n"
-                        f"• <b>Current Mark:</b> ${curr_price:.6f}\n"
-                        f"• <b>Banked on Leg:</b> <code>+{tp2_gain:.2f}%</code>\n\n"
-                        f"🤖 <b>AUTOMATED ACTIONS EXECUTED:</b>\n"
-                        f"1. <b>Closed 60% of position</b> on Binance.\n"
-                        f"2. <b>Trailed Stop-Loss to TP1: ${t1:.6f}</b>."
-                    )
-                    await send_telegram_alert(session, msg)
-                    continue
-
-            elif stage == 3:
-                hit_t3 = (curr_price >= t3) if act == "LONG" else (curr_price <= t3)
-                if hit_t3:
-                    if sl_order_id:
-                        await asyncio.to_thread(cancel_binance_order, sym, sl_order_id)
-                    if TRADING_MODE in ("LIVE", "TESTNET"):
-                        await asyncio.to_thread(emergency_binance_market_close, sym, act, executed_qty)
-
-                    final_pnl = round(partial_realized_pnl + (remaining_ratio * pnl_approx), 2)
-                    with get_db_connection() as conn:
-                        conn.execute("""
-                            UPDATE watched_signals 
-                            SET status = 'COMPLETED', realized_pnl = ?, remaining_ratio = 0.0, exit_reason = 'TP3_FULL_TARGET', movement_tag = '🏆 TP3_FULL', last_updated = CURRENT_TIMESTAMP 
-                            WHERE id = ?
-                        """, (final_pnl, w_id))
-                    msg = (
-                        f"🏆 <b>FULL TAKE-PROFIT ACHIEVED (+3.2R)!</b>\n\n"
-                        f"• <b>Contract:</b> <code>{sym}</code> ({act})\n"
-                        f"• <b>Final Mark:</b> ${curr_price:.6f}\n"
-                        f"• <b>Total Net Trade Return:</b> <code>{final_pnl:+.2f}%</code>\n\n"
-                        f"🤖 <b>Closed remaining position on Binance. Trade complete!</b>"
-                    )
-                    await send_telegram_alert(session, msg)
-                    continue
 
             with get_db_connection() as conn:
                 conn.execute("UPDATE watched_signals SET highest_favorable_price = ? WHERE id = ?", (updated_high_fav, w_id))

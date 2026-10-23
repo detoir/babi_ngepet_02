@@ -565,7 +565,57 @@ def place_binance_stop_loss(symbol: str, side: str, qty_contracts: float, stop_p
         log_event("INFO", "BINANCE_SL", f"Placed Hard SL for {formatted_qty} {target_sym} at ${formatted_stop:.6f} (ID: {order_id})")
         return order_id
     except Exception as e:
-        log_event("ERROR", "BINANCE_SL", f"Stop loss order failed on {target_sym}: {e}")
+        log_event("ERROR", "BINANCE_SL", f"Stop loss order failed on {target_sym} at ${stop_price:.6f}: {e}")
+        return ""
+
+def place_binance_take_profit(symbol: str, side: str, qty_contracts: float, tp_price: float) -> str:
+    if TRADING_MODE not in ("LIVE", "TESTNET"):
+        return "SIMULATED_TP"
+    bridge = bridge_symbol_formats(symbol)
+    target_sym = bridge["ccxt"]
+    # If position is LONG, exit TP is SELL; if SHORT, exit TP is BUY
+    order_side = "sell" if side.upper() == "LONG" else "buy"
+    try:
+        market = exchange.market(target_sym)
+        min_qty = float(market.get("limits", {}).get("amount", {}).get("min") or 0.001)
+        formatted_tp = format_order_price(target_sym, tp_price)
+        formatted_qty = float(exchange.amount_to_precision(target_sym, qty_contracts))
+        if formatted_qty < min_qty:
+            formatted_qty = min_qty
+        # Place reduceOnly LIMIT order at TP price to capture exact wicks with Maker fee (0.02% vs 0.05% Taker)
+        try:
+            order = exchange.create_order(
+                symbol=target_sym,
+                type="LIMIT",
+                side=order_side,
+                amount=formatted_qty,
+                price=formatted_tp,
+                params={
+                    "timeInForce": "GTC",
+                    "reduceOnly": True
+                }
+            )
+            order_id = str(order.get("id"))
+            log_event("INFO", "BINANCE_TP", f"Placed Resting Limit TP for {formatted_qty} {target_sym} at ${formatted_tp:.6f} (ID: {order_id})")
+            return order_id
+        except Exception:
+            # Fallback to TAKE_PROFIT_MARKET if price already crossed or limit rejected
+            order = exchange.create_order(
+                symbol=target_sym,
+                type="TAKE_PROFIT_MARKET",
+                side=order_side,
+                amount=formatted_qty,
+                params={
+                    "stopPrice": formatted_tp,
+                    "reduceOnly": True,
+                    "workingType": "MARK_PRICE"
+                }
+            )
+            order_id = str(order.get("id"))
+            log_event("INFO", "BINANCE_TP", f"Placed Conditional TP_MARKET for {formatted_qty} {target_sym} at ${formatted_tp:.6f} (ID: {order_id})")
+            return order_id
+    except Exception as e:
+        log_event("WARN", "BINANCE_TP", f"Take profit order failed on {target_sym} at ${tp_price:.6f}: {e}")
         return ""
 
 def cancel_binance_order(symbol: str, order_id: str) -> bool:
@@ -594,8 +644,12 @@ def emergency_binance_market_close(symbol: str, side: str, qty_contracts: float 
     order_side = "sell" if side.upper() == "LONG" else "buy"
     try:
         params = {"reduceOnly": True}
+        market = exchange.market(target_sym)
+        min_qty = float(market.get("limits", {}).get("amount", {}).get("min") or 0.001)
         if qty_contracts > 0:
             formatted_qty = float(exchange.amount_to_precision(target_sym, qty_contracts))
+            if formatted_qty < min_qty:
+                formatted_qty = min_qty
             exchange.create_order(symbol=target_sym, type="MARKET", side=order_side, amount=formatted_qty, params=params)
         else:
             # Fetch current open position size on Binance
@@ -668,16 +722,22 @@ def upsert_watched_signal(
     symbol, action, entry, sl, t1, t2, t3, atr_val, pos_size, trade_speed, coin_trend, 
     strategic_thesis="", confidence=0.75, stage_init=0, binance_entry_order_id="", executed_qty=0.0,
     leverage=1, rsi_1h=50.0, funding_rate=0.0, book_ratio=1.0, whale_ls_ratio=1.0, btc_24h_pct=0.0, profit_index=0.0,
-    binance_sl_order_id=""
+    binance_sl_order_id="", binance_tp1_id=""
 ):
     with get_db_connection() as conn:
         c = conn.cursor()
-        c.execute("SELECT stage, status, action, confidence, entry_limit, binance_entry_order_id, binance_sl_order_id FROM watched_signals WHERE symbol = ?", (symbol,))
+        c.execute("SELECT stage, status, action, confidence, entry_limit, binance_entry_order_id, binance_sl_order_id, binance_tp1_id FROM watched_signals WHERE symbol = ?", (symbol,))
         existing = c.fetchone()
 
         if existing and existing["status"] == 'WATCHING' and existing["stage"] >= 1:
             log_event("INFO", "WATCHLIST", f"Targets locked for live trade {symbol}. Modification blocked.")
             return False
+
+        # If re-anchoring a pending Stage 0 limit order, cancel the old pending order on Binance first
+        if existing and existing["status"] == 'WATCHING' and existing["stage"] == 0:
+            old_entry_id = str(existing["binance_entry_order_id"] or "")
+            if old_entry_id and old_entry_id != binance_entry_order_id:
+                cancel_binance_order(symbol, old_entry_id)
 
         movement_tag = "🆕 NEW SETUP"
         if existing and existing["status"] == 'WATCHING':
@@ -689,8 +749,8 @@ def upsert_watched_signal(
 
         conn.execute("""
             INSERT INTO watched_signals 
-            (symbol, action, entry_limit, initial_sl, current_sl, target_1, target_2, target_3, atr_val, position_size_usd, stage, highest_favorable_price, status, realized_pnl, confidence, trade_speed, coin_trend, strategic_thesis, movement_tag, binance_entry_order_id, binance_sl_order_id, executed_qty, trading_mode, leverage, rsi_1h, funding_rate, book_ratio, whale_ls_ratio, btc_24h_pct, profit_index, last_updated)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'WATCHING', 0.0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            (symbol, action, entry_limit, initial_sl, current_sl, target_1, target_2, target_3, atr_val, position_size_usd, stage, highest_favorable_price, status, realized_pnl, remaining_ratio, partial_realized_pnl, confidence, trade_speed, coin_trend, strategic_thesis, movement_tag, binance_entry_order_id, binance_sl_order_id, binance_tp1_id, binance_tp2_id, binance_tp3_id, executed_qty, trading_mode, leverage, rsi_1h, funding_rate, book_ratio, whale_ls_ratio, btc_24h_pct, profit_index, timestamp, last_updated)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'WATCHING', 0.0, 1.0, 0.0, ?, ?, ?, ?, ?, ?, ?, ?, '', '', ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
             ON CONFLICT(symbol) DO UPDATE SET
                 action=excluded.action,
                 entry_limit=excluded.entry_limit,
@@ -705,6 +765,8 @@ def upsert_watched_signal(
                 highest_favorable_price=excluded.entry_limit,
                 status='WATCHING',
                 realized_pnl=0.0,
+                remaining_ratio=1.0,
+                partial_realized_pnl=0.0,
                 confidence=excluded.confidence,
                 trade_speed=excluded.trade_speed,
                 coin_trend=excluded.coin_trend,
@@ -712,6 +774,9 @@ def upsert_watched_signal(
                 movement_tag=excluded.movement_tag,
                 binance_entry_order_id=excluded.binance_entry_order_id,
                 binance_sl_order_id=excluded.binance_sl_order_id,
+                binance_tp1_id=excluded.binance_tp1_id,
+                binance_tp2_id='',
+                binance_tp3_id='',
                 executed_qty=excluded.executed_qty,
                 trading_mode=excluded.trading_mode,
                 leverage=excluded.leverage,
@@ -722,11 +787,12 @@ def upsert_watched_signal(
                 btc_24h_pct=excluded.btc_24h_pct,
                 profit_index=excluded.profit_index,
                 exit_reason='',
+                timestamp=CURRENT_TIMESTAMP,
                 last_updated=CURRENT_TIMESTAMP
         """, (
             symbol, action, entry, sl, sl, t1, t2, t3, atr_val, pos_size, stage_init, entry, 
             confidence, trade_speed, coin_trend, strategic_thesis, movement_tag, binance_entry_order_id, 
-            binance_sl_order_id, executed_qty, TRADING_MODE, leverage, rsi_1h, funding_rate, book_ratio, 
+            binance_sl_order_id, binance_tp1_id, executed_qty, TRADING_MODE, leverage, rsi_1h, funding_rate, book_ratio, 
             whale_ls_ratio, btc_24h_pct, profit_index
         ))
 

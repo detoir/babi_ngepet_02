@@ -70,6 +70,7 @@ from config_db import (
     place_binance_market_entry,
     place_binance_entry_limit,
     place_binance_stop_loss,
+    place_binance_take_profit,
     cancel_binance_order,
     emergency_binance_market_close,
     format_order_quantity,
@@ -186,16 +187,16 @@ def calculate_deterministic_trade_levels(price: float, atr_1h: float, direction:
     is_sweep = (strat_mode == "SWEEP_REVERSION" or is_weekend)
 
     if is_scalp or strat_mode == "SCALP":
-        # Professional Scalp Sniper (Aligned with 5m/1m EMA + Pullback Framework):
-        # Use local ATR swing risk (0.6% - 1.2% max)
+        # Professional Scalp Sniper:
+        # Balanced ATR swing risk (0.75% min to avoid 1m spread wicks, 1.15% max to cap single loss)
         raw_risk = atr_1h * 0.70
-        risk_dist = max(raw_risk, price * 0.006)
-        risk_dist = min(risk_dist, price * 0.012)
+        risk_dist = max(raw_risk, price * 0.0075)
+        risk_dist = min(risk_dist, price * 0.0115)
 
-        # Asymmetric Scalp Targets: TP1 at 1.5R (covers taker fee + secures profit), TP2 at 2.2R, TP3 at 3.0R
-        tp1_mult = 1.5
+        # Asymmetric Scalp Targets: TP1 at 1.4R, TP2 at 2.2R, TP3 at 3.2R
+        tp1_mult = 1.4
         tp2_mult = 2.2
-        tp3_mult = 3.0
+        tp3_mult = 3.2
 
         # Smart Pullback Entry: Never buy the exact market top / short the exact market bottom
         # If MARKET mode is explicitly set, use mark price; otherwise place limit at a smart discount
@@ -227,26 +228,29 @@ def calculate_deterministic_trade_levels(price: float, atr_1h: float, direction:
             "t1": t1,
             "t2": t2,
             "t3": t3,
+            "tp1_mult": tp1_mult,
+            "tp2_mult": tp2_mult,
+            "tp3_mult": tp3_mult,
             "risk_dist": risk_dist,
             "risk_pct": round((risk_dist / entry) * 100.0, 2) if entry > 0 else 1.0
         }
 
-    # Dynamic risk distance (1.5% to 2.8% max)
-    raw_risk = atr_1h * 1.5
-    risk_dist = max(raw_risk, price * 0.015)
-    risk_dist = min(risk_dist, price * 0.028)
+    # Dynamic risk distance for Fast/Swing trades: Cap strictly at 1.50% (down from 2.80%) to prevent oversized -2.8% drawdowns
+    raw_risk = atr_1h * 1.15
+    risk_dist = max(raw_risk, price * 0.010)
+    risk_dist = min(risk_dist, price * 0.015)
 
     # Adaptive reward multipliers based on regime
     if is_sweep:
-        # Range-bound / Weekend: Compressed targets for quick scalp turnover
-        tp1_mult = 0.85
-        tp2_mult = 1.5
-        tp3_mult = 2.2
+        # Range-bound / Weekend: Positive asymmetric R:R (1.3R / 2.1R / 3.0R)
+        tp1_mult = 1.3
+        tp2_mult = 2.1
+        tp3_mult = 3.0
     else:
         # Trending: Asymmetric reward multipliers allowing runners to achieve full target
-        tp1_mult = 1.2
-        tp2_mult = 2.0
-        tp3_mult = 3.2
+        tp1_mult = 1.5
+        tp2_mult = 2.4
+        tp3_mult = 3.5
 
     if not is_sweep:
         if direction == "SHORT":
@@ -945,13 +949,14 @@ async def execute_unified_hourly_discovery_pipeline(context: ContextTypes.DEFAUL
                                 c_check.execute("""
                                     INSERT INTO watched_signals
                                     (symbol, action, entry_limit, initial_sl, current_sl, target_1, target_2, target_3,
-                                     position_size_usd, stage, highest_favorable_price, status, confidence, trade_speed,
-                                     coin_trend, strategic_thesis, movement_tag, executed_qty, trading_mode, last_updated)
-                                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, 'WATCHING', 0.90, 'FAST TRADE', 'BINANCE_SYNC', 'Auto-synced from active Binance position', '🔄 BINANCE_SYNC', ?, ?, CURRENT_TIMESTAMP)
+                                     position_size_usd, stage, highest_favorable_price, status, remaining_ratio, partial_realized_pnl, confidence, trade_speed,
+                                     coin_trend, strategic_thesis, movement_tag, executed_qty, trading_mode, timestamp, last_updated)
+                                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, 'WATCHING', 1.0, 0.0, 0.90, 'FAST TRADE', 'BINANCE_SYNC', 'Auto-synced from active Binance position', '🔄 BINANCE_SYNC', ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
                                     ON CONFLICT(symbol) DO UPDATE SET
                                         status = 'WATCHING', stage = 1, executed_qty = excluded.executed_qty,
                                         entry_limit = excluded.entry_limit, current_sl = excluded.current_sl,
-                                        movement_tag = '🔄 BINANCE_SYNC', last_updated = CURRENT_TIMESTAMP
+                                        remaining_ratio = 1.0, partial_realized_pnl = 0.0,
+                                        movement_tag = '🔄 BINANCE_SYNC', timestamp = CURRENT_TIMESTAMP, last_updated = CURRENT_TIMESTAMP
                                 """, (raw_sym, b_side, entry_px, est_sl, est_sl, est_t1, est_t2, est_t3, pos_notional, entry_px, contracts, TRADING_MODE))
                                 log_event("INFO", "BINANCE_SYNC", f"Auto-synced open Binance {b_side} position on {raw_sym}: {contracts} contracts (${pos_notional:.1f})")
             except Exception as e_pos:
@@ -993,6 +998,7 @@ async def execute_unified_hourly_discovery_pipeline(context: ContextTypes.DEFAUL
                             "peak_gain_pct": round(peak_gain, 2),
                             "pullback_from_peak": round(pullback, 2),
                             "sl_order_id": str(r["binance_sl_order_id"] or ""),
+                            "tp1_order_id": str(dict(r).get("binance_tp1_id", "") or ""),
                             "executed_qty": float(r["executed_qty"] or 0.0),
                             "remaining_ratio": float(dict(r).get("remaining_ratio", 1.0) or 1.0),
                             "partial_realized_pnl": float(dict(r).get("partial_realized_pnl", 0.0) or 0.0)
@@ -1099,16 +1105,18 @@ async def execute_unified_hourly_discovery_pipeline(context: ContextTypes.DEFAUL
             if not match_pos:
                 continue
 
-            if d_verdict == "HARVEST_NOW" and match_pos["pnl_pct"] > 0:
-                # Emergency Harvest
+            if d_verdict == "HARVEST_NOW" and match_pos["pnl_pct"] >= 0.45:
+                # Emergency Harvest (only when net profit comfortably exceeds exchange fees)
                 if match_pos["sl_order_id"]:
                     await asyncio.to_thread(cancel_binance_order, match_pos["symbol"], match_pos["sl_order_id"])
+                if match_pos.get("tp1_order_id"):
+                    await asyncio.to_thread(cancel_binance_order, match_pos["symbol"], match_pos["tp1_order_id"])
                 if TRADING_MODE in ("LIVE", "TESTNET"):
                     await asyncio.to_thread(emergency_binance_market_close, match_pos["symbol"], match_pos["action"], match_pos["executed_qty"])
 
                 final_pnl = round(match_pos["partial_realized_pnl"] + (match_pos["remaining_ratio"] * match_pos["pnl_pct"]), 2)
                 with get_db_connection() as conn:
-                    conn.execute("UPDATE watched_signals SET status = 'COMPLETED', realized_pnl = ?, remaining_ratio = 0.0, movement_tag = '🎯 AI_REVERSAL_HARVEST', last_updated = CURRENT_TIMESTAMP WHERE id = ?", (final_pnl, match_pos["id"]))
+                    conn.execute("UPDATE watched_signals SET status = 'COMPLETED', realized_pnl = ?, remaining_ratio = 0.0, exit_reason = 'AI_REVERSAL_HARVEST', movement_tag = '🎯 AI_REVERSAL_HARVEST', last_updated = CURRENT_TIMESTAMP WHERE id = ?", (final_pnl, match_pos["id"]))
 
                 log_event("INFO", "AI_REVERSAL", f"Emergency profit harvested on {d_sym}: {final_pnl:+.2f}%. Reason: {d_reason}")
                 if chat_id and context:
@@ -1125,18 +1133,23 @@ async def execute_unified_hourly_discovery_pipeline(context: ContextTypes.DEFAUL
                     except Exception:
                         pass
 
-            elif d_verdict == "TIGHTEN_SL":
+            elif d_verdict == "TIGHTEN_SL" and match_pos["pnl_pct"] >= 0.55:
+                # CRITICAL SAFETY GUARD: Only tighten SL to Break-Even+Fees if trade is at least +0.55% in profit
+                # so the new SL (+0.15%) has a safe >=0.40% cushion and NEVER triggers an instant self-stop-out!
                 tighter_sl = round(match_pos["entry"] * 1.0015, 6) if match_pos["action"] == "LONG" else round(match_pos["entry"] * 0.9985, 6)
-                if match_pos["sl_order_id"]:
-                    await asyncio.to_thread(cancel_binance_order, match_pos["symbol"], match_pos["sl_order_id"])
-                new_sl_id = ""
-                if TRADING_MODE in ("LIVE", "TESTNET"):
-                    new_sl_id = await asyncio.to_thread(place_binance_stop_loss, match_pos["symbol"], match_pos["action"], match_pos["executed_qty"], tighter_sl)
+                is_better = (tighter_sl > match_pos["current_sl"]) if match_pos["action"] == "LONG" else (tighter_sl < match_pos["current_sl"])
+                is_safe_side = (match_pos["curr_price"] >= tighter_sl * 1.003) if match_pos["action"] == "LONG" else (match_pos["curr_price"] <= tighter_sl * 0.997)
+                if is_better and is_safe_side:
+                    if match_pos["sl_order_id"]:
+                        await asyncio.to_thread(cancel_binance_order, match_pos["symbol"], match_pos["sl_order_id"])
+                    new_sl_id = ""
+                    if TRADING_MODE in ("LIVE", "TESTNET"):
+                        new_sl_id = await asyncio.to_thread(place_binance_stop_loss, match_pos["symbol"], match_pos["action"], match_pos["executed_qty"], tighter_sl)
 
-                with get_db_connection() as conn:
-                    conn.execute("UPDATE watched_signals SET current_sl = ?, binance_sl_order_id = ?, movement_tag = '🛡️ AI_TIGHTENED_SL', last_updated = CURRENT_TIMESTAMP WHERE id = ?", (tighter_sl, new_sl_id, match_pos["id"]))
+                    with get_db_connection() as conn:
+                        conn.execute("UPDATE watched_signals SET current_sl = ?, binance_sl_order_id = ?, movement_tag = '🛡️ AI_TIGHTENED_SL', last_updated = CURRENT_TIMESTAMP WHERE id = ?", (tighter_sl, new_sl_id, match_pos["id"]))
 
-                log_event("INFO", "AI_REVERSAL", f"Stop-Loss tightened on {d_sym} to ${tighter_sl:.6f}. Reason: {d_reason}")
+                    log_event("INFO", "AI_REVERSAL", f"Stop-Loss tightened on {d_sym} to ${tighter_sl:.6f}. Reason: {d_reason}")
 
         # 7. Profit Prioritization & Candidate Ranking Engine
         raw_candidates = []
@@ -1335,6 +1348,7 @@ async def execute_unified_hourly_discovery_pipeline(context: ContextTypes.DEFAUL
 
             binance_order_id = ""
             binance_sl_id = ""
+            binance_tp1_id = ""
             executed_qty = 0.0
             actual_fill_price = levels["entry"]
             target_leverage = SCALP_LEVERAGE if is_scalp else DEFAULT_LEVERAGE
@@ -1346,16 +1360,39 @@ async def execute_unified_hourly_discovery_pipeline(context: ContextTypes.DEFAUL
                     market_res = place_binance_market_entry(sym, act, pos_size_usd, leverage=target_leverage)
                     binance_order_id = market_res.get("id", "")
                     executed_qty = float(market_res.get("filled", 0.0))
+                    if executed_qty <= 0:
+                        log_event("WARN", "PROFIT_ENGINE", f"Market entry failed on {sym} (0 qty filled). Skipping watchlist insertion.")
+                        continue
                     if market_res.get("price", 0.0) > 0:
                         actual_fill_price = float(market_res["price"])
-                    
-                    # Immediately place protective Stop-Loss on exchange
-                    if executed_qty > 0:
-                        binance_sl_id = place_binance_stop_loss(sym, act, executed_qty, levels["sl"])
+
+                # Recalculate SL/TP brackets relative to actual_fill_price so slippage never distorts risk/reward
+                fill_risk_dist = actual_fill_price * (levels["risk_pct"] / 100.0)
+                tp1_m = levels.get("tp1_mult", 1.4 if is_scalp else 1.5)
+                tp2_m = levels.get("tp2_mult", 2.2 if is_scalp else 2.4)
+                tp3_m = levels.get("tp3_mult", 3.2 if is_scalp else 3.5)
+                if act == "LONG":
+                    levels["sl"] = round(actual_fill_price - fill_risk_dist, 6)
+                    levels["t1"] = round(actual_fill_price + (tp1_m * fill_risk_dist), 6)
+                    levels["t2"] = round(actual_fill_price + (tp2_m * fill_risk_dist), 6)
+                    levels["t3"] = round(actual_fill_price + (tp3_m * fill_risk_dist), 6)
+                else:
+                    levels["sl"] = round(actual_fill_price + fill_risk_dist, 6)
+                    levels["t1"] = round(actual_fill_price - (tp1_m * fill_risk_dist), 6)
+                    levels["t2"] = round(actual_fill_price - (tp2_m * fill_risk_dist), 6)
+                    levels["t3"] = round(actual_fill_price - (tp3_m * fill_risk_dist), 6)
+
+                if TRADING_MODE in ("LIVE", "TESTNET") and executed_qty > 0:
+                    # Immediately place protective Stop-Loss and Resting Limit TP1 (50% size) on Binance
+                    binance_sl_id = place_binance_stop_loss(sym, act, executed_qty, levels["sl"])
+                    binance_tp1_id = place_binance_take_profit(sym, act, executed_qty * 0.50, levels["t1"])
             else:
                 # Place Resting Limit Order on Binance
                 if TRADING_MODE in ("LIVE", "TESTNET"):
                     binance_order_id = place_binance_entry_limit(sym, act, pos_size_usd, levels["entry"], leverage=target_leverage)
+                    if not binance_order_id:
+                        log_event("WARN", "PROFIT_ENGINE", f"Limit entry failed on {sym}. Skipping watchlist insertion.")
+                        continue
 
             upsert_watched_signal(
                 sym, act, actual_fill_price, levels["sl"],
@@ -1371,7 +1408,8 @@ async def execute_unified_hourly_discovery_pipeline(context: ContextTypes.DEFAUL
                 whale_ls_ratio=float(cand_info.get("whale_ls_ratio") if cand_info else 1.0),
                 btc_24h_pct=float(btc_24h_pct),
                 profit_index=float(item.get("profit_index") or 0.0),
-                binance_sl_order_id=binance_sl_id
+                binance_sl_order_id=binance_sl_id,
+                binance_tp1_id=binance_tp1_id
             )
             emitted_count += 1
 
@@ -1386,15 +1424,15 @@ async def execute_unified_hourly_discovery_pipeline(context: ContextTypes.DEFAUL
 
             if is_scalp:
                 tp_desc = (
-                    f"• TP1 (60% Qty): <code>${levels['t1']:.6f}</code> (+1.0R)\n"
-                    f"• TP2 (25% Qty): <code>${levels['t2']:.6f}</code> (+1.8R)\n"
-                    f"• TP3 (15% Qty): <code>${levels['t3']:.6f}</code> (+2.6R)"
+                    f"• TP1 (50% Qty): <code>${levels['t1']:.6f}</code> (+1.4R)\n"
+                    f"• TP2 (25% Qty): <code>${levels['t2']:.6f}</code> (+2.2R)\n"
+                    f"• TP3 (25% Qty): <code>${levels['t3']:.6f}</code> (+3.2R)"
                 )
             else:
                 tp_desc = (
-                    f"• TP1 (50% Qty): <code>${levels['t1']:.6f}</code> (+1.2R)\n"
-                    f"• TP2 (30% Qty): <code>${levels['t2']:.6f}</code> (+2.0R)\n"
-                    f"• TP3 (20% Qty): <code>${levels['t3']:.6f}</code> (+3.2R)"
+                    f"• TP1 (50% Qty): <code>${levels['t1']:.6f}</code> (+1.5R)\n"
+                    f"• TP2 (25% Qty): <code>${levels['t2']:.6f}</code> (+2.4R)\n"
+                    f"• TP3 (25% Qty): <code>${levels['t3']:.6f}</code> (+3.5R)"
                 )
 
             prob_line = f" | Scalp Prob: <b>{cand.get('scalp_probability', 80):.0f}%</b>" if is_scalp else ""
