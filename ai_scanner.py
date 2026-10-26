@@ -73,12 +73,14 @@ from config_db import (
     place_binance_take_profit,
     cancel_binance_order,
     emergency_binance_market_close,
+    get_symbol_min_qty,
     format_order_quantity,
     parse_database_timestamp,
     utc_now,
 )
 
 exchange = get_exchange_instance()
+ROUND_TRIP_FEE_PCT = 0.10
 ai_client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url="https://api.deepseek.com")
 
 def extract_clean_json(raw_text: str) -> dict:
@@ -901,36 +903,16 @@ async def execute_unified_hourly_discovery_pipeline(context: ContextTypes.DEFAUL
 
     t_start = time.time()
     try:
-        watched_cnt, daily_cnt = count_active_and_daily_trades()
-        
-        if watched_cnt >= MAX_CONCURRENT_POSITIONS:
-            log_event("INFO", "SCANNER", f"Watched slots full ({watched_cnt}/{MAX_CONCURRENT_POSITIONS}). Standing aside.")
-            return
-
-        if daily_cnt >= MAX_DAILY_TRADES:
-            log_event("INFO", "SCANNER", f"Daily trade limit reached ({daily_cnt}/{MAX_DAILY_TRADES} in 24h). Standing aside.")
-            return
-
-        prune_old_logs()
-
-        daily_loss = check_rolling_24h_drawdown()
-        if daily_loss <= MAX_24H_LOSS_THRESHOLD:
-            log_event("WARN", "SCANNER", f"24h drawdown floor reached ({daily_loss:.2f}%).")
-            return
-
-        # 1. Fetch Current Capital & Dynamic Balance
-        capital_info = fetch_current_account_capital()
-        account_balance = float(capital_info.get("total", 10000.0))
-        log_event("INFO", "CAPITAL", f"Current Capital Checked: ${account_balance:.2f} USD ({capital_info.get('mode', 'SIMULATION')})")
-
-        # 2. Fetch Active Positions & Pending Watchlist Setups (Auto-Sync from Binance)
+        # 1. Reconcile & Auto-Sync Live Binance Positions BEFORE checking slot capacity
         if TRADING_MODE in ("LIVE", "TESTNET"):
             try:
                 live_positions = await asyncio.to_thread(exchange.fetch_positions)
+                open_live_symbols = set()
                 for lp in live_positions:
                     contracts = abs(float(lp.get("contracts") or 0.0))
                     if contracts > 0:
                         raw_sym = lp.get("symbol", "")
+                        open_live_symbols.add(raw_sym)
                         b_side = str(lp.get("side", "long")).upper()
                         entry_px = float(lp.get("entryPrice") or lp.get("markPrice") or 0.0)
                         pos_notional = float(lp.get("notional") or (contracts * entry_px))
@@ -959,8 +941,43 @@ async def execute_unified_hourly_discovery_pipeline(context: ContextTypes.DEFAUL
                                         movement_tag = '🔄 BINANCE_SYNC', timestamp = CURRENT_TIMESTAMP, last_updated = CURRENT_TIMESTAMP
                                 """, (raw_sym, b_side, entry_px, est_sl, est_sl, est_t1, est_t2, est_t3, pos_notional, entry_px, contracts, TRADING_MODE))
                                 log_event("INFO", "BINANCE_SYNC", f"Auto-synced open Binance {b_side} position on {raw_sym}: {contracts} contracts (${pos_notional:.1f})")
+
+                # Reconcile any Stage >= 1 WATCHING rows whose positions are now closed (0 contracts) on Binance
+                with get_db_connection() as c_reconcile:
+                    c_cur = c_reconcile.cursor()
+                    c_cur.execute("SELECT id, symbol, action, entry_limit, current_sl, partial_realized_pnl, remaining_ratio FROM watched_signals WHERE status = 'WATCHING' AND stage >= 1")
+                    for db_pos in c_cur.fetchall():
+                        if db_pos["symbol"] not in open_live_symbols:
+                            c_reconcile.execute("""
+                                UPDATE watched_signals
+                                SET status = 'COMPLETED', remaining_ratio = 0.0, exit_reason = 'EXCHANGE_CLOSED_SYNC', last_updated = CURRENT_TIMESTAMP
+                                WHERE id = ?
+                            """, (db_pos["id"],))
+                            log_event("INFO", "BINANCE_SYNC", f"Freed zombie slot {db_pos['symbol']} (position already closed on Binance).")
             except Exception as e_pos:
                 log_event("WARN", "BINANCE_SYNC", f"Live position sync warning: {e_pos}")
+
+        watched_cnt, daily_cnt = count_active_and_daily_trades()
+        
+        if watched_cnt >= MAX_CONCURRENT_POSITIONS:
+            log_event("INFO", "SCANNER", f"Watched slots full ({watched_cnt}/{MAX_CONCURRENT_POSITIONS}). Standing aside.")
+            return
+
+        if daily_cnt >= MAX_DAILY_TRADES:
+            log_event("INFO", "SCANNER", f"Daily trade limit reached ({daily_cnt}/{MAX_DAILY_TRADES} in 24h). Standing aside.")
+            return
+
+        prune_old_logs()
+
+        daily_loss = check_rolling_24h_drawdown()
+        if daily_loss <= MAX_24H_LOSS_THRESHOLD:
+            log_event("WARN", "SCANNER", f"24h drawdown floor reached ({daily_loss:.2f}%).")
+            return
+
+        # 2. Fetch Current Capital & Dynamic Balance
+        capital_info = fetch_current_account_capital()
+        account_balance = float(capital_info.get("total", 10000.0))
+        log_event("INFO", "CAPITAL", f"Current Capital Checked: ${account_balance:.2f} USD ({capital_info.get('mode', 'SIMULATION')})")
 
         active_positions_payload = []
         pending_watchlist_payload = []
@@ -1105,7 +1122,7 @@ async def execute_unified_hourly_discovery_pipeline(context: ContextTypes.DEFAUL
             if not match_pos:
                 continue
 
-            if d_verdict == "HARVEST_NOW" and match_pos["pnl_pct"] >= 0.45:
+            if d_verdict == "HARVEST_NOW" and match_pos["pnl_pct"] >= 0.65:
                 # Emergency Harvest (only when net profit comfortably exceeds exchange fees)
                 if match_pos["sl_order_id"]:
                     await asyncio.to_thread(cancel_binance_order, match_pos["symbol"], match_pos["sl_order_id"])
@@ -1114,16 +1131,17 @@ async def execute_unified_hourly_discovery_pipeline(context: ContextTypes.DEFAUL
                 if TRADING_MODE in ("LIVE", "TESTNET"):
                     await asyncio.to_thread(emergency_binance_market_close, match_pos["symbol"], match_pos["action"], match_pos["executed_qty"])
 
-                final_pnl = round(match_pos["partial_realized_pnl"] + (match_pos["remaining_ratio"] * match_pos["pnl_pct"]), 2)
+                net_leg_pnl = match_pos["pnl_pct"] - ROUND_TRIP_FEE_PCT
+                final_pnl = round(match_pos["partial_realized_pnl"] + (match_pos["remaining_ratio"] * net_leg_pnl), 2)
                 with get_db_connection() as conn:
                     conn.execute("UPDATE watched_signals SET status = 'COMPLETED', realized_pnl = ?, remaining_ratio = 0.0, exit_reason = 'AI_REVERSAL_HARVEST', movement_tag = '🎯 AI_REVERSAL_HARVEST', last_updated = CURRENT_TIMESTAMP WHERE id = ?", (final_pnl, match_pos["id"]))
 
-                log_event("INFO", "AI_REVERSAL", f"Emergency profit harvested on {d_sym}: {final_pnl:+.2f}%. Reason: {d_reason}")
+                log_event("INFO", "AI_REVERSAL", f"Emergency profit harvested on {d_sym}: {final_pnl:+.2f}% net. Reason: {d_reason}")
                 if chat_id and context:
                     msg = (
                         f"💰 <b>AI PROFIT HARVEST: REVERSAL DEFENSE</b>\n\n"
                         f"• <b>Contract:</b> <code>{match_pos['symbol']}</code> ({match_pos['action']})\n"
-                        f"• <b>Exit Mark:</b> ${match_pos['curr_price']:.6f} (<code>{match_pos['pnl_pct']:+.2f}%</code>)\n"
+                        f"• <b>Exit Mark:</b> ${match_pos['curr_price']:.6f} (<code>{net_leg_pnl:+.2f}% net</code>)\n"
                         f"• <b>Total Realized Trade PnL:</b> <code>{final_pnl:+.2f}%</code>\n"
                         f"• <b>AI Diagnostic:</b> <i>{html.escape(d_reason)}</i>\n"
                         f"🤖 <b>Closed immediately on Binance to protect profit.</b>"
@@ -1133,12 +1151,12 @@ async def execute_unified_hourly_discovery_pipeline(context: ContextTypes.DEFAUL
                     except Exception:
                         pass
 
-            elif d_verdict == "TIGHTEN_SL" and match_pos["pnl_pct"] >= 0.55:
-                # CRITICAL SAFETY GUARD: Only tighten SL to Break-Even+Fees if trade is at least +0.55% in profit
-                # so the new SL (+0.15%) has a safe >=0.40% cushion and NEVER triggers an instant self-stop-out!
-                tighter_sl = round(match_pos["entry"] * 1.0015, 6) if match_pos["action"] == "LONG" else round(match_pos["entry"] * 0.9985, 6)
+            elif d_verdict == "TIGHTEN_SL" and match_pos["pnl_pct"] >= 0.95:
+                # CRITICAL SAFETY GUARD: Only tighten SL to Break-Even+Profit (+0.35%) if trade is at least +0.95% in profit
+                # so the new SL has a safe >=0.45% cushion and NEVER chokes out trades before TP1!
+                tighter_sl = round(match_pos["entry"] * 1.0035, 6) if match_pos["action"] == "LONG" else round(match_pos["entry"] * 0.9965, 6)
                 is_better = (tighter_sl > match_pos["current_sl"]) if match_pos["action"] == "LONG" else (tighter_sl < match_pos["current_sl"])
-                is_safe_side = (match_pos["curr_price"] >= tighter_sl * 1.003) if match_pos["action"] == "LONG" else (match_pos["curr_price"] <= tighter_sl * 0.997)
+                is_safe_side = (match_pos["curr_price"] >= tighter_sl * 1.0045) if match_pos["action"] == "LONG" else (match_pos["curr_price"] <= tighter_sl * 0.9955)
                 if is_better and is_safe_side:
                     if match_pos["sl_order_id"]:
                         await asyncio.to_thread(cancel_binance_order, match_pos["symbol"], match_pos["sl_order_id"])
@@ -1242,24 +1260,27 @@ async def execute_unified_hourly_discovery_pipeline(context: ContextTypes.DEFAUL
             whale_ls = cand_info.get("whale_ls_ratio", 1.0) if cand_info else 1.0
 
             quant_score = calculate_objective_quant_score(act, rsi_1h, rsi_4h, btc_regime["regime"], vol_m, funding, chg, btc_24h_pct, book_ratio)
-            if cand["source"] == "WHALE_FLOW":
-                quant_score = max(quant_score, cand["confidence"])
-            elif cand["source"] == "AI_SCALP":
-                quant_score = max(quant_score, cand["confidence"])
+            # Hard Quantitative Safety Veto: Never allow AI confidence to override a failed quant safety check (< 0.50)
+            if quant_score < 0.50:
+                log_event("INFO", "QUANT_VETO", f"Rejected {act} on {sym}: Objective quant score {quant_score:.2f} failed safety gate (RSI 1H: {rsi_1h:.1f}, BTC 24h: {btc_24h_pct:+.2f}%, Book: {book_ratio}x).")
+                continue
+
+            if cand["source"] in ("WHALE_FLOW", "AI_SCALP"):
+                quant_score = round((quant_score * 0.60) + (float(cand["confidence"]) * 0.40), 2)
 
             if quant_score < CONFIDENCE_THRESHOLD:
                 continue
 
             is_scalp = (cand.get("trade_speed") == "SCALP TRADE" or cand.get("strategy_mode") == "SCALP")
 
-            # Strict Professional Scalp Trend Alignment Gate (EMA21 + RSI 50 Rule):
-            # Eliminates counter-trend knife-catching on lower timeframes
+            # Strict Professional Scalp Trend & Orderbook Alignment Gate:
+            # Eliminates counter-trend knife-catching, overbought/oversold chasing, and wrong-side book skew
             if is_scalp:
-                if act == "LONG" and (curr_price < ema21_1h or rsi_1h < 48.0 or btc_24h_pct < -1.0):
-                    log_event("INFO", "SCALP_GATE", f"Filtered LONG scalp on {sym}: Counter-trend (Price ${curr_price:.4f} < EMA21 ${ema21_1h:.4f} or RSI {rsi_1h:.1f} < 48).")
+                if act == "LONG" and (curr_price < ema21_1h or rsi_1h < 48.0 or rsi_1h > 65.0 or book_ratio < 1.15 or btc_24h_pct < -0.50):
+                    log_event("INFO", "SCALP_GATE", f"Filtered LONG scalp on {sym}: Failed alignment (Price ${curr_price:.4f} vs EMA21 ${ema21_1h:.4f}, RSI {rsi_1h:.1f} [48-65], Book {book_ratio}x [>=1.15], BTC {btc_24h_pct:+.2f}%).")
                     continue
-                elif act == "SHORT" and (curr_price > ema21_1h or rsi_1h > 52.0 or btc_24h_pct > 1.5):
-                    log_event("INFO", "SCALP_GATE", f"Filtered SHORT scalp on {sym}: Counter-trend (Price ${curr_price:.4f} > EMA21 ${ema21_1h:.4f} or RSI {rsi_1h:.1f} > 52).")
+                elif act == "SHORT" and (curr_price > ema21_1h or rsi_1h > 52.0 or rsi_1h < 35.0 or book_ratio > 0.85 or btc_24h_pct > 1.00):
+                    log_event("INFO", "SCALP_GATE", f"Filtered SHORT scalp on {sym}: Failed alignment (Price ${curr_price:.4f} vs EMA21 ${ema21_1h:.4f}, RSI {rsi_1h:.1f} [35-52], Book {book_ratio}x [<=0.85], BTC {btc_24h_pct:+.2f}%).")
                     continue
 
             levels = calculate_deterministic_trade_levels(curr_price, atr_1h, act, ema21_1h, cand["strategy_mode"], change_24h=chg, is_scalp=is_scalp)
@@ -1383,9 +1404,11 @@ async def execute_unified_hourly_discovery_pipeline(context: ContextTypes.DEFAUL
                     levels["t3"] = round(actual_fill_price - (tp3_m * fill_risk_dist), 6)
 
                 if TRADING_MODE in ("LIVE", "TESTNET") and executed_qty > 0:
-                    # Immediately place protective Stop-Loss and Resting Limit TP1 (50% size) on Binance
+                    # Immediately place protective Stop-Loss and Resting Limit TP1 (50% size, or 100% if min-lot) on Binance
+                    min_lot = get_symbol_min_qty(sym)
+                    tp1_qty = executed_qty if (executed_qty * 0.50) < min_lot else (executed_qty * 0.50)
                     binance_sl_id = place_binance_stop_loss(sym, act, executed_qty, levels["sl"])
-                    binance_tp1_id = place_binance_take_profit(sym, act, executed_qty * 0.50, levels["t1"])
+                    binance_tp1_id = place_binance_take_profit(sym, act, tp1_qty, levels["t1"])
             else:
                 # Place Resting Limit Order on Binance
                 if TRADING_MODE in ("LIVE", "TESTNET"):

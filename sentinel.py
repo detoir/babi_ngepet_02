@@ -37,11 +37,14 @@ from config_db import (
     cancel_binance_order,
     emergency_binance_market_close,
     fetch_binance_order_status,
+    fetch_live_binance_position,
+    get_symbol_min_qty,
     format_order_quantity,
     set_symbol_leverage_and_margin,
 )
 
 exchange = get_exchange_instance()
+ROUND_TRIP_FEE_PCT = 0.10  # 0.05% entry + 0.05% exit Binance USD-M Futures fee allowance
 
 LAST_BTC_PRICE = 0.0
 LAST_BTC_CHECK_TIME = 0.0
@@ -243,12 +246,30 @@ async def run_sentinel_cycle(session: aiohttp.ClientSession):
 
             if TRADING_MODE in ("LIVE", "TESTNET") and entry_order_id and not entry_order_id.startswith("SIMULATED"):
                 ord_status = await asyncio.to_thread(fetch_binance_order_status, sym, entry_order_id)
-                if ord_status.get("status") == "CLOSED" or ord_status.get("filled", 0) > 0:
+                st_code = ord_status.get("status", "UNKNOWN")
+                if st_code == "CLOSED" or ord_status.get("filled", 0) > 0:
                     is_order_filled = True
                     if ord_status.get("filled", 0) > 0:
                         executed_qty = float(ord_status["filled"])
                     if ord_status.get("average", 0) > 0:
                         entry = float(ord_status["average"])
+                elif st_code in ("CANCELED", "NOT_FOUND"):
+                    # Verify if order filled into a live position or was cancelled/removed on exchange
+                    pos_check = await asyncio.to_thread(fetch_live_binance_position, sym)
+                    if pos_check.get("ok") and pos_check.get("contracts", 0.0) > 0:
+                        is_order_filled = True
+                        executed_qty = float(pos_check["contracts"])
+                        if pos_check.get("entryPrice", 0.0) > 0:
+                            entry = float(pos_check["entryPrice"])
+                    elif pos_check.get("ok"):
+                        with get_db_connection() as conn:
+                            conn.execute("""
+                                UPDATE watched_signals 
+                                SET status = 'EXPIRED', realized_pnl = 0.0, movement_tag = '🚫 EXCHANGE_ORDER_GONE', last_updated = CURRENT_TIMESTAMP 
+                                WHERE id = ?
+                            """, (w_id,))
+                        log_event("INFO", "SENTINEL", f"Pending limit order {entry_order_id} on {sym} no longer exists on Binance (0 position). Freed slot.")
+                        continue
             elif TRADING_MODE == "SIMULATION":
                 is_order_filled = is_entry_touched
 
@@ -261,12 +282,14 @@ async def run_sentinel_cycle(session: aiohttp.ClientSession):
                 if executed_qty <= 0:
                     executed_qty = format_order_quantity(sym, pos_size_usd, entry)
 
-                # Automatically submit Hard Stop-Loss and Resting Limit TP1 (50% size) on Binance
+                # Automatically submit Hard Stop-Loss and Resting Limit TP1 (50% size, or 100% if min-lot) on Binance
                 new_sl_id = ""
                 new_tp1_id = ""
                 if TRADING_MODE in ("LIVE", "TESTNET") and executed_qty > 0:
+                    min_lot = get_symbol_min_qty(sym)
+                    tp1_init_qty = executed_qty if (executed_qty * 0.50) < min_lot else (executed_qty * 0.50)
                     new_sl_id = await asyncio.to_thread(place_binance_stop_loss, sym, act, executed_qty, current_sl)
-                    new_tp1_id = await asyncio.to_thread(place_binance_take_profit, sym, act, executed_qty * 0.50, t1)
+                    new_tp1_id = await asyncio.to_thread(place_binance_take_profit, sym, act, tp1_init_qty, t1)
 
                 with get_db_connection() as conn:
                     conn.execute("""
@@ -325,17 +348,33 @@ async def run_sentinel_cycle(session: aiohttp.ClientSession):
             created_at = parse_database_timestamp(item["timestamp"])
             holding_mins = (utc_now() - created_at).total_seconds() / 60.0
 
-            # STEP 3.0: Verify if the native Binance Stop-Loss order ALREADY filled on exchange
+            # STEP 3.0: Verify if the native Binance Stop-Loss order ALREADY filled or position closed on exchange
             if TRADING_MODE in ("LIVE", "TESTNET") and sl_order_id and not sl_order_id.startswith("SIMULATED"):
                 sl_ord_info = await asyncio.to_thread(fetch_binance_order_status, sym, sl_order_id)
-                if sl_ord_info.get("status") == "CLOSED":
-                    # Native SL order triggered on Binance! Clean up any open TP orders
+                sl_status = sl_ord_info.get("status", "UNKNOWN")
+
+                # If order returned NOT_FOUND (-2013) or CANCELED, check if the position is still open on Binance
+                if sl_status in ("NOT_FOUND", "CANCELED"):
+                    pos_info = await asyncio.to_thread(fetch_live_binance_position, sym)
+                    if pos_info.get("ok"):
+                        live_contracts = float(pos_info.get("contracts") or 0.0)
+                        if live_contracts <= 0:
+                            # Position is already closed on Binance! Reconcile immediately
+                            sl_status = "CLOSED"
+                        else:
+                            # Position is still active on Binance, but SL order ID is stale/cancelled; re-place SL below
+                            executed_qty = live_contracts
+                            sl_order_id = ""
+
+                if sl_status == "CLOSED":
+                    # Native SL or external close triggered on Binance! Clean up any open TP orders
                     for tp_oid in (tp1_order_id, tp2_order_id, tp3_order_id):
                         if tp_oid:
                             await asyncio.to_thread(cancel_binance_order, sym, tp_oid)
                     exit_price = float(sl_ord_info.get("average") or current_sl)
-                    exit_pnl = ((exit_price - entry) / entry * 100.0) if act == "LONG" else ((entry - exit_price) / entry * 100.0)
-                    final_pnl = round(partial_realized_pnl + (remaining_ratio * exit_pnl), 2)
+                    raw_exit_pnl = ((exit_price - entry) / entry * 100.0) if act == "LONG" else ((entry - exit_price) / entry * 100.0)
+                    net_leg_pnl = raw_exit_pnl - ROUND_TRIP_FEE_PCT
+                    final_pnl = round(partial_realized_pnl + (remaining_ratio * net_leg_pnl), 2)
                     cooldown_time = (utc_now() + datetime.timedelta(hours=4)).strftime("%Y-%m-%d %H:%M:%S")
                     close_status = "COMPLETED" if final_pnl >= 0 else "STOPPED_OUT"
                     exit_reason_text = "BE_PROFIT_STOP" if final_pnl >= 0 else "HARD_STOP_LOSS"
@@ -350,15 +389,15 @@ async def run_sentinel_cycle(session: aiohttp.ClientSession):
                             conn.execute("""
                                 INSERT INTO loss_diagnostics (symbol, action, entry_price, exit_price, stop_loss_price, exit_type, holding_duration_mins, market_regime, diagnostic_reason)
                                 VALUES (?, ?, ?, ?, ?, 'STOP_LOSS', ?, 'LIVE_EXCHANGE_SL', ?)
-                            """, (sym, act, entry, exit_price, current_sl, holding_mins, f"Exchange SL filled at ${exit_price:.6f} after {holding_mins:.0f}m ({final_pnl:+.2f}% PnL)."))
-                    log_event("INFO", "SENTINEL_EXIT", f"Trade {sym} {act} closed by exchange SL ({exit_reason_text}). Realized: {final_pnl:+.2f}%, Duration: {holding_mins:.0f}m")
+                            """, (sym, act, entry, exit_price, current_sl, holding_mins, f"Exchange SL filled at ${exit_price:.6f} after {holding_mins:.0f}m ({final_pnl:+.2f}% net PnL)."))
+                    log_event("INFO", "SENTINEL_EXIT", f"Trade {sym} {act} closed by exchange SL ({exit_reason_text}). Net Realized: {final_pnl:+.2f}%, Duration: {holding_mins:.0f}m")
                     emoji = "🛑 <b>STOP-LOSS FILLED ON BINANCE</b>" if final_pnl < 0 else "🛡️ <b>PROFIT / BREAK-EVEN STOP FILLED</b>"
                     msg = (
                         f"{emoji}\n\n"
                         f"• <b>Contract:</b> <code>{sym}</code> ({act})\n"
                         f"• <b>Exit Price:</b> ${exit_price:.6f}\n"
                         f"• <b>Holding Time:</b> <code>{holding_mins:.0f} mins</code>\n"
-                        f"• <b>Total Realized Result:</b> <code>{final_pnl:+.2f}%</code>\n"
+                        f"• <b>Net Realized Result (after fees):</b> <code>{final_pnl:+.2f}%</code>\n"
                         f"🤖 <b>Position closed on Binance and resting TP orders cleaned up.</b>"
                     )
                     await send_telegram_alert(session, msg)
@@ -367,16 +406,18 @@ async def run_sentinel_cycle(session: aiohttp.ClientSession):
             # SAFETY GUARD: Ensure every active live position has a resting Stop-Loss and TP order on Binance
             if TRADING_MODE in ("LIVE", "TESTNET") and current_sl > 0:
                 if executed_qty <= 0:
-                    try:
-                        bridge_pos = bridge_symbol_formats(sym)
-                        positions = await asyncio.to_thread(exchange.fetch_positions, [bridge_pos["ccxt"]])
-                        for p in positions:
-                            contracts = abs(float(p.get("contracts") or 0.0))
-                            if contracts > 0:
-                                executed_qty = contracts
-                                break
-                    except Exception:
-                        pass
+                    pos_info = await asyncio.to_thread(fetch_live_binance_position, sym)
+                    if pos_info.get("ok") and pos_info.get("contracts", 0.0) > 0:
+                        executed_qty = float(pos_info["contracts"])
+                    elif pos_info.get("ok") and pos_info.get("contracts", 0.0) <= 0:
+                        # No live position exists on Binance for this stage >= 1 row
+                        for oid in (sl_order_id, tp1_order_id, tp2_order_id, tp3_order_id):
+                            if oid:
+                                await asyncio.to_thread(cancel_binance_order, sym, oid)
+                        with get_db_connection() as conn_flat:
+                            conn_flat.execute("UPDATE watched_signals SET status = 'COMPLETED', remaining_ratio = 0.0, exit_reason = 'EXCHANGE_CLOSED_SYNC', last_updated = CURRENT_TIMESTAMP WHERE id = ?", (w_id,))
+                        log_event("INFO", "SENTINEL_SYNC", f"Reconciled flat Binance position on {sym}. Closed zombie WATCHING row.")
+                        continue
                     if executed_qty <= 0:
                         executed_qty = format_order_quantity(sym, pos_size_usd, curr_price)
 
@@ -390,7 +431,9 @@ async def run_sentinel_cycle(session: aiohttp.ClientSession):
                         log_event("INFO", "SL_SAFETY_GUARD", f"Recovered and bound live Stop-Loss {recovered_sl_id} for {sym}")
 
                 if executed_qty > 0 and stage == 1 and (not tp1_order_id or tp1_order_id.startswith("SIMULATED")) and t1 > 0:
-                    recovered_tp1_id = await asyncio.to_thread(place_binance_take_profit, sym, act, executed_qty * 0.50, t1)
+                    min_lot = get_symbol_min_qty(sym)
+                    tp1_qty = executed_qty if (executed_qty * 0.50) < min_lot else (executed_qty * 0.50)
+                    recovered_tp1_id = await asyncio.to_thread(place_binance_take_profit, sym, act, tp1_qty, t1)
                     if recovered_tp1_id:
                         tp1_order_id = recovered_tp1_id
                         with get_db_connection() as conn_tp:
@@ -438,7 +481,7 @@ async def run_sentinel_cycle(session: aiohttp.ClientSession):
             # ------------------------------------------------------------------
             # STEP 3.1: TAKE-PROFIT EXECUTION (Check Resting Binance TP Orders & Targets FIRST)
             # Keep 100% of position size intact until TP1 (+1.4R/+1.5R) so winners pay on full size!
-            # Scale out: 50% at TP1 -> 25% at TP2 -> 25% at TP3
+            # Scale out: 50% at TP1 -> 25% at TP2 -> 25% at TP3 (or 100% at TP1 if position is minimum lot)
             # ------------------------------------------------------------------
             if stage == 1:
                 tp1_order_filled = False
@@ -452,18 +495,46 @@ async def run_sentinel_cycle(session: aiohttp.ClientSession):
 
                 hit_t1 = tp1_order_filled or ((curr_price >= t1) if act == "LONG" else (curr_price <= t1))
                 if hit_t1:
-                    stage = 2
-                    # Move SL to Break-Even + 0.25% (or keep higher SL if already ratcheted above BE!)
-                    be_sl = round(entry * 1.0025, 6) if act == "LONG" else round(entry * 0.9975, 6)
-                    new_sl_target = max(current_sl, be_sl) if act == "LONG" else min(current_sl, be_sl)
+                    min_lot = get_symbol_min_qty(sym)
+                    is_single_min_lot = (executed_qty > 0 and (executed_qty * 0.50) < min_lot)
+                    tp1_close_ratio = 1.0 if is_single_min_lot else 0.50
 
-                    # Scale out 50% at TP1 (leaving full 50% for TP2 + TP3 runners)
-                    tp1_close_ratio = 0.50
+                    raw_leg_pnl = ((tp1_fill_price - entry) / entry * 100.0) if act == "LONG" else ((entry - tp1_fill_price) / entry * 100.0)
+                    net_leg_pnl = raw_leg_pnl - ROUND_TRIP_FEE_PCT
                     closed_fraction = round(remaining_ratio * tp1_close_ratio, 4)
-                    leg_pnl = ((tp1_fill_price - entry) / entry * 100.0) if act == "LONG" else ((entry - tp1_fill_price) / entry * 100.0)
-                    tp1_gain = round(closed_fraction * leg_pnl, 4)
+                    tp1_gain = round(closed_fraction * net_leg_pnl, 4)
                     new_partial_pnl = round(partial_realized_pnl + tp1_gain, 4)
-                    new_remaining_ratio = round(remaining_ratio - closed_fraction, 4)
+                    new_remaining_ratio = round(max(0.0, remaining_ratio - closed_fraction), 4)
+
+                    if is_single_min_lot or new_remaining_ratio <= 0.0:
+                        # Entire min-lot position closed at TP1
+                        if sl_order_id:
+                            await asyncio.to_thread(cancel_binance_order, sym, sl_order_id)
+                        if TRADING_MODE in ("LIVE", "TESTNET") and not tp1_order_filled:
+                            if tp1_order_id:
+                                await asyncio.to_thread(cancel_binance_order, sym, tp1_order_id)
+                            await asyncio.to_thread(emergency_binance_market_close, sym, act, executed_qty)
+                        final_pnl = round(new_partial_pnl, 2)
+                        with get_db_connection() as conn:
+                            conn.execute("""
+                                UPDATE watched_signals 
+                                SET status = 'COMPLETED', realized_pnl = ?, remaining_ratio = 0.0, exit_reason = 'TP1_FULL_TARGET', movement_tag = '🎯 TP1_COMPLETE', last_updated = CURRENT_TIMESTAMP 
+                                WHERE id = ?
+                            """, (final_pnl, w_id))
+                        msg = (
+                            f"🎯 <b>TP 1 HIT — FULL MIN-LOT POSITION BANKED</b>\n\n"
+                            f"• <b>Contract:</b> <code>{sym}</code> ({act})\n"
+                            f"• <b>Fill Price:</b> ${tp1_fill_price:.6f} (<code>{net_leg_pnl:+.2f}% net</code>)\n"
+                            f"• <b>Total Net Realized PnL:</b> <code>{final_pnl:+.2f}%</code>\n"
+                            f"🤖 <b>Position closed at TP1 (single minimum lot contract).</b>"
+                        )
+                        await send_telegram_alert(session, msg)
+                        continue
+
+                    stage = 2
+                    # Move SL to Break-Even + 0.35% (covers 0.10% fees + 0.25% net profit floor on runner)
+                    be_sl = round(entry * 1.0035, 6) if act == "LONG" else round(entry * 0.9965, 6)
+                    new_sl_target = max(current_sl, be_sl) if act == "LONG" else min(current_sl, be_sl)
 
                     new_tp2_id = ""
                     if TRADING_MODE in ("LIVE", "TESTNET") and executed_qty > 0:
@@ -476,8 +547,8 @@ async def run_sentinel_cycle(session: aiohttp.ClientSession):
                             await asyncio.to_thread(cancel_binance_order, sym, sl_order_id)
                         remaining_qty = max(0.0, executed_qty - close_qty)
                         new_sl_id = await asyncio.to_thread(place_binance_stop_loss, sym, act, remaining_qty, new_sl_target)
-                        # Place resting Limit TP2 for 50% of remaining (25% of original total)
-                        new_tp2_id = await asyncio.to_thread(place_binance_take_profit, sym, act, remaining_qty * 0.50, t2)
+                        tp2_qty = remaining_qty if (remaining_qty * 0.50) < min_lot else (remaining_qty * 0.50)
+                        new_tp2_id = await asyncio.to_thread(place_binance_take_profit, sym, act, tp2_qty, t2)
                     else:
                         remaining_qty = executed_qty * (1.0 - tp1_close_ratio) if executed_qty > 0 else 0.0
                         new_sl_id = sl_order_id
@@ -500,7 +571,7 @@ async def run_sentinel_cycle(session: aiohttp.ClientSession):
                     msg = (
                         f"🎯 <b>TP 1 HIT {tp1_badge} — 50% POSITION BANKED</b>\n\n"
                         f"• <b>Contract:</b> <code>{sym}</code> ({act})\n"
-                        f"• <b>Fill Price:</b> ${tp1_fill_price:.6f} (<code>{leg_pnl:+.2f}%</code>)\n"
+                        f"• <b>Fill Price:</b> ${tp1_fill_price:.6f} (<code>{net_leg_pnl:+.2f}% net</code>)\n"
                         f"• <b>Banked on Leg:</b> <code>+{tp1_gain:.2f}%</code>\n\n"
                         f"🤖 <b>AUTOMATED ACTIONS EXECUTED:</b>\n"
                         f"1. <b>Closed 50% of position</b> on Binance.\n"
@@ -522,15 +593,42 @@ async def run_sentinel_cycle(session: aiohttp.ClientSession):
 
                 hit_t2 = tp2_order_filled or ((curr_price >= t2) if act == "LONG" else (curr_price <= t2))
                 if hit_t2:
+                    min_lot = get_symbol_min_qty(sym)
+                    is_single_min_lot = (executed_qty > 0 and (executed_qty * 0.50) < min_lot)
+                    tp2_close_ratio = 1.0 if is_single_min_lot else 0.50
+
+                    raw_leg_pnl = ((tp2_fill_price - entry) / entry * 100.0) if act == "LONG" else ((entry - tp2_fill_price) / entry * 100.0)
+                    net_leg_pnl = raw_leg_pnl - ROUND_TRIP_FEE_PCT
+                    closed_fraction = round(remaining_ratio * tp2_close_ratio, 4)
+                    tp2_gain = round(closed_fraction * net_leg_pnl, 4)
+                    new_partial_pnl = round(partial_realized_pnl + tp2_gain, 4)
+                    new_remaining_ratio = round(max(0.0, remaining_ratio - closed_fraction), 4)
+
+                    if is_single_min_lot or new_remaining_ratio <= 0.0:
+                        if sl_order_id:
+                            await asyncio.to_thread(cancel_binance_order, sym, sl_order_id)
+                        if TRADING_MODE in ("LIVE", "TESTNET") and not tp2_order_filled:
+                            if tp2_order_id:
+                                await asyncio.to_thread(cancel_binance_order, sym, tp2_order_id)
+                            await asyncio.to_thread(emergency_binance_market_close, sym, act, executed_qty)
+                        final_pnl = round(new_partial_pnl, 2)
+                        with get_db_connection() as conn:
+                            conn.execute("""
+                                UPDATE watched_signals 
+                                SET status = 'COMPLETED', realized_pnl = ?, remaining_ratio = 0.0, exit_reason = 'TP2_FULL_TARGET', movement_tag = '🎯🎯 TP2_COMPLETE', last_updated = CURRENT_TIMESTAMP 
+                                WHERE id = ?
+                            """, (final_pnl, w_id))
+                        msg = (
+                            f"🎯🎯 <b>TP 2 HIT — POSITION COMPLETE!</b>\n\n"
+                            f"• <b>Contract:</b> <code>{sym}</code> ({act})\n"
+                            f"• <b>Fill Price:</b> ${tp2_fill_price:.6f}\n"
+                            f"• <b>Total Net Realized PnL:</b> <code>{final_pnl:+.2f}%</code>"
+                        )
+                        await send_telegram_alert(session, msg)
+                        continue
+
                     stage = 3
                     new_sl_target = max(current_sl, t1) if act == "LONG" else min(current_sl, t1)
-
-                    # Close 50% of remaining position on Binance (25% of total, leaving 25% runner for TP3)
-                    closed_fraction = round(remaining_ratio * 0.50, 4)
-                    leg_pnl = ((tp2_fill_price - entry) / entry * 100.0) if act == "LONG" else ((entry - tp2_fill_price) / entry * 100.0)
-                    tp2_gain = round(closed_fraction * leg_pnl, 4)
-                    new_partial_pnl = round(partial_realized_pnl + tp2_gain, 4)
-                    new_remaining_ratio = round(remaining_ratio - closed_fraction, 4)
 
                     new_tp3_id = ""
                     if TRADING_MODE in ("LIVE", "TESTNET") and executed_qty > 0:
@@ -566,7 +664,7 @@ async def run_sentinel_cycle(session: aiohttp.ClientSession):
                     msg = (
                         f"🎯🎯 <b>TP 2 HIT (+2.2R) — 75% TOTAL POSITION BANKED</b>\n\n"
                         f"• <b>Contract:</b> <code>{sym}</code> ({act})\n"
-                        f"• <b>Fill Price:</b> ${tp2_fill_price:.6f} (<code>{leg_pnl:+.2f}%</code>)\n"
+                        f"• <b>Fill Price:</b> ${tp2_fill_price:.6f} (<code>{net_leg_pnl:+.2f}% net</code>)\n"
                         f"• <b>Banked on Leg:</b> <code>+{tp2_gain:.2f}%</code>\n\n"
                         f"🤖 <b>AUTOMATED ACTIONS EXECUTED:</b>\n"
                         f"1. <b>Closed 50% of remaining</b> on Binance.\n"
@@ -595,8 +693,9 @@ async def run_sentinel_cycle(session: aiohttp.ClientSession):
                             await asyncio.to_thread(cancel_binance_order, sym, tp3_order_id)
                         await asyncio.to_thread(emergency_binance_market_close, sym, act, executed_qty)
 
-                    leg_pnl = ((tp3_fill_price - entry) / entry * 100.0) if act == "LONG" else ((entry - tp3_fill_price) / entry * 100.0)
-                    final_pnl = round(partial_realized_pnl + (remaining_ratio * leg_pnl), 2)
+                    raw_leg_pnl = ((tp3_fill_price - entry) / entry * 100.0) if act == "LONG" else ((entry - tp3_fill_price) / entry * 100.0)
+                    net_leg_pnl = raw_leg_pnl - ROUND_TRIP_FEE_PCT
+                    final_pnl = round(partial_realized_pnl + (remaining_ratio * net_leg_pnl), 2)
                     with get_db_connection() as conn:
                         conn.execute("""
                             UPDATE watched_signals 
@@ -615,8 +714,8 @@ async def run_sentinel_cycle(session: aiohttp.ClientSession):
 
             # ------------------------------------------------------------------
             # STEP 3.2: DYNAMIC TIERED PROFIT FLOOR RATCHET (RUNNING STOP-LOSS)
-            # Enforces a strict >= 0.35% breathing cushion between curr_price and target_floor_sl
-            # so normal 1-minute candle wicks NEVER prematurely stop out winning trades!
+            # Do NOT choke Stage 1 trades at +0.20% before TP1! Only engage floor
+            # once price has reached >= +1.25% (near TP1), locking at least +0.45% gross (+0.35% net).
             # ------------------------------------------------------------------
             target_floor_sl = None
             floor_label = None
@@ -629,12 +728,8 @@ async def run_sentinel_cycle(session: aiohttp.ClientSession):
                     target_floor_sl = round(entry * 1.0095, 6) if act == "LONG" else round(entry * 0.9905, 6)
                     floor_label = "🔒 SCALP_FLOOR_+0.95%"
                 elif peak_gain_pct >= 1.25 and pnl_approx >= 0.95:
-                    target_floor_sl = round(entry * 1.0050, 6) if act == "LONG" else round(entry * 0.9950, 6)
-                    floor_label = "🔒 SCALP_FLOOR_+0.50%"
-                elif peak_gain_pct >= 0.80 and pnl_approx >= 0.60:
-                    # Locks in Break-Even + 0.20% once trade has >= 0.60% current gain (>= 0.40% safe buffer)
-                    target_floor_sl = round(entry * 1.0020, 6) if act == "LONG" else round(entry * 0.9980, 6)
-                    floor_label = "🔒 SCALP_FLOOR_+0.20% (BE+FEES)"
+                    target_floor_sl = round(entry * 1.0045, 6) if act == "LONG" else round(entry * 0.9955, 6)
+                    floor_label = "🔒 SCALP_FLOOR_+0.45%"
             else:
                 if peak_gain_pct >= 3.00 and pnl_approx >= 2.40:
                     target_floor_sl = round(entry * 1.0180, 6) if act == "LONG" else round(entry * 0.9820, 6)
@@ -645,13 +740,10 @@ async def run_sentinel_cycle(session: aiohttp.ClientSession):
                 elif peak_gain_pct >= 1.45 and pnl_approx >= 1.05:
                     target_floor_sl = round(entry * 1.0055, 6) if act == "LONG" else round(entry * 0.9945, 6)
                     floor_label = "🔒 PROFIT_FLOOR_+0.55%"
-                elif peak_gain_pct >= 0.95 and pnl_approx >= 0.65:
-                    target_floor_sl = round(entry * 1.0020, 6) if act == "LONG" else round(entry * 0.9980, 6)
-                    floor_label = "🔒 PROFIT_FLOOR_+0.20% (BE+FEES)"
 
             if target_floor_sl is not None:
                 is_better_sl = (target_floor_sl > current_sl) if act == "LONG" else (target_floor_sl < current_sl)
-                has_safe_buffer = (curr_price >= target_floor_sl * 1.0035) if act == "LONG" else (curr_price <= target_floor_sl * 0.9965)
+                has_safe_buffer = (curr_price >= target_floor_sl * 1.0045) if act == "LONG" else (curr_price <= target_floor_sl * 0.9955)
                 if is_better_sl and has_safe_buffer:
                     new_sl_id = sl_order_id
                     if TRADING_MODE in ("LIVE", "TESTNET") and executed_qty > 0:
@@ -679,7 +771,7 @@ async def run_sentinel_cycle(session: aiohttp.ClientSession):
             # ------------------------------------------------------------------
             # STEP 3.3: ADAPTIVE SUDDEN REVERSAL & PROFIT HARVEST DEFENSE
             # ------------------------------------------------------------------
-            is_sudden_reversal = (peak_gain_pct >= reversal_min_gain and pullback_from_peak >= reversal_pullback_threshold and pnl_approx >= 0.55)
+            is_sudden_reversal = (peak_gain_pct >= reversal_min_gain and pullback_from_peak >= reversal_pullback_threshold and pnl_approx >= 0.65)
             is_peak_giveback = (peak_gain_pct >= 2.8 and pullback_from_peak >= 1.2 and pnl_approx >= 0.80)
 
             if (is_sudden_reversal or is_peak_giveback) and stage == 1 and "PEAK_EXIT" not in tag_current:
@@ -690,8 +782,9 @@ async def run_sentinel_cycle(session: aiohttp.ClientSession):
                     await asyncio.to_thread(emergency_binance_market_close, sym, act, executed_qty)
 
                 exit_price = curr_price
-                exit_pnl = ((exit_price - entry) / entry * 100.0) if act == "LONG" else ((entry - exit_price) / entry * 100.0)
-                final_pnl = round(partial_realized_pnl + (remaining_ratio * exit_pnl), 2)
+                raw_exit_pnl = ((exit_price - entry) / entry * 100.0) if act == "LONG" else ((entry - exit_price) / entry * 100.0)
+                net_leg_pnl = raw_exit_pnl - ROUND_TRIP_FEE_PCT
+                final_pnl = round(partial_realized_pnl + (remaining_ratio * net_leg_pnl), 2)
 
                 with get_db_connection() as conn:
                     conn.execute("""
@@ -699,12 +792,12 @@ async def run_sentinel_cycle(session: aiohttp.ClientSession):
                         SET status = 'COMPLETED', realized_pnl = ?, remaining_ratio = 0.0, exit_reason = 'REVERSAL_HARVEST', movement_tag = '🎯 REVERSAL_HARVEST', last_updated = CURRENT_TIMESTAMP 
                         WHERE id = ?
                     """, (final_pnl, w_id))
-                log_event("INFO", "SENTINEL_EXIT", f"Trade {sym} {act} closed via REVERSAL_HARVEST at {final_pnl:+.2f}% after {holding_mins:.0f}m")
+                log_event("INFO", "SENTINEL_EXIT", f"Trade {sym} {act} closed via REVERSAL_HARVEST at {final_pnl:+.2f}% net after {holding_mins:.0f}m")
                 msg = (
                     f"💰 <b>PROFIT HARVEST: SUDDEN REVERSAL DEFENDED [{regime_label}]</b>\n\n"
                     f"• <b>Contract:</b> <code>{sym}</code> ({act})\n"
                     f"• <b>Peak Gain:</b> <code>+{peak_gain_pct:.2f}%</code>\n"
-                    f"• <b>Secured Exit:</b> ${curr_price:.6f} (<code>{exit_pnl:+.2f}%</code>)\n"
+                    f"• <b>Secured Exit:</b> ${curr_price:.6f} (<code>{net_leg_pnl:+.2f}% net</code>)\n"
                     f"• <b>Total Realized Trade PnL:</b> <code>{final_pnl:+.2f}%</code>\n"
                     f"• <b>Pullback from High:</b> <code>-{pullback_from_peak:.2f}%</code>\n"
                     f"🤖 <b>Closed on Binance to preserve profit before market flipped.</b>"
@@ -716,11 +809,11 @@ async def run_sentinel_cycle(session: aiohttp.ClientSession):
             # STEP 3.4: STAGNATION DEFENSE (Safe Buffer Enforced)
             # ------------------------------------------------------------------
             if is_scalp_trade and stage == 1 and holding_mins >= stagnation_limit_mins:
-                if pnl_approx >= 0.50 and "STAGNANT" not in tag_current:
-                    # Stagnant but safely green (>= +0.50%): Lock SL to Break-Even + Fees (+0.15%) with >=0.35% buffer
-                    be_safe_sl = round(entry * 1.0015, 6) if act == "LONG" else round(entry * 0.9985, 6)
+                if pnl_approx >= 0.75 and "STAGNANT" not in tag_current:
+                    # Stagnant but safely green (>= +0.75%): Lock SL to Break-Even + Profit (+0.30%) with >=0.45% buffer
+                    be_safe_sl = round(entry * 1.0030, 6) if act == "LONG" else round(entry * 0.9970, 6)
                     is_better_sl = (be_safe_sl > current_sl) if act == "LONG" else (be_safe_sl < current_sl)
-                    has_safe_buffer = (curr_price >= be_safe_sl * 1.003) if act == "LONG" else (curr_price <= be_safe_sl * 0.997)
+                    has_safe_buffer = (curr_price >= be_safe_sl * 1.0045) if act == "LONG" else (curr_price <= be_safe_sl * 0.9955)
                     if is_better_sl and has_safe_buffer:
                         if TRADING_MODE in ("LIVE", "TESTNET") and executed_qty > 0:
                             if sl_order_id:
@@ -740,8 +833,9 @@ async def run_sentinel_cycle(session: aiohttp.ClientSession):
                         await asyncio.to_thread(emergency_binance_market_close, sym, act, executed_qty)
 
                     exit_price = curr_price
-                    exit_pnl = ((exit_price - entry) / entry * 100.0) if act == "LONG" else ((entry - exit_price) / entry * 100.0)
-                    final_pnl = round(partial_realized_pnl + (remaining_ratio * exit_pnl), 2)
+                    raw_exit_pnl = ((exit_price - entry) / entry * 100.0) if act == "LONG" else ((entry - exit_price) / entry * 100.0)
+                    net_leg_pnl = raw_exit_pnl - ROUND_TRIP_FEE_PCT
+                    final_pnl = round(partial_realized_pnl + (remaining_ratio * net_leg_pnl), 2)
 
                     close_status = "COMPLETED" if final_pnl >= 0 else "STOPPED_OUT"
                     with get_db_connection() as conn:
@@ -755,12 +849,12 @@ async def run_sentinel_cycle(session: aiohttp.ClientSession):
                             VALUES (?, ?, ?, ?, ?, 'SCALP_STAGNATION', ?, 'SCALP_SNIPER', ?)
                         """, (sym, act, entry, exit_price, current_sl, holding_mins, f"Scalp stalled at {pnl_approx:+.2f}% after {holding_mins:.0f}m."))
 
-                    log_event("INFO", "SENTINEL_EXIT", f"Trade {sym} {act} closed via SCALP_STAGNATION_KILL at {final_pnl:+.2f}% after {holding_mins:.0f}m")
+                    log_event("INFO", "SENTINEL_EXIT", f"Trade {sym} {act} closed via SCALP_STAGNATION_KILL at {final_pnl:+.2f}% net after {holding_mins:.0f}m")
 
                     msg = (
                         f"⚡ <b>SCALP STAGNATION RECYCLE ({holding_mins:.0f}m)</b>\n\n"
                         f"• <b>Contract:</b> <code>{sym}</code> ({act})\n"
-                        f"• <b>Exit Mark:</b> ${exit_price:.6f} (<code>{exit_pnl:+.2f}%</code>)\n"
+                        f"• <b>Exit Mark:</b> ${exit_price:.6f} (<code>{net_leg_pnl:+.2f}% net</code>)\n"
                         f"• <b>Total Realized Trade PnL:</b> <code>{final_pnl:+.2f}%</code>\n"
                         f"🤖 <b>Prolonged drawdown recycled to protect capital.</b>"
                     )
@@ -796,8 +890,9 @@ async def run_sentinel_cycle(session: aiohttp.ClientSession):
                     await asyncio.to_thread(emergency_binance_market_close, sym, act, executed_qty)
 
                 exit_price = current_sl if TRADING_MODE == "SIMULATION" else curr_price
-                exit_pnl = ((exit_price - entry) / entry * 100.0) if act == "LONG" else ((entry - exit_price) / entry * 100.0)
-                final_pnl = round(partial_realized_pnl + (remaining_ratio * exit_pnl), 2)
+                raw_exit_pnl = ((exit_price - entry) / entry * 100.0) if act == "LONG" else ((entry - exit_price) / entry * 100.0)
+                net_leg_pnl = raw_exit_pnl - ROUND_TRIP_FEE_PCT
+                final_pnl = round(partial_realized_pnl + (remaining_ratio * net_leg_pnl), 2)
 
                 cooldown_time = (utc_now() + datetime.timedelta(hours=4)).strftime("%Y-%m-%d %H:%M:%S")
                 close_status = "COMPLETED" if final_pnl >= 0 else "STOPPED_OUT"
@@ -813,9 +908,9 @@ async def run_sentinel_cycle(session: aiohttp.ClientSession):
                         conn.execute("""
                             INSERT INTO loss_diagnostics (symbol, action, entry_price, exit_price, stop_loss_price, exit_type, holding_duration_mins, market_regime, diagnostic_reason)
                             VALUES (?, ?, ?, ?, ?, 'STOP_LOSS', ?, ?, ?)
-                        """, (sym, act, entry, exit_price, current_sl, holding_mins, regime_label, f"Hit SL at ${current_sl:.6f} after {holding_mins:.0f}m ({final_pnl:+.2f}% PnL)."))
+                        """, (sym, act, entry, exit_price, current_sl, holding_mins, regime_label, f"Hit SL at ${current_sl:.6f} after {holding_mins:.0f}m ({final_pnl:+.2f}% net PnL)."))
 
-                log_event("INFO", "SENTINEL_EXIT", f"Trade {sym} {act} closed via {exit_reason_text}. Realized: {final_pnl:+.2f}%, Duration: {holding_mins:.0f}m")
+                log_event("INFO", "SENTINEL_EXIT", f"Trade {sym} {act} closed via {exit_reason_text}. Net Realized: {final_pnl:+.2f}%, Duration: {holding_mins:.0f}m")
 
                 emoji = "🛑 <b>STOP-LOSS HIT ON BINANCE</b>" if final_pnl < 0 else "🛡️ <b>BREAK-EVEN / PROFIT STOP TRIGGERED</b>"
                 msg = (
@@ -823,7 +918,7 @@ async def run_sentinel_cycle(session: aiohttp.ClientSession):
                     f"• <b>Contract:</b> <code>{sym}</code> ({act})\n"
                     f"• <b>Exit Price:</b> ${exit_price:.6f}\n"
                     f"• <b>Holding Time:</b> <code>{holding_mins:.0f} mins</code>\n"
-                    f"• <b>Total Realized Result:</b> <code>{final_pnl:+.2f}%</code>\n"
+                    f"• <b>Net Realized Result (after fees):</b> <code>{final_pnl:+.2f}%</code>\n"
                     f"🤖 <b>Position closed and orders cleaned up on Binance.</b>"
                 )
                 await send_telegram_alert(session, msg)

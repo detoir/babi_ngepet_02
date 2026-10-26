@@ -458,6 +458,33 @@ def set_symbol_leverage_and_margin(symbol: str, leverage: int = DEFAULT_LEVERAGE
         pass
     return True
 
+def get_symbol_min_qty(symbol: str) -> float:
+    bridge = bridge_symbol_formats(symbol)
+    target_sym = bridge["ccxt"]
+    try:
+        market = exchange.market(target_sym)
+        min_amt = float(market.get("limits", {}).get("amount", {}).get("min") or 0.0)
+        prec_amt = market.get("precision", {}).get("amount")
+        step_min = 0.0
+        if prec_amt is not None:
+            prec_val = float(prec_amt)
+            if prec_val > 0:
+                step_min = prec_val if prec_val < 1.0 else (10.0 ** (-int(prec_val)))
+        return max(min_amt, step_min, 0.001)
+    except Exception:
+        return 0.001
+
+def safe_amount_to_precision(symbol: str, qty_contracts: float) -> float:
+    bridge = bridge_symbol_formats(symbol)
+    target_sym = bridge["ccxt"]
+    min_qty = get_symbol_min_qty(target_sym)
+    clamped_qty = max(float(qty_contracts or 0.0), min_qty)
+    try:
+        formatted = float(exchange.amount_to_precision(target_sym, clamped_qty))
+        return max(formatted, min_qty)
+    except Exception:
+        return min_qty
+
 def format_order_quantity(symbol: str, pos_size_usd: float, price: float) -> float:
     bridge = bridge_symbol_formats(symbol)
     target_sym = bridge["ccxt"]
@@ -466,14 +493,13 @@ def format_order_quantity(symbol: str, pos_size_usd: float, price: float) -> flo
     raw_qty = pos_size_usd / price
     try:
         market = exchange.market(target_sym)
-        min_qty = float(market.get("limits", {}).get("amount", {}).get("min") or 0.001)
+        min_qty = get_symbol_min_qty(target_sym)
         min_notional = float(market.get("limits", {}).get("cost", {}).get("min") or 5.0)
         if (raw_qty * price) < min_notional:
             raw_qty = (min_notional * 1.05) / price
         if raw_qty < min_qty:
             raw_qty = min_qty
-        formatted = float(exchange.amount_to_precision(target_sym, raw_qty))
-        return formatted
+        return safe_amount_to_precision(target_sym, raw_qty)
     except Exception as e:
         log_event("WARN", "BINANCE_PRECISION", f"Qty precision formatting error on {target_sym}: {e}")
         return round(raw_qty, 3)
@@ -485,6 +511,30 @@ def format_order_price(symbol: str, price: float) -> float:
         return float(exchange.price_to_precision(target_sym, price))
     except Exception:
         return round(price, 4)
+
+def fetch_live_binance_position(symbol: str) -> dict:
+    if TRADING_MODE not in ("LIVE", "TESTNET"):
+        return {"contracts": 0.0, "entryPrice": 0.0, "markPrice": 0.0, "side": "", "ok": False}
+    bridge = bridge_symbol_formats(symbol)
+    target_sym = bridge["ccxt"]
+    try:
+        positions = exchange.fetch_positions([target_sym])
+        for p in positions:
+            p_sym = p.get("symbol", "")
+            if p_sym == target_sym or bridge["base"] in p_sym:
+                contracts = abs(float(p.get("contracts") or 0.0))
+                if contracts > 0:
+                    return {
+                        "contracts": contracts,
+                        "entryPrice": float(p.get("entryPrice") or 0.0),
+                        "markPrice": float(p.get("markPrice") or 0.0),
+                        "side": str(p.get("side") or "").upper(),
+                        "ok": True
+                    }
+        return {"contracts": 0.0, "entryPrice": 0.0, "markPrice": 0.0, "side": "", "ok": True}
+    except Exception as e:
+        log_event("WARN", "BINANCE_POS", f"Position check warning on {target_sym}: {e}")
+        return {"contracts": 0.0, "entryPrice": 0.0, "markPrice": 0.0, "side": "", "ok": False}
 
 def place_binance_market_entry(symbol: str, side: str, qty_usd: float, leverage: int = None) -> dict:
     if TRADING_MODE not in ("LIVE", "TESTNET"):
@@ -525,7 +575,7 @@ def place_binance_entry_limit(symbol: str, side: str, qty_usd: float, price: flo
         set_symbol_leverage_and_margin(target_sym, lev)
         formatted_price = format_order_price(target_sym, price)
         formatted_qty = format_order_quantity(target_sym, qty_usd, price)
-        order = exchange.create_limit_order(target_sym, order_side, formatted_qty, formatted_price, {
+        order = exchange.create_order(target_sym, "LIMIT", order_side, formatted_qty, formatted_price, {
             "timeInForce": "GTC"
         })
         order_id = str(order.get("id"))
@@ -543,13 +593,11 @@ def place_binance_stop_loss(symbol: str, side: str, qty_contracts: float, stop_p
     # If position is LONG, exit stop is SELL; if SHORT, exit stop is BUY
     order_side = "sell" if side.upper() == "LONG" else "buy"
     try:
-        market = exchange.market(target_sym)
-        min_qty = float(market.get("limits", {}).get("amount", {}).get("min") or 0.001)
+        min_qty = get_symbol_min_qty(target_sym)
         formatted_stop = format_order_price(target_sym, stop_price)
-        formatted_qty = float(exchange.amount_to_precision(target_sym, qty_contracts))
-        if formatted_qty < min_qty:
-            log_event("WARN", "BINANCE_SL", f"Qty {formatted_qty} on {target_sym} below min amount {min_qty}. Adjusting to minimum contract size {min_qty}.")
-            formatted_qty = min_qty
+        if qty_contracts < min_qty:
+            log_event("INFO", "BINANCE_SL", f"Qty {qty_contracts} on {target_sym} below min lot {min_qty}. Clamping to {min_qty}.")
+        formatted_qty = safe_amount_to_precision(target_sym, qty_contracts)
         order = exchange.create_order(
             symbol=target_sym,
             type="STOP_MARKET",
@@ -576,12 +624,8 @@ def place_binance_take_profit(symbol: str, side: str, qty_contracts: float, tp_p
     # If position is LONG, exit TP is SELL; if SHORT, exit TP is BUY
     order_side = "sell" if side.upper() == "LONG" else "buy"
     try:
-        market = exchange.market(target_sym)
-        min_qty = float(market.get("limits", {}).get("amount", {}).get("min") or 0.001)
         formatted_tp = format_order_price(target_sym, tp_price)
-        formatted_qty = float(exchange.amount_to_precision(target_sym, qty_contracts))
-        if formatted_qty < min_qty:
-            formatted_qty = min_qty
+        formatted_qty = safe_amount_to_precision(target_sym, qty_contracts)
         # Place reduceOnly LIMIT order at TP price to capture exact wicks with Maker fee (0.02% vs 0.05% Taker)
         try:
             order = exchange.create_order(
@@ -623,18 +667,26 @@ def cancel_binance_order(symbol: str, order_id: str) -> bool:
         return True
     bridge = bridge_symbol_formats(symbol)
     target_sym = bridge["ccxt"]
-    try:
-        exchange.cancel_order(order_id, target_sym)
-        log_event("INFO", "BINANCE_CANCEL", f"Cancelled order {order_id} on {target_sym}")
+    is_algo = str(order_id).startswith("400000")
+    param_attempts = [{"trigger": True}, {"stop": True}, {}] if is_algo else [{}, {"trigger": True}]
+    last_err = None
+    for params in param_attempts:
+        try:
+            exchange.cancel_order(order_id, target_sym, params=params)
+            log_event("INFO", "BINANCE_CANCEL", f"Cancelled order {order_id} on {target_sym}")
+            return True
+        except Exception as e:
+            last_err = e
+            err_msg = str(e)
+            if any(code in err_msg for code in ("-2011", "-2013", "Unknown order", "Order does not exist")):
+                continue
+            break
+    err_str = str(last_err or "")
+    if any(code in err_str for code in ("-2011", "-2013", "Unknown order", "Order does not exist")):
+        log_event("INFO", "BINANCE_CANCEL", f"Order {order_id} already resolved/closed on {target_sym}")
         return True
-    except Exception as e:
-        err_msg = str(e)
-        if "-2011" in err_msg or "Unknown order" in err_msg:
-            # Order was already executed, cancelled, or expired on exchange
-            log_event("INFO", "BINANCE_CANCEL", f"Order {order_id} already resolved/closed on {target_sym}")
-        else:
-            log_event("WARN", "BINANCE_CANCEL", f"Cancel order {order_id} exception on {target_sym}: {e}")
-        return False
+    log_event("WARN", "BINANCE_CANCEL", f"Cancel order {order_id} exception on {target_sym}: {last_err}")
+    return False
 
 def emergency_binance_market_close(symbol: str, side: str, qty_contracts: float = 0.0) -> bool:
     if TRADING_MODE not in ("LIVE", "TESTNET"):
@@ -644,21 +696,19 @@ def emergency_binance_market_close(symbol: str, side: str, qty_contracts: float 
     order_side = "sell" if side.upper() == "LONG" else "buy"
     try:
         params = {"reduceOnly": True}
-        market = exchange.market(target_sym)
-        min_qty = float(market.get("limits", {}).get("amount", {}).get("min") or 0.001)
+        # Always verify actual open position on Binance first to avoid -2022 ReduceOnly rejection
+        pos_info = fetch_live_binance_position(target_sym)
+        live_contracts = pos_info.get("contracts", 0.0)
+        if pos_info.get("ok") and live_contracts <= 0:
+            log_event("INFO", "BINANCE_CLOSE", f"Position on {target_sym} is already flat (0 contracts). Skipping market close.")
+            return True
         if qty_contracts > 0:
-            formatted_qty = float(exchange.amount_to_precision(target_sym, qty_contracts))
-            if formatted_qty < min_qty:
-                formatted_qty = min_qty
+            close_amt = min(qty_contracts, live_contracts) if live_contracts > 0 else qty_contracts
+            formatted_qty = safe_amount_to_precision(target_sym, close_amt)
             exchange.create_order(symbol=target_sym, type="MARKET", side=order_side, amount=formatted_qty, params=params)
-        else:
-            # Fetch current open position size on Binance
-            positions = exchange.fetch_positions([target_sym])
-            for p in positions:
-                contracts = abs(float(p.get("contracts") or 0.0))
-                if contracts > 0:
-                    exchange.create_order(symbol=target_sym, type="MARKET", side=order_side, amount=contracts, params=params)
-                    break
+        elif live_contracts > 0:
+            formatted_qty = safe_amount_to_precision(target_sym, live_contracts)
+            exchange.create_order(symbol=target_sym, type="MARKET", side=order_side, amount=formatted_qty, params=params)
         log_event("INFO", "BINANCE_CLOSE", f"Emergency Market Close executed for {target_sym}")
         return True
     except Exception as e:
@@ -670,16 +720,33 @@ def fetch_binance_order_status(symbol: str, order_id: str) -> dict:
         return {"status": "UNKNOWN", "filled": 0.0, "average": 0.0}
     bridge = bridge_symbol_formats(symbol)
     target_sym = bridge["ccxt"]
-    try:
-        ord_data = exchange.fetch_order(order_id, target_sym)
-        return {
-            "status": str(ord_data.get("status", "open")).upper(),
-            "filled": float(ord_data.get("filled") or 0.0),
-            "average": float(ord_data.get("average") or ord_data.get("price") or 0.0)
-        }
-    except Exception as e:
-        log_event("WARN", "BINANCE_STATUS", f"Fetch order {order_id} error on {target_sym}: {e}")
-        return {"status": "ERROR", "filled": 0.0, "average": 0.0}
+    is_algo = str(order_id).startswith("400000")
+    param_attempts = [{"trigger": True}, {"stop": True}, {}] if is_algo else [{}, {"trigger": True}, {"stop": True}]
+    last_err = None
+    for params in param_attempts:
+        try:
+            ord_data = exchange.fetch_order(order_id, target_sym, params=params)
+            raw_status = str(ord_data.get("status") or ord_data.get("info", {}).get("algoStatus") or "open").upper()
+            if raw_status in ("FILLED", "FINISHED", "TRIGGERED"):
+                raw_status = "CLOSED"
+            elif raw_status in ("CANCELED", "CANCELLED", "EXPIRED", "REJECTED"):
+                raw_status = "CANCELED"
+            return {
+                "status": raw_status,
+                "filled": float(ord_data.get("filled") or ord_data.get("info", {}).get("executedQty") or 0.0),
+                "average": float(ord_data.get("average") or ord_data.get("price") or ord_data.get("stopPrice") or 0.0)
+            }
+        except Exception as e:
+            last_err = e
+            err_msg = str(e)
+            if "-2013" in err_msg or "Order does not exist" in err_msg:
+                continue
+            break
+    err_str = str(last_err or "")
+    if "-2013" in err_str or "Order does not exist" in err_str:
+        return {"status": "NOT_FOUND", "filled": 0.0, "average": 0.0}
+    log_event("WARN", "BINANCE_STATUS", f"Fetch order {order_id} error on {target_sym}: {last_err}")
+    return {"status": "ERROR", "filled": 0.0, "average": 0.0}
 
 def trigger_circuit_breaker(hours=4):
     cb_until = time.time() + (hours * 3600)
