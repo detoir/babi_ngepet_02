@@ -37,6 +37,7 @@ from config_db import (
     DEFAULT_LEVERAGE,
     SCALP_LEVERAGE,
     SCALP_ENTRY_TYPE,
+    TRADE_ENTRY_TYPE,
     TRADING_MODE,
     DEEPSEEK_API_KEY,
     TELEGRAM_BOT_TOKEN,
@@ -71,6 +72,9 @@ from config_db import (
     place_binance_entry_limit,
     place_binance_stop_loss,
     place_binance_take_profit,
+    place_binance_tp_sl_brackets,
+    split_tp_quantities,
+    fetch_live_binance_position,
     cancel_binance_order,
     emergency_binance_market_close,
     get_symbol_min_qty,
@@ -190,26 +194,23 @@ def calculate_deterministic_trade_levels(price: float, atr_1h: float, direction:
 
     if is_scalp or strat_mode == "SCALP":
         # Professional Scalp Sniper:
-        # Balanced ATR swing risk (0.75% min to avoid 1m spread wicks, 1.15% max to cap single loss)
-        raw_risk = atr_1h * 0.70
-        risk_dist = max(raw_risk, price * 0.0075)
-        risk_dist = min(risk_dist, price * 0.0115)
+        # Balanced ATR swing risk (0.85% min to avoid 5m spread/wick noise, 1.20% max to cap single loss)
+        raw_risk = atr_1h * 0.75
+        risk_dist = max(raw_risk, price * 0.0085)
+        risk_dist = min(risk_dist, price * 0.0120)
 
-        # Asymmetric Scalp Targets: TP1 at 1.4R, TP2 at 2.2R, TP3 at 3.2R
-        tp1_mult = 1.4
-        tp2_mult = 2.2
-        tp3_mult = 3.2
+        # High-Hit-Rate Scalp Targets: Bank 50% early at 1.0R so winning positions pay out before reversals!
+        tp1_mult = 1.0
+        tp2_mult = 1.8
+        tp3_mult = 2.8
 
-        # Smart Pullback Entry: Never buy the exact market top / short the exact market bottom
-        # If MARKET mode is explicitly set, use mark price; otherwise place limit at a smart discount
+        # If MARKET mode is active (default), use mark price so entry + SL + TP execute immediately
         if SCALP_ENTRY_TYPE == "MARKET":
             entry = round(price, 6)
         elif direction == "LONG":
-            # Long pullback entry: Target a slight dip toward EMA21 or 0.25% discount
             pullback_target = max(price * 0.9970, min(price * 0.9985, ema21_1h)) if ema21_1h < price else (price * 0.9975)
             entry = round(pullback_target, 6)
         else:
-            # Short pullback entry: Target a slight relief bounce toward EMA21 or 0.25% premium
             bounce_target = min(price * 1.0030, max(price * 1.0015, ema21_1h)) if ema21_1h > price else (price * 1.0025)
             entry = round(bounce_target, 6)
 
@@ -237,61 +238,52 @@ def calculate_deterministic_trade_levels(price: float, atr_1h: float, direction:
             "risk_pct": round((risk_dist / entry) * 100.0, 2) if entry > 0 else 1.0
         }
 
-    # Dynamic risk distance for Fast/Swing trades: Cap strictly at 1.50% (down from 2.80%) to prevent oversized -2.8% drawdowns
-    raw_risk = atr_1h * 1.15
+    # Dynamic risk distance for Fast/Swing trades: Cap strictly at 1.45%
+    raw_risk = atr_1h * 1.10
     risk_dist = max(raw_risk, price * 0.010)
-    risk_dist = min(risk_dist, price * 0.015)
+    risk_dist = min(risk_dist, price * 0.0145)
 
-    # Adaptive reward multipliers based on regime
+    # Adaptive reward multipliers: Closer TP1 (1.1R-1.2R) to bank 50% early on first impulse
     if is_sweep:
-        # Range-bound / Weekend: Positive asymmetric R:R (1.3R / 2.1R / 3.0R)
-        tp1_mult = 1.3
-        tp2_mult = 2.1
-        tp3_mult = 3.0
+        tp1_mult = 1.1
+        tp2_mult = 1.9
+        tp3_mult = 2.8
     else:
-        # Trending: Asymmetric reward multipliers allowing runners to achieve full target
-        tp1_mult = 1.5
-        tp2_mult = 2.4
-        tp3_mult = 3.5
+        tp1_mult = 1.2
+        tp2_mult = 2.0
+        tp3_mult = 3.0
 
-    if not is_sweep:
+    if TRADE_ENTRY_TYPE == "MARKET":
+        entry = round(price, 6)
+    elif not is_sweep:
         if direction == "SHORT":
-            # For shorts: Pullback limit entry above current price to avoid shorting the exact low
-            # Anti-chase: If coin has already dumped heavily (<= -4.0%), demand a deeper bounce into resistance
             if change_24h <= -4.0:
                 bounce_target = min(price * 1.008, max(price * 1.004, ema21_1h)) if ema21_1h > price else (price * 1.005)
             else:
                 bounce_target = min(price * 1.0035, max(price * 1.0012, ema21_1h)) if ema21_1h > price else (price * 1.0018)
             entry = round(bounce_target, 6)
-            sl = round(entry + risk_dist, 6)
-            t1 = round(entry - (tp1_mult * risk_dist), 6)
-            t2 = round(entry - (tp2_mult * risk_dist), 6)
-            t3 = round(entry - (tp3_mult * risk_dist), 6)
         else:
-            # For longs: Pullback limit entry below current price to avoid buying the exact peak
-            # Anti-chase: If coin has already pumped heavily (>= +3.5%), demand a deeper dip into discount support
             if change_24h >= 3.5:
                 pullback_target = max(price * 0.992, min(price * 0.996, ema21_1h)) if ema21_1h < price else (price * 0.994)
             else:
                 pullback_target = max(price * 0.9965, min(price * 0.9988, ema21_1h)) if ema21_1h < price else (price * 0.9982)
             entry = round(pullback_target, 6)
-            sl = round(entry - risk_dist, 6)
-            t1 = round(entry + (tp1_mult * risk_dist), 6)
-            t2 = round(entry + (tp2_mult * risk_dist), 6)
-            t3 = round(entry + (tp3_mult * risk_dist), 6)
     else:  # SWEEP_REVERSION / WEEKEND
         if direction == "LONG":
             entry = round(price * 0.994, 6)
-            sl = round(entry - risk_dist, 6)
-            t1 = round(entry + (tp1_mult * risk_dist), 6)
-            t2 = round(entry + (tp2_mult * risk_dist), 6)
-            t3 = round(entry + (tp3_mult * risk_dist), 6)
         else:
             entry = round(price * 1.006, 6)
-            sl = round(entry + risk_dist, 6)
-            t1 = round(entry - (tp1_mult * risk_dist), 6)
-            t2 = round(entry - (tp2_mult * risk_dist), 6)
-            t3 = round(entry - (tp3_mult * risk_dist), 6)
+
+    if direction == "LONG":
+        sl = round(entry - risk_dist, 6)
+        t1 = round(entry + (tp1_mult * risk_dist), 6)
+        t2 = round(entry + (tp2_mult * risk_dist), 6)
+        t3 = round(entry + (tp3_mult * risk_dist), 6)
+    else:
+        sl = round(entry + risk_dist, 6)
+        t1 = round(entry - (tp1_mult * risk_dist), 6)
+        t2 = round(entry - (tp2_mult * risk_dist), 6)
+        t3 = round(entry - (tp3_mult * risk_dist), 6)
         
     return {
         "entry": entry,
@@ -299,43 +291,59 @@ def calculate_deterministic_trade_levels(price: float, atr_1h: float, direction:
         "t1": t1,
         "t2": t2,
         "t3": t3,
+        "tp1_mult": tp1_mult,
+        "tp2_mult": tp2_mult,
+        "tp3_mult": tp3_mult,
         "risk_dist": risk_dist,
-        "risk_pct": round((risk_dist / entry) * 100.0, 2) if entry > 0 else 2.0
+        "risk_pct": round((risk_dist / entry) * 100.0, 2) if entry > 0 else 1.4
     }
 
 def calculate_objective_quant_score(direction: str, rsi_1h: float, rsi_4h: float, btc_regime: str, vol_m: float, funding_rate: float, change_24h: float, btc_24h_pct: float, book_ratio: float = 1.0) -> float:
-    if direction == "LONG" and btc_24h_pct < -0.8:
-        return 0.10
-
-    if direction == "SHORT" and btc_24h_pct > 2.0:
-        return 0.10
+    # Hard Disqualification Gates: Never buy overbought tops / falling knives or short oversold capitulation bottoms
+    if direction == "LONG":
+        if btc_24h_pct < -0.8:
+            return 0.10
+        if rsi_1h > 64.0 or rsi_1h < 42.0:
+            return 0.10
+        if change_24h >= 7.5 or funding_rate >= 0.025 or book_ratio < 1.05:
+            return 0.10
+    else:  # SHORT
+        if btc_24h_pct > 1.8:
+            return 0.10
+        if rsi_1h < 36.0 or rsi_1h > 56.0:
+            return 0.10
+        if change_24h <= -7.0 or funding_rate <= -0.030 or book_ratio > 0.95:
+            return 0.10
 
     score = 0.50
     
     if direction == "LONG":
-        if btc_24h_pct >= 0.5: score += 0.15
-        if change_24h > (btc_24h_pct + 1.5): score += 0.15
-        if 42.0 <= rsi_1h <= 62.0: score += 0.15
-        if 45.0 <= rsi_4h <= 65.0: score += 0.15
-        if funding_rate <= 0.008: score += 0.10
-        if book_ratio >= 1.15: score += 0.10
-        # Overbought and chase penalties
-        if rsi_1h > 67.0: score -= 0.35
-        if change_24h >= 10.0: score -= 0.35
-
+        if btc_24h_pct >= 0.5: score += 0.12
+        if 0.5 <= (change_24h - btc_24h_pct) <= 5.0: score += 0.12
+        if 48.0 <= rsi_1h <= 60.0: score += 0.12
+        if 48.0 <= rsi_4h <= 63.0: score += 0.10
+        if funding_rate <= 0.010: score += 0.08
+        if book_ratio >= 1.25: score += 0.10
     else:  # SHORT
-        if btc_24h_pct <= -1.0: score += 0.25
-        if change_24h < (btc_24h_pct - 1.0): score += 0.20
-        if 36.0 <= rsi_1h <= 55.0: score += 0.15
-        if 35.0 <= rsi_4h <= 58.0: score += 0.15
-        if -0.025 <= funding_rate <= 0.012: score += 0.10
-        if book_ratio <= 0.85: score += 0.10
-        # Oversold exhaustion and dump chase penalties
-        if rsi_1h < 33.0: score -= 0.35
-        if change_24h <= -9.0: score -= 0.35
+        if btc_24h_pct <= -1.0: score += 0.15
+        if -5.5 <= (change_24h - btc_24h_pct) <= -0.8: score += 0.12
+        if 38.0 <= rsi_1h <= 50.0: score += 0.12
+        if 38.0 <= rsi_4h <= 55.0: score += 0.10
+        if -0.020 <= funding_rate <= 0.012: score += 0.08
+        if book_ratio <= 0.78: score += 0.10
 
-    if vol_m >= 35.0: score += 0.10
-    elif vol_m >= 10.0: score += 0.05
+    if vol_m >= 35.0: score += 0.08
+    elif vol_m >= 10.0: score += 0.04
+
+    # Clamp positive bonuses BEFORE applying any edge exhaustion penalties
+    score = min(0.92, score)
+
+    if direction == "LONG":
+        if rsi_1h > 61.5: score -= 0.25
+        if change_24h >= 5.5: score -= 0.25
+    else:
+        if rsi_1h < 38.5: score -= 0.25
+        if change_24h <= -5.5: score -= 0.25
 
     return round(max(0.10, min(0.95, score)), 2)
 
@@ -923,24 +931,41 @@ async def execute_unified_hourly_discovery_pipeline(context: ContextTypes.DEFAUL
                             c_cur.execute("SELECT id, status, stage FROM watched_signals WHERE symbol = ? AND status = 'WATCHING'", (raw_sym,))
                             existing_row = c_cur.fetchone()
                             if not existing_row:
-                                # Auto-import manual or external Binance trade into bot tracking
+                                # Auto-import manual or external Binance trade into bot tracking and attach protective SL/TP brackets
                                 est_sl = round(entry_px * 0.990, 6) if b_side == "LONG" else round(entry_px * 1.010, 6)
-                                est_t1 = round(entry_px * 1.015, 6) if b_side == "LONG" else round(entry_px * 0.985, 6)
-                                est_t2 = round(entry_px * 1.025, 6) if b_side == "LONG" else round(entry_px * 0.975, 6)
-                                est_t3 = round(entry_px * 1.035, 6) if b_side == "LONG" else round(entry_px * 0.965, 6)
+                                est_t1 = round(entry_px * 1.011, 6) if b_side == "LONG" else round(entry_px * 0.989, 6)
+                                est_t2 = round(entry_px * 1.020, 6) if b_side == "LONG" else round(entry_px * 0.980, 6)
+                                est_t3 = round(entry_px * 1.030, 6) if b_side == "LONG" else round(entry_px * 0.970, 6)
+                                sync_brackets = await asyncio.to_thread(
+                                    place_binance_tp_sl_brackets, raw_sym, b_side, contracts, est_sl, est_t1, est_t2, est_t3
+                                )
                                 c_check.execute("""
                                     INSERT INTO watched_signals
                                     (symbol, action, entry_limit, initial_sl, current_sl, target_1, target_2, target_3,
                                      position_size_usd, stage, highest_favorable_price, status, remaining_ratio, partial_realized_pnl, confidence, trade_speed,
-                                     coin_trend, strategic_thesis, movement_tag, executed_qty, trading_mode, timestamp, last_updated)
-                                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, 'WATCHING', 1.0, 0.0, 0.90, 'FAST TRADE', 'BINANCE_SYNC', 'Auto-synced from active Binance position', '🔄 BINANCE_SYNC', ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                                     coin_trend, strategic_thesis, movement_tag, binance_entry_order_id, binance_sl_order_id, binance_tp1_id, binance_tp2_id, binance_tp3_id,
+                                     executed_qty, trading_mode, timestamp, last_updated)
+                                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, 'WATCHING', 1.0, 0.0, 0.90, 'FAST TRADE', 'BINANCE_SYNC', 'Auto-synced from active Binance position', '🔄 BINANCE_SYNC', '', ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
                                     ON CONFLICT(symbol) DO UPDATE SET
+                                        action = excluded.action,
                                         status = 'WATCHING', stage = 1, executed_qty = excluded.executed_qty,
-                                        entry_limit = excluded.entry_limit, current_sl = excluded.current_sl,
+                                        entry_limit = excluded.entry_limit, initial_sl = excluded.initial_sl, current_sl = excluded.current_sl,
+                                        target_1 = excluded.target_1, target_2 = excluded.target_2, target_3 = excluded.target_3,
+                                        highest_favorable_price = excluded.entry_limit,
+                                        binance_entry_order_id = '',
+                                        binance_sl_order_id = excluded.binance_sl_order_id,
+                                        binance_tp1_id = excluded.binance_tp1_id,
+                                        binance_tp2_id = excluded.binance_tp2_id,
+                                        binance_tp3_id = excluded.binance_tp3_id,
                                         remaining_ratio = 1.0, partial_realized_pnl = 0.0,
                                         movement_tag = '🔄 BINANCE_SYNC', timestamp = CURRENT_TIMESTAMP, last_updated = CURRENT_TIMESTAMP
-                                """, (raw_sym, b_side, entry_px, est_sl, est_sl, est_t1, est_t2, est_t3, pos_notional, entry_px, contracts, TRADING_MODE))
-                                log_event("INFO", "BINANCE_SYNC", f"Auto-synced open Binance {b_side} position on {raw_sym}: {contracts} contracts (${pos_notional:.1f})")
+                                """, (
+                                    raw_sym, b_side, entry_px, est_sl, est_sl, est_t1, est_t2, est_t3,
+                                    pos_notional, entry_px,
+                                    sync_brackets["sl_id"], sync_brackets["tp1_id"], sync_brackets["tp2_id"], sync_brackets["tp3_id"],
+                                    contracts, TRADING_MODE
+                                ))
+                                log_event("INFO", "BINANCE_SYNC", f"Auto-synced open Binance {b_side} position on {raw_sym}: {contracts} contracts (${pos_notional:.1f}) with SL/TP brackets.")
 
                 # Reconcile any Stage >= 1 WATCHING rows whose positions are now closed (0 contracts) on Binance
                 with get_db_connection() as c_reconcile:
@@ -1151,12 +1176,11 @@ async def execute_unified_hourly_discovery_pipeline(context: ContextTypes.DEFAUL
                     except Exception:
                         pass
 
-            elif d_verdict == "TIGHTEN_SL" and match_pos["pnl_pct"] >= 0.95:
-                # CRITICAL SAFETY GUARD: Only tighten SL to Break-Even+Profit (+0.35%) if trade is at least +0.95% in profit
-                # so the new SL has a safe >=0.45% cushion and NEVER chokes out trades before TP1!
-                tighter_sl = round(match_pos["entry"] * 1.0035, 6) if match_pos["action"] == "LONG" else round(match_pos["entry"] * 0.9965, 6)
+            elif d_verdict == "TIGHTEN_SL" and match_pos["pnl_pct"] >= 0.60:
+                # Tighten SL to Break-Even+Profit (+0.20%) once trade is at least +0.60% in profit
+                tighter_sl = round(match_pos["entry"] * 1.0020, 6) if match_pos["action"] == "LONG" else round(match_pos["entry"] * 0.9980, 6)
                 is_better = (tighter_sl > match_pos["current_sl"]) if match_pos["action"] == "LONG" else (tighter_sl < match_pos["current_sl"])
-                is_safe_side = (match_pos["curr_price"] >= tighter_sl * 1.0045) if match_pos["action"] == "LONG" else (match_pos["curr_price"] <= tighter_sl * 0.9955)
+                is_safe_side = (match_pos["curr_price"] >= tighter_sl * 1.0020) if match_pos["action"] == "LONG" else (match_pos["curr_price"] <= tighter_sl * 0.9980)
                 if is_better and is_safe_side:
                     if match_pos["sl_order_id"]:
                         await asyncio.to_thread(cancel_binance_order, match_pos["symbol"], match_pos["sl_order_id"])
@@ -1165,7 +1189,7 @@ async def execute_unified_hourly_discovery_pipeline(context: ContextTypes.DEFAUL
                         new_sl_id = await asyncio.to_thread(place_binance_stop_loss, match_pos["symbol"], match_pos["action"], match_pos["executed_qty"], tighter_sl)
 
                     with get_db_connection() as conn:
-                        conn.execute("UPDATE watched_signals SET current_sl = ?, binance_sl_order_id = ?, movement_tag = '🛡️ AI_TIGHTENED_SL', last_updated = CURRENT_TIMESTAMP WHERE id = ?", (tighter_sl, new_sl_id, match_pos["id"]))
+                        conn.execute("UPDATE watched_signals SET current_sl = ?, binance_sl_order_id = ?, movement_tag = '🛡️ AI_TIGHTENED_SL', last_updated = CURRENT_TIMESTAMP WHERE id = ? AND status = 'WATCHING'", (tighter_sl, new_sl_id, match_pos["id"]))
 
                     log_event("INFO", "AI_REVERSAL", f"Stop-Loss tightened on {d_sym} to ${tighter_sl:.6f}. Reason: {d_reason}")
 
@@ -1258,6 +1282,8 @@ async def execute_unified_hourly_discovery_pipeline(context: ContextTypes.DEFAUL
             chg = cand_info["c"] if cand_info else 0.0
             book_ratio = cand_info.get("book_ratio", 1.0) if cand_info else 1.0
             whale_ls = cand_info.get("whale_ls_ratio", 1.0) if cand_info else 1.0
+            hi_24h = float(cand_info.get("hi") or curr_price) if cand_info else curr_price
+            lo_24h = float(cand_info.get("lo") or curr_price) if cand_info else curr_price
 
             quant_score = calculate_objective_quant_score(act, rsi_1h, rsi_4h, btc_regime["regime"], vol_m, funding, chg, btc_24h_pct, book_ratio)
             # Hard Quantitative Safety Veto: Never allow AI confidence to override a failed quant safety check (< 0.50)
@@ -1266,21 +1292,26 @@ async def execute_unified_hourly_discovery_pipeline(context: ContextTypes.DEFAUL
                 continue
 
             if cand["source"] in ("WHALE_FLOW", "AI_SCALP"):
-                quant_score = round((quant_score * 0.60) + (float(cand["confidence"]) * 0.40), 2)
+                quant_score = round((quant_score * 0.65) + (float(cand["confidence"]) * 0.35), 2)
 
             if quant_score < CONFIDENCE_THRESHOLD:
                 continue
 
             is_scalp = (cand.get("trade_speed") == "SCALP TRADE" or cand.get("strategy_mode") == "SCALP")
 
-            # Strict Professional Scalp Trend & Orderbook Alignment Gate:
-            # Eliminates counter-trend knife-catching, overbought/oversold chasing, and wrong-side book skew
-            if is_scalp:
-                if act == "LONG" and (curr_price < ema21_1h or rsi_1h < 48.0 or rsi_1h > 65.0 or book_ratio < 1.15 or btc_24h_pct < -0.50):
-                    log_event("INFO", "SCALP_GATE", f"Filtered LONG scalp on {sym}: Failed alignment (Price ${curr_price:.4f} vs EMA21 ${ema21_1h:.4f}, RSI {rsi_1h:.1f} [48-65], Book {book_ratio}x [>=1.15], BTC {btc_24h_pct:+.2f}%).")
+            # Strict Trend, Orderbook & 24h Range Room Alignment Gate (Enforced on ALL trades):
+            # Eliminates counter-trend knife-catching, overbought/oversold chasing, and buying 24h highs / shorting 24h lows
+            if act == "LONG":
+                min_book = 1.15 if is_scalp else 1.10
+                near_24h_top = (chg >= 2.5 and hi_24h > 0 and curr_price >= hi_24h * 0.992)
+                if curr_price < (ema21_1h * 0.998) or rsi_1h < 46.0 or rsi_1h > 63.0 or book_ratio < min_book or btc_24h_pct < -0.50 or near_24h_top:
+                    log_event("INFO", "ALIGNMENT_GATE", f"Filtered LONG on {sym}: Failed alignment (Price ${curr_price:.4f} vs EMA21 ${ema21_1h:.4f}, 24h High ${hi_24h:.4f}, RSI {rsi_1h:.1f}, Book {book_ratio}x, BTC {btc_24h_pct:+.2f}%).")
                     continue
-                elif act == "SHORT" and (curr_price > ema21_1h or rsi_1h > 52.0 or rsi_1h < 35.0 or book_ratio > 0.85 or btc_24h_pct > 1.00):
-                    log_event("INFO", "SCALP_GATE", f"Filtered SHORT scalp on {sym}: Failed alignment (Price ${curr_price:.4f} vs EMA21 ${ema21_1h:.4f}, RSI {rsi_1h:.1f} [35-52], Book {book_ratio}x [<=0.85], BTC {btc_24h_pct:+.2f}%).")
+            elif act == "SHORT":
+                max_book = 0.85 if is_scalp else 0.90
+                near_24h_bottom = (chg <= -2.5 and lo_24h > 0 and curr_price <= lo_24h * 1.008)
+                if curr_price > (ema21_1h * 1.002) or rsi_1h > 53.0 or rsi_1h < 37.0 or book_ratio > max_book or btc_24h_pct > 1.00 or near_24h_bottom:
+                    log_event("INFO", "ALIGNMENT_GATE", f"Filtered SHORT on {sym}: Failed alignment (Price ${curr_price:.4f} vs EMA21 ${ema21_1h:.4f}, 24h Low ${lo_24h:.4f}, RSI {rsi_1h:.1f}, Book {book_ratio}x, BTC {btc_24h_pct:+.2f}%).")
                     continue
 
             levels = calculate_deterministic_trade_levels(curr_price, atr_1h, act, ema21_1h, cand["strategy_mode"], change_24h=chg, is_scalp=is_scalp)
@@ -1323,9 +1354,12 @@ async def execute_unified_hourly_discovery_pipeline(context: ContextTypes.DEFAUL
                 "expected_cash_profit": round(expected_cash_profit, 2),
                 "pos_size_usd": pos_size_calc,
                 "curr_price": curr_price,
+                "ema21_1h": ema21_1h,
+                "chg": chg,
                 "rsi_1h": rsi_1h,
                 "funding": funding,
                 "book_ratio": book_ratio,
+                "whale_ls": whale_ls,
                 "atr_1h": atr_1h,
                 "is_scalp": is_scalp
             })
@@ -1357,19 +1391,26 @@ async def execute_unified_hourly_discovery_pipeline(context: ContextTypes.DEFAUL
                 log_event("INFO", "PROFIT_ENGINE", f"Correlated {act} limit ({dir_count}/{max_allowed_dir}) reached. Skipping {sym}.")
                 continue
 
-            levels = item["levels"]
+            # Re-fetch fresh live price after AI evaluation so 20s LLM latency never causes stale fills
+            fresh_price = await asyncio.to_thread(fetch_real_perp_market_price, sym)
+            curr_price = fresh_price if fresh_price > 0 else item["curr_price"]
+            levels = calculate_deterministic_trade_levels(
+                curr_price, item["atr_1h"], act, item.get("ema21_1h", curr_price),
+                cand["strategy_mode"], change_24h=item.get("chg", 0.0), is_scalp=is_scalp
+            )
             quant_score = item["quant_score"]
-            curr_price = item["curr_price"]
             pos_size_usd = item.get("pos_size_usd") or calculate_dynamic_position_size(quant_score, levels["risk_pct"], balance=account_balance, is_scalp=is_scalp)
 
-            # Execution Logic: Aggressive scalps fill immediately at market
-            is_market_entry = (is_scalp and SCALP_ENTRY_TYPE == "MARKET")
+            # Execution Logic: Default MARKET entry so trade + Stop-Loss + TP1/TP2/TP3 brackets are placed together immediately
+            is_market_entry = (SCALP_ENTRY_TYPE == "MARKET" if is_scalp else TRADE_ENTRY_TYPE == "MARKET")
             is_immediate_fill = is_market_entry or ((curr_price <= levels["entry"]) if act == "LONG" else (curr_price >= levels["entry"]))
             init_stage = 1 if is_immediate_fill else 0
 
             binance_order_id = ""
             binance_sl_id = ""
             binance_tp1_id = ""
+            binance_tp2_id = ""
+            binance_tp3_id = ""
             executed_qty = 0.0
             actual_fill_price = levels["entry"]
             target_leverage = SCALP_LEVERAGE if is_scalp else DEFAULT_LEVERAGE
@@ -1377,8 +1418,8 @@ async def execute_unified_hourly_discovery_pipeline(context: ContextTypes.DEFAUL
             if is_immediate_fill:
                 actual_fill_price = curr_price
                 if TRADING_MODE in ("LIVE", "TESTNET"):
-                    # Fire immediate Market Entry on Binance for Aggressive Scalp
-                    market_res = place_binance_market_entry(sym, act, pos_size_usd, leverage=target_leverage)
+                    # Fire immediate Market Entry on Binance
+                    market_res = await asyncio.to_thread(place_binance_market_entry, sym, act, pos_size_usd, target_leverage)
                     binance_order_id = market_res.get("id", "")
                     executed_qty = float(market_res.get("filled", 0.0))
                     if executed_qty <= 0:
@@ -1386,12 +1427,14 @@ async def execute_unified_hourly_discovery_pipeline(context: ContextTypes.DEFAUL
                         continue
                     if market_res.get("price", 0.0) > 0:
                         actual_fill_price = float(market_res["price"])
+                else:
+                    executed_qty = format_order_quantity(sym, pos_size_usd, actual_fill_price)
 
                 # Recalculate SL/TP brackets relative to actual_fill_price so slippage never distorts risk/reward
                 fill_risk_dist = actual_fill_price * (levels["risk_pct"] / 100.0)
-                tp1_m = levels.get("tp1_mult", 1.4 if is_scalp else 1.5)
-                tp2_m = levels.get("tp2_mult", 2.2 if is_scalp else 2.4)
-                tp3_m = levels.get("tp3_mult", 3.2 if is_scalp else 3.5)
+                tp1_m = levels.get("tp1_mult", 1.0 if is_scalp else 1.2)
+                tp2_m = levels.get("tp2_mult", 1.8 if is_scalp else 2.0)
+                tp3_m = levels.get("tp3_mult", 2.8 if is_scalp else 3.0)
                 if act == "LONG":
                     levels["sl"] = round(actual_fill_price - fill_risk_dist, 6)
                     levels["t1"] = round(actual_fill_price + (tp1_m * fill_risk_dist), 6)
@@ -1403,19 +1446,38 @@ async def execute_unified_hourly_discovery_pipeline(context: ContextTypes.DEFAUL
                     levels["t2"] = round(actual_fill_price - (tp2_m * fill_risk_dist), 6)
                     levels["t3"] = round(actual_fill_price - (tp3_m * fill_risk_dist), 6)
 
-                if TRADING_MODE in ("LIVE", "TESTNET") and executed_qty > 0:
-                    # Immediately place protective Stop-Loss and Resting Limit TP1 (50% size, or 100% if min-lot) on Binance
-                    min_lot = get_symbol_min_qty(sym)
-                    tp1_qty = executed_qty if (executed_qty * 0.50) < min_lot else (executed_qty * 0.50)
-                    binance_sl_id = place_binance_stop_loss(sym, act, executed_qty, levels["sl"])
-                    binance_tp1_id = place_binance_take_profit(sym, act, tp1_qty, levels["t1"])
+                # Immediately put up Hard Stop-Loss and TP1/TP2/TP3 orders on Binance while sending trade
+                brackets = await asyncio.to_thread(
+                    place_binance_tp_sl_brackets,
+                    sym, act, executed_qty, levels["sl"], levels["t1"], levels["t2"], levels["t3"]
+                )
+                binance_sl_id = brackets["sl_id"]
+                binance_tp1_id = brackets["tp1_id"]
+                binance_tp2_id = brackets["tp2_id"]
+                binance_tp3_id = brackets["tp3_id"]
             else:
-                # Place Resting Limit Order on Binance
+                # Place Resting Limit Order on Binance AND immediately put up conditional SL & TP brackets
+                executed_qty = format_order_quantity(sym, pos_size_usd, levels["entry"])
                 if TRADING_MODE in ("LIVE", "TESTNET"):
-                    binance_order_id = place_binance_entry_limit(sym, act, pos_size_usd, levels["entry"], leverage=target_leverage)
+                    binance_order_id = await asyncio.to_thread(place_binance_entry_limit, sym, act, pos_size_usd, levels["entry"], target_leverage)
                     if not binance_order_id:
                         log_event("WARN", "PROFIT_ENGINE", f"Limit entry failed on {sym}. Skipping watchlist insertion.")
                         continue
+                    # Check if limit order filled immediately on matching engine
+                    pos_check = await asyncio.to_thread(fetch_live_binance_position, sym)
+                    if pos_check.get("ok") and float(pos_check.get("contracts") or 0.0) > 0:
+                        init_stage = 1
+                        executed_qty = float(pos_check["contracts"])
+                        if float(pos_check.get("entryPrice") or 0.0) > 0:
+                            actual_fill_price = float(pos_check["entryPrice"])
+                    brackets = await asyncio.to_thread(
+                        place_binance_tp_sl_brackets,
+                        sym, act, executed_qty, levels["sl"], levels["t1"], levels["t2"], levels["t3"]
+                    )
+                    binance_sl_id = brackets["sl_id"]
+                    binance_tp1_id = brackets["tp1_id"]
+                    binance_tp2_id = brackets["tp2_id"]
+                    binance_tp3_id = brackets["tp3_id"]
 
             upsert_watched_signal(
                 sym, act, actual_fill_price, levels["sl"],
@@ -1428,11 +1490,13 @@ async def execute_unified_hourly_discovery_pipeline(context: ContextTypes.DEFAUL
                 rsi_1h=float(item.get("rsi_1h") or 50.0),
                 funding_rate=float(item.get("funding") or 0.0),
                 book_ratio=float(item.get("book_ratio") or 1.0),
-                whale_ls_ratio=float(cand_info.get("whale_ls_ratio") if cand_info else 1.0),
+                whale_ls_ratio=float(item.get("whale_ls") or 1.0),
                 btc_24h_pct=float(btc_24h_pct),
                 profit_index=float(item.get("profit_index") or 0.0),
                 binance_sl_order_id=binance_sl_id,
-                binance_tp1_id=binance_tp1_id
+                binance_tp1_id=binance_tp1_id,
+                binance_tp2_id=binance_tp2_id,
+                binance_tp3_id=binance_tp3_id
             )
             emitted_count += 1
 
@@ -1447,15 +1511,15 @@ async def execute_unified_hourly_discovery_pipeline(context: ContextTypes.DEFAUL
 
             if is_scalp:
                 tp_desc = (
-                    f"• TP1 (50% Qty): <code>${levels['t1']:.6f}</code> (+1.4R)\n"
-                    f"• TP2 (25% Qty): <code>${levels['t2']:.6f}</code> (+2.2R)\n"
-                    f"• TP3 (25% Qty): <code>${levels['t3']:.6f}</code> (+3.2R)"
+                    f"• TP1 (50% Qty): <code>${levels['t1']:.6f}</code> (+1.0R) {'✅' if binance_tp1_id else ''}\n"
+                    f"• TP2 (25% Qty): <code>${levels['t2']:.6f}</code> (+1.8R) {'✅' if binance_tp2_id else ''}\n"
+                    f"• TP3 (25% Qty): <code>${levels['t3']:.6f}</code> (+2.8R) {'✅' if binance_tp3_id else ''}"
                 )
             else:
                 tp_desc = (
-                    f"• TP1 (50% Qty): <code>${levels['t1']:.6f}</code> (+1.5R)\n"
-                    f"• TP2 (25% Qty): <code>${levels['t2']:.6f}</code> (+2.4R)\n"
-                    f"• TP3 (25% Qty): <code>${levels['t3']:.6f}</code> (+3.5R)"
+                    f"• TP1 (50% Qty): <code>${levels['t1']:.6f}</code> (+1.2R) {'✅' if binance_tp1_id else ''}\n"
+                    f"• TP2 (25% Qty): <code>${levels['t2']:.6f}</code> (+2.0R) {'✅' if binance_tp2_id else ''}\n"
+                    f"• TP3 (25% Qty): <code>${levels['t3']:.6f}</code> (+3.0R) {'✅' if binance_tp3_id else ''}"
                 )
 
             prob_line = f" | Scalp Prob: <b>{cand.get('scalp_probability', 80):.0f}%</b>" if is_scalp else ""
@@ -1746,17 +1810,48 @@ async def addwatch_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         t2 = levels["t2"]
         t3 = levels["t3"]
 
+    cap_info = fetch_current_account_capital()
+    pos_size_usd = calculate_dynamic_position_size(0.85, abs(entry - sl) / entry * 100.0 if entry > 0 else 1.2, balance=cap_info.get("total", 10000.0))
+    exec_qty = format_order_quantity(sym, pos_size_usd, entry)
+    entry_oid = ""
+    sl_id = ""
+    tp1_id = ""
+    tp2_id = ""
+    tp3_id = ""
+    init_stage = 0
+
+    if TRADING_MODE in ("LIVE", "TESTNET"):
+        is_imm = ((curr_price <= entry) if direction == "LONG" else (curr_price >= entry)) or TRADE_ENTRY_TYPE == "MARKET"
+        if is_imm:
+            init_stage = 1
+            m_res = await asyncio.to_thread(place_binance_market_entry, sym, direction, pos_size_usd, DEFAULT_LEVERAGE)
+            entry_oid = m_res.get("id", "")
+            if float(m_res.get("filled", 0.0)) > 0:
+                exec_qty = float(m_res["filled"])
+            if float(m_res.get("price", 0.0)) > 0:
+                entry = float(m_res["price"])
+        else:
+            entry_oid = await asyncio.to_thread(place_binance_entry_limit, sym, direction, pos_size_usd, entry, DEFAULT_LEVERAGE)
+        brackets = await asyncio.to_thread(place_binance_tp_sl_brackets, sym, direction, exec_qty, sl, t1, t2, t3)
+        sl_id = brackets["sl_id"]
+        tp1_id = brackets["tp1_id"]
+        tp2_id = brackets["tp2_id"]
+        tp3_id = brackets["tp3_id"]
+
     upsert_watched_signal(
-        sym, direction, entry, sl, t1, t2, t3, atr_1h, 500.0,
-        speed_choice, "MANUAL", "Manual Telegram Watchlist Insertion", confidence=0.85
+        sym, direction, entry, sl, t1, t2, t3, atr_1h, pos_size_usd,
+        speed_choice, "MANUAL", "Manual Telegram Watchlist Insertion", confidence=0.85,
+        stage_init=init_stage, binance_entry_order_id=entry_oid, executed_qty=exec_qty,
+        leverage=DEFAULT_LEVERAGE, binance_sl_order_id=sl_id,
+        binance_tp1_id=tp1_id, binance_tp2_id=tp2_id, binance_tp3_id=tp3_id
     )
 
     speed_icon = "⚡" if speed_choice == "FAST TRADE" else "⏳"
     await update.message.reply_text(
         f"✅ <b>Added to Watchlist:</b> <code>{sym}</code> ({direction}) | {speed_icon} <b>[{speed_choice}]</b>\n\n"
-        f"• <b>Entry:</b> ${entry:.6f}\n"
-        f"• <b>Stop-Loss:</b> ${sl:.6f}\n"
-        f"• <b>TP1:</b> ${t1:.6f} | <b>TP2:</b> ${t2:.6f} | <b>TP3:</b> ${t3:.6f}\n"
+        f"• <b>Entry:</b> ${entry:.6f} {'(Filled)' if init_stage == 1 else '(Limit)'}\n"
+        f"• <b>Stop-Loss:</b> ${sl:.6f} {'✅' if sl_id else ''}\n"
+        f"• <b>TP1:</b> ${t1:.6f} {'✅' if tp1_id else ''} | <b>TP2:</b> ${t2:.6f} {'✅' if tp2_id else ''} | <b>TP3:</b> ${t3:.6f} {'✅' if tp3_id else ''}\n"
         f"👉 Sentinel will defend this trade on every 8s tick.",
         parse_mode="HTML"
     )
@@ -1781,30 +1876,44 @@ async def enter_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         levels = calculate_deterministic_trade_levels(curr_price, atr_1h, row["action"], curr_price, "TREND_MOMENTUM")
 
         sl_id = ""
+        tp1_id = ""
+        tp2_id = ""
+        tp3_id = ""
         exec_qty = float(row["executed_qty"] or 0.0)
         pos_size = float(row["position_size_usd"] or 500.0)
         if TRADING_MODE in ("LIVE", "TESTNET"):
+            old_entry_id = str(row["binance_entry_order_id"] or "")
+            if old_entry_id:
+                await asyncio.to_thread(cancel_binance_order, row["symbol"], old_entry_id)
             lev = int(row["leverage"] or DEFAULT_LEVERAGE)
-            m_res = place_binance_market_entry(row["symbol"], row["action"], pos_size, leverage=lev)
+            m_res = await asyncio.to_thread(place_binance_market_entry, row["symbol"], row["action"], pos_size, lev)
             if float(m_res.get("filled", 0.0)) > 0:
                 exec_qty = float(m_res["filled"])
                 curr_price = float(m_res.get("price") or curr_price)
             else:
                 exec_qty = format_order_quantity(row["symbol"], pos_size, curr_price)
-            sl_id = place_binance_stop_loss(row["symbol"], row["action"], exec_qty, levels["sl"])
+            levels = calculate_deterministic_trade_levels(curr_price, atr_1h, row["action"], curr_price, "TREND_MOMENTUM")
+            brackets = await asyncio.to_thread(
+                place_binance_tp_sl_brackets,
+                row["symbol"], row["action"], exec_qty, levels["sl"], levels["t1"], levels["t2"], levels["t3"]
+            )
+            sl_id = brackets["sl_id"]
+            tp1_id = brackets["tp1_id"]
+            tp2_id = brackets["tp2_id"]
+            tp3_id = brackets["tp3_id"]
 
         conn.execute("""
             UPDATE watched_signals 
-            SET stage = 1, entry_limit = ?, initial_sl = ?, current_sl = ?, target_1 = ?, target_2 = ?, target_3 = ?, highest_favorable_price = ?, executed_qty = ?, binance_sl_order_id = ?, last_updated = CURRENT_TIMESTAMP 
+            SET stage = 1, entry_limit = ?, initial_sl = ?, current_sl = ?, target_1 = ?, target_2 = ?, target_3 = ?, highest_favorable_price = ?, executed_qty = ?, binance_sl_order_id = ?, binance_tp1_id = ?, binance_tp2_id = ?, binance_tp3_id = ?, last_updated = CURRENT_TIMESTAMP 
             WHERE id = ?
-        """, (curr_price, levels["sl"], levels["sl"], levels["t1"], levels["t2"], levels["t3"], curr_price, exec_qty, sl_id, row["id"]))
+        """, (curr_price, levels["sl"], levels["sl"], levels["t1"], levels["t2"], levels["t3"], curr_price, exec_qty, sl_id, tp1_id, tp2_id, tp3_id, row["id"]))
 
     sl_note = f" (Placed on Binance: {sl_id})" if sl_id else ""
     await update.message.reply_text(
         f"🟢 <b>ACTIVATED ON BOT — {row['symbol']}</b> (⚡ FAST TRADE)\n\n"
         f"• <b>Fill Mark:</b> ${curr_price:.6f}\n"
         f"• <b>Hard SL:</b> ${levels['sl']:.6f}{sl_note}\n"
-        f"• <b>Set TPs:</b> TP1: ${levels['t1']:.6f} | TP2: ${levels['t2']:.6f} | TP3: ${levels['t3']:.6f}",
+        f"• <b>Set TPs:</b> TP1: ${levels['t1']:.6f} {'✅' if tp1_id else ''} | TP2: ${levels['t2']:.6f} {'✅' if tp2_id else ''} | TP3: ${levels['t3']:.6f} {'✅' if tp3_id else ''}",
         parse_mode="HTML"
     )
 

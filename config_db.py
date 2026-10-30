@@ -59,7 +59,8 @@ PENDING_TTL_HOURS = get_env_int("PENDING_TTL_HOURS", 3)
 TRADING_MODE = get_env_str("TRADING_MODE", "SIMULATION").upper()
 DEFAULT_LEVERAGE = get_env_int("DEFAULT_LEVERAGE", 2)
 SCALP_LEVERAGE = get_env_int("SCALP_LEVERAGE", 3)  # Conservative 3x leverage to protect small account equity
-SCALP_ENTRY_TYPE = get_env_str("SCALP_ENTRY_TYPE", "LIMIT").upper()  # LIMIT for discount pullback fills, avoiding maker fee drag
+SCALP_ENTRY_TYPE = get_env_str("SCALP_ENTRY_TYPE", "MARKET").upper()  # MARKET by default so SL and TP brackets attach immediately on trade send
+TRADE_ENTRY_TYPE = get_env_str("TRADE_ENTRY_TYPE", "MARKET").upper()  # MARKET by default so SL and TP brackets attach immediately on trade send
 MAX_CORRELATED_POSITIONS_PER_SIDE = get_env_int("MAX_CORRELATED_POSITIONS_PER_SIDE", 2)
 MAX_CORRELATED_SCALPS_PER_SIDE = get_env_int("MAX_CORRELATED_SCALPS_PER_SIDE", 1)  # 1 scalp at a time to prevent margin exhaustion
 
@@ -365,7 +366,7 @@ def check_rolling_24h_drawdown() -> float:
         c = conn.cursor()
         c.execute("""
             SELECT SUM(realized_pnl) as total_pnl FROM watched_signals 
-            WHERE status IN ('INVALIDATED', 'COMPLETED') 
+            WHERE status IN ('INVALIDATED', 'COMPLETED', 'STOPPED_OUT') 
             AND last_updated >= datetime('now', '-1 day')
         """)
         row = c.fetchone()
@@ -598,20 +599,44 @@ def place_binance_stop_loss(symbol: str, side: str, qty_contracts: float, stop_p
         if qty_contracts < min_qty:
             log_event("INFO", "BINANCE_SL", f"Qty {qty_contracts} on {target_sym} below min lot {min_qty}. Clamping to {min_qty}.")
         formatted_qty = safe_amount_to_precision(target_sym, qty_contracts)
-        order = exchange.create_order(
-            symbol=target_sym,
-            type="STOP_MARKET",
-            side=order_side,
-            amount=formatted_qty,
-            params={
-                "stopPrice": formatted_stop,
-                "reduceOnly": True,
-                "workingType": "MARK_PRICE"
-            }
-        )
-        order_id = str(order.get("id"))
-        log_event("INFO", "BINANCE_SL", f"Placed Hard SL for {formatted_qty} {target_sym} at ${formatted_stop:.6f} (ID: {order_id})")
-        return order_id
+        try:
+            order = exchange.create_order(
+                symbol=target_sym,
+                type="STOP_MARKET",
+                side=order_side,
+                amount=formatted_qty,
+                params={
+                    "stopPrice": formatted_stop,
+                    "reduceOnly": True,
+                    "workingType": "MARK_PRICE"
+                }
+            )
+            order_id = str(order.get("id"))
+            log_event("INFO", "BINANCE_SL", f"Placed Hard SL for {formatted_qty} {target_sym} at ${formatted_stop:.6f} (ID: {order_id})")
+            return order_id
+        except Exception as e1:
+            err_msg = str(e1)
+            # If rejected because price is too close (-2021 Order would immediately trigger), nudge stop by 0.25%
+            if "-2021" in err_msg or "immediately trigger" in err_msg.lower():
+                ticker = exchange.fetch_ticker(target_sym)
+                mark_px = float(ticker.get("info", {}).get("markPrice") or ticker.get("last") or stop_price)
+                nudged_stop = mark_px * 0.9970 if side.upper() == "LONG" else mark_px * 1.0030
+                formatted_stop = format_order_price(target_sym, nudged_stop)
+            # Fallback to closePosition=True so SL attaches even if qty precision or pending limit order differed
+            order = exchange.create_order(
+                symbol=target_sym,
+                type="STOP_MARKET",
+                side=order_side,
+                amount=formatted_qty,
+                params={
+                    "stopPrice": formatted_stop,
+                    "closePosition": True,
+                    "workingType": "MARK_PRICE"
+                }
+            )
+            order_id = str(order.get("id"))
+            log_event("INFO", "BINANCE_SL", f"Placed Hard SL (closePosition) for {target_sym} at ${formatted_stop:.6f} (ID: {order_id})")
+            return order_id
     except Exception as e:
         log_event("ERROR", "BINANCE_SL", f"Stop loss order failed on {target_sym} at ${stop_price:.6f}: {e}")
         return ""
@@ -626,7 +651,7 @@ def place_binance_take_profit(symbol: str, side: str, qty_contracts: float, tp_p
     try:
         formatted_tp = format_order_price(target_sym, tp_price)
         formatted_qty = safe_amount_to_precision(target_sym, qty_contracts)
-        # Place reduceOnly LIMIT order at TP price to capture exact wicks with Maker fee (0.02% vs 0.05% Taker)
+        # 1. Place reduceOnly LIMIT order at TP price to capture exact wicks with Maker fee (0.02% vs 0.05% Taker)
         try:
             order = exchange.create_order(
                 symbol=target_sym,
@@ -643,24 +668,105 @@ def place_binance_take_profit(symbol: str, side: str, qty_contracts: float, tp_p
             log_event("INFO", "BINANCE_TP", f"Placed Resting Limit TP for {formatted_qty} {target_sym} at ${formatted_tp:.6f} (ID: {order_id})")
             return order_id
         except Exception:
-            # Fallback to TAKE_PROFIT_MARKET if price already crossed or limit rejected
-            order = exchange.create_order(
-                symbol=target_sym,
-                type="TAKE_PROFIT_MARKET",
-                side=order_side,
-                amount=formatted_qty,
-                params={
-                    "stopPrice": formatted_tp,
-                    "reduceOnly": True,
-                    "workingType": "MARK_PRICE"
-                }
-            )
-            order_id = str(order.get("id"))
-            log_event("INFO", "BINANCE_TP", f"Placed Conditional TP_MARKET for {formatted_qty} {target_sym} at ${formatted_tp:.6f} (ID: {order_id})")
-            return order_id
+            # 2. Fallback to TAKE_PROFIT_MARKET (reduceOnly) if price crossed or resting limit qty was full
+            try:
+                order = exchange.create_order(
+                    symbol=target_sym,
+                    type="TAKE_PROFIT_MARKET",
+                    side=order_side,
+                    amount=formatted_qty,
+                    params={
+                        "stopPrice": formatted_tp,
+                        "reduceOnly": True,
+                        "workingType": "MARK_PRICE"
+                    }
+                )
+                order_id = str(order.get("id"))
+                log_event("INFO", "BINANCE_TP", f"Placed Conditional TP_MARKET for {formatted_qty} {target_sym} at ${formatted_tp:.6f} (ID: {order_id})")
+                return order_id
+            except Exception:
+                # 3. Fallback to TAKE_PROFIT_MARKET (closePosition) if entry is still pending
+                order = exchange.create_order(
+                    symbol=target_sym,
+                    type="TAKE_PROFIT_MARKET",
+                    side=order_side,
+                    amount=formatted_qty,
+                    params={
+                        "stopPrice": formatted_tp,
+                        "closePosition": True,
+                        "workingType": "MARK_PRICE"
+                    }
+                )
+                order_id = str(order.get("id"))
+                log_event("INFO", "BINANCE_TP", f"Placed Conditional TP_MARKET (closePosition) for {target_sym} at ${formatted_tp:.6f} (ID: {order_id})")
+                return order_id
     except Exception as e:
         log_event("WARN", "BINANCE_TP", f"Take profit order failed on {target_sym} at ${tp_price:.6f}: {e}")
         return ""
+
+def split_tp_quantities(symbol: str, total_qty: float) -> tuple:
+    """Split total_qty cleanly into (tp1_qty, tp2_qty, tp3_qty) respecting min lot and never exceeding total_qty."""
+    bridge = bridge_symbol_formats(symbol)
+    target_sym = bridge["ccxt"]
+    min_qty = get_symbol_min_qty(target_sym)
+    total_clamped = safe_amount_to_precision(target_sym, total_qty)
+    if total_clamped < (min_qty * 2.0):
+        return (total_clamped, 0.0, 0.0)
+    if total_clamped < (min_qty * 4.0):
+        tp1_q = safe_amount_to_precision(target_sym, total_clamped * 0.50)
+        rem = round(total_clamped - tp1_q, 8)
+        if rem < min_qty:
+            return (total_clamped, 0.0, 0.0)
+        tp2_q = safe_amount_to_precision(target_sym, rem)
+        if round(tp1_q + tp2_q, 8) > round(total_clamped, 8):
+            tp2_q = max(0.0, round(total_clamped - tp1_q, 8))
+        return (tp1_q, tp2_q, 0.0)
+
+    tp1_q = safe_amount_to_precision(target_sym, total_clamped * 0.50)
+    tp2_q = safe_amount_to_precision(target_sym, total_clamped * 0.25)
+    rem3 = round(total_clamped - tp1_q - tp2_q, 8)
+    if rem3 < min_qty:
+        rem2 = round(total_clamped - tp1_q, 8)
+        tp2_q = safe_amount_to_precision(target_sym, rem2) if rem2 >= min_qty else 0.0
+        return (tp1_q, tp2_q, 0.0)
+    tp3_q = safe_amount_to_precision(target_sym, rem3)
+    if round(tp1_q + tp2_q + tp3_q, 8) > round(total_clamped, 8):
+        adj3 = round(total_clamped - tp1_q - tp2_q, 8)
+        if adj3 >= min_qty:
+            tp3_q = safe_amount_to_precision(target_sym, adj3)
+        else:
+            tp3_q = 0.0
+    return (tp1_q, tp2_q, tp3_q)
+
+def place_binance_tp_sl_brackets(
+    symbol: str, side: str, qty_contracts: float, sl_price: float,
+    t1_price: float, t2_price: float = 0.0, t3_price: float = 0.0
+) -> dict:
+    """Immediately place Hard Stop-Loss and TP1/TP2/TP3 brackets on Binance when sending a trade."""
+    if TRADING_MODE not in ("LIVE", "TESTNET") or qty_contracts <= 0:
+        return {
+            "sl_id": "SIMULATED_SL" if sl_price > 0 else "",
+            "tp1_id": "SIMULATED_TP1" if t1_price > 0 else "",
+            "tp2_id": "SIMULATED_TP2" if t2_price > 0 else "",
+            "tp3_id": "SIMULATED_TP3" if t3_price > 0 else "",
+            "tp1_qty": qty_contracts * 0.50,
+            "tp2_qty": qty_contracts * 0.25,
+            "tp3_qty": qty_contracts * 0.25,
+        }
+    tp1_q, tp2_q, tp3_q = split_tp_quantities(symbol, qty_contracts)
+    sl_id = place_binance_stop_loss(symbol, side, qty_contracts, sl_price) if sl_price > 0 else ""
+    tp1_id = place_binance_take_profit(symbol, side, tp1_q, t1_price) if (t1_price > 0 and tp1_q > 0) else ""
+    tp2_id = place_binance_take_profit(symbol, side, tp2_q, t2_price) if (t2_price > 0 and tp2_q > 0) else ""
+    tp3_id = place_binance_take_profit(symbol, side, tp3_q, t3_price) if (t3_price > 0 and tp3_q > 0) else ""
+    return {
+        "sl_id": sl_id,
+        "tp1_id": tp1_id,
+        "tp2_id": tp2_id,
+        "tp3_id": tp3_id,
+        "tp1_qty": tp1_q,
+        "tp2_qty": tp2_q,
+        "tp3_qty": tp3_q,
+    }
 
 def cancel_binance_order(symbol: str, order_id: str) -> bool:
     if TRADING_MODE not in ("LIVE", "TESTNET") or not order_id or order_id.startswith("SIMULATED"):
@@ -789,22 +895,30 @@ def upsert_watched_signal(
     symbol, action, entry, sl, t1, t2, t3, atr_val, pos_size, trade_speed, coin_trend, 
     strategic_thesis="", confidence=0.75, stage_init=0, binance_entry_order_id="", executed_qty=0.0,
     leverage=1, rsi_1h=50.0, funding_rate=0.0, book_ratio=1.0, whale_ls_ratio=1.0, btc_24h_pct=0.0, profit_index=0.0,
-    binance_sl_order_id="", binance_tp1_id=""
+    binance_sl_order_id="", binance_tp1_id="", binance_tp2_id="", binance_tp3_id=""
 ):
     with get_db_connection() as conn:
         c = conn.cursor()
-        c.execute("SELECT stage, status, action, confidence, entry_limit, binance_entry_order_id, binance_sl_order_id, binance_tp1_id FROM watched_signals WHERE symbol = ?", (symbol,))
+        c.execute("SELECT stage, status, action, confidence, entry_limit, binance_entry_order_id, binance_sl_order_id, binance_tp1_id, binance_tp2_id, binance_tp3_id FROM watched_signals WHERE symbol = ?", (symbol,))
         existing = c.fetchone()
 
         if existing and existing["status"] == 'WATCHING' and existing["stage"] >= 1:
             log_event("INFO", "WATCHLIST", f"Targets locked for live trade {symbol}. Modification blocked.")
             return False
 
-        # If re-anchoring a pending Stage 0 limit order, cancel the old pending order on Binance first
+        # If re-anchoring a pending Stage 0 limit order, cancel the old pending orders on Binance first
         if existing and existing["status"] == 'WATCHING' and existing["stage"] == 0:
-            old_entry_id = str(existing["binance_entry_order_id"] or "")
-            if old_entry_id and old_entry_id != binance_entry_order_id:
-                cancel_binance_order(symbol, old_entry_id)
+            ex_dict = dict(existing)
+            for old_col, new_val in (
+                ("binance_entry_order_id", binance_entry_order_id),
+                ("binance_sl_order_id", binance_sl_order_id),
+                ("binance_tp1_id", binance_tp1_id),
+                ("binance_tp2_id", binance_tp2_id),
+                ("binance_tp3_id", binance_tp3_id),
+            ):
+                old_id = str(ex_dict.get(old_col) or "")
+                if old_id and old_id != new_val:
+                    cancel_binance_order(symbol, old_id)
 
         movement_tag = "🆕 NEW SETUP"
         if existing and existing["status"] == 'WATCHING':
@@ -817,7 +931,7 @@ def upsert_watched_signal(
         conn.execute("""
             INSERT INTO watched_signals 
             (symbol, action, entry_limit, initial_sl, current_sl, target_1, target_2, target_3, atr_val, position_size_usd, stage, highest_favorable_price, status, realized_pnl, remaining_ratio, partial_realized_pnl, confidence, trade_speed, coin_trend, strategic_thesis, movement_tag, binance_entry_order_id, binance_sl_order_id, binance_tp1_id, binance_tp2_id, binance_tp3_id, executed_qty, trading_mode, leverage, rsi_1h, funding_rate, book_ratio, whale_ls_ratio, btc_24h_pct, profit_index, timestamp, last_updated)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'WATCHING', 0.0, 1.0, 0.0, ?, ?, ?, ?, ?, ?, ?, ?, '', '', ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'WATCHING', 0.0, 1.0, 0.0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
             ON CONFLICT(symbol) DO UPDATE SET
                 action=excluded.action,
                 entry_limit=excluded.entry_limit,
@@ -842,8 +956,8 @@ def upsert_watched_signal(
                 binance_entry_order_id=excluded.binance_entry_order_id,
                 binance_sl_order_id=excluded.binance_sl_order_id,
                 binance_tp1_id=excluded.binance_tp1_id,
-                binance_tp2_id='',
-                binance_tp3_id='',
+                binance_tp2_id=excluded.binance_tp2_id,
+                binance_tp3_id=excluded.binance_tp3_id,
                 executed_qty=excluded.executed_qty,
                 trading_mode=excluded.trading_mode,
                 leverage=excluded.leverage,
@@ -859,7 +973,7 @@ def upsert_watched_signal(
         """, (
             symbol, action, entry, sl, sl, t1, t2, t3, atr_val, pos_size, stage_init, entry, 
             confidence, trade_speed, coin_trend, strategic_thesis, movement_tag, binance_entry_order_id, 
-            binance_sl_order_id, binance_tp1_id, executed_qty, TRADING_MODE, leverage, rsi_1h, funding_rate, book_ratio, 
+            binance_sl_order_id, binance_tp1_id, binance_tp2_id, binance_tp3_id, executed_qty, TRADING_MODE, leverage, rsi_1h, funding_rate, book_ratio, 
             whale_ls_ratio, btc_24h_pct, profit_index
         ))
 
@@ -1018,7 +1132,7 @@ def export_monthly_report_csv() -> tuple:
                    timestamp, last_updated
             FROM watched_signals
             WHERE last_updated >= ?
-            ORDER BY id DESC
+            ORDER BY last_updated DESC, id DESC
         """, (start_of_month,))
         rows = c.fetchall()
 
