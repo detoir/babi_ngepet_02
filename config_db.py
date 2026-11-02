@@ -57,8 +57,9 @@ PENDING_TTL_HOURS = get_env_int("PENDING_TTL_HOURS", 3)
 # Trading Execution Mode & Limits
 # TRADING_MODE options: "SIMULATION" (virtual alerts/tracking), "TESTNET" (Binance Futures Testnet), "LIVE" (Real Binance Futures)
 TRADING_MODE = get_env_str("TRADING_MODE", "SIMULATION").upper()
-DEFAULT_LEVERAGE = get_env_int("DEFAULT_LEVERAGE", 2)
-SCALP_LEVERAGE = get_env_int("SCALP_LEVERAGE", 3)  # Conservative 3x leverage to protect small account equity
+POSITION_SIZE_MULTIPLIER = get_env_float("POSITION_SIZE_MULTIPLIER", 5.0)  # 5x multiplier over baseline position size/margin
+DEFAULT_LEVERAGE = max(get_env_int("DEFAULT_LEVERAGE", 10), 5)
+SCALP_LEVERAGE = max(get_env_int("SCALP_LEVERAGE", 15), 6)
 SCALP_ENTRY_TYPE = get_env_str("SCALP_ENTRY_TYPE", "MARKET").upper()  # MARKET by default so SL and TP brackets attach immediately on trade send
 TRADE_ENTRY_TYPE = get_env_str("TRADE_ENTRY_TYPE", "MARKET").upper()  # MARKET by default so SL and TP brackets attach immediately on trade send
 MAX_CORRELATED_POSITIONS_PER_SIDE = get_env_int("MAX_CORRELATED_POSITIONS_PER_SIDE", 2)
@@ -550,12 +551,30 @@ def place_binance_market_entry(symbol: str, side: str, qty_usd: float, leverage:
         ticker = exchange.fetch_ticker(target_sym)
         price = float(ticker.get("last") or ticker.get("close") or 1.0)
         formatted_qty = format_order_quantity(target_sym, qty_usd, price)
-        order = exchange.create_order(
-            symbol=target_sym,
-            type="MARKET",
-            side=order_side,
-            amount=formatted_qty
-        )
+        try:
+            order = exchange.create_order(
+                symbol=target_sym,
+                type="MARKET",
+                side=order_side,
+                amount=formatted_qty
+            )
+        except Exception as e_inner:
+            if "-2019" in str(e_inner) or "margin is insufficient" in str(e_inner).lower():
+                # Auto-scale leverage up to 15x or clamp to 85% of free margin so 5x sized trades never fail
+                boost_lev = max(lev * 2, 12)
+                set_symbol_leverage_and_margin(target_sym, boost_lev)
+                cap = fetch_current_account_capital()
+                free_usd = float(cap.get("free", 0.0))
+                safe_qty_usd = min(qty_usd, free_usd * boost_lev * 0.85) if free_usd > 0 else (qty_usd * 0.6)
+                formatted_qty = format_order_quantity(target_sym, safe_qty_usd, price)
+                order = exchange.create_order(
+                    symbol=target_sym,
+                    type="MARKET",
+                    side=order_side,
+                    amount=formatted_qty
+                )
+            else:
+                raise e_inner
         order_id = str(order.get("id"))
         filled_qty = float(order.get("filled") or formatted_qty)
         avg_price = float(order.get("average") or order.get("price") or price)
@@ -576,9 +595,23 @@ def place_binance_entry_limit(symbol: str, side: str, qty_usd: float, price: flo
         set_symbol_leverage_and_margin(target_sym, lev)
         formatted_price = format_order_price(target_sym, price)
         formatted_qty = format_order_quantity(target_sym, qty_usd, price)
-        order = exchange.create_order(target_sym, "LIMIT", order_side, formatted_qty, formatted_price, {
-            "timeInForce": "GTC"
-        })
+        try:
+            order = exchange.create_order(target_sym, "LIMIT", order_side, formatted_qty, formatted_price, {
+                "timeInForce": "GTC"
+            })
+        except Exception as e_inner:
+            if "-2019" in str(e_inner) or "margin is insufficient" in str(e_inner).lower():
+                boost_lev = max(lev * 2, 12)
+                set_symbol_leverage_and_margin(target_sym, boost_lev)
+                cap = fetch_current_account_capital()
+                free_usd = float(cap.get("free", 0.0))
+                safe_qty_usd = min(qty_usd, free_usd * boost_lev * 0.85) if free_usd > 0 else (qty_usd * 0.6)
+                formatted_qty = format_order_quantity(target_sym, safe_qty_usd, price)
+                order = exchange.create_order(target_sym, "LIMIT", order_side, formatted_qty, formatted_price, {
+                    "timeInForce": "GTC"
+                })
+            else:
+                raise e_inner
         order_id = str(order.get("id"))
         log_event("INFO", "BINANCE_ORDER", f"Placed {order_side.upper()} Limit for {formatted_qty} {target_sym} at ${formatted_price:.6f} (ID: {order_id})")
         return order_id
