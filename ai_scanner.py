@@ -569,7 +569,7 @@ def analyze_macro_universe_with_ai(market_universe: list, live_news: str, btc_re
 
     cap_total = capital_info.get("total", 10000.0) if capital_info else 10000.0
     cap_free = capital_info.get("free", 8000.0) if capital_info else 8000.0
-    cap_mode = capital_info.get("mode", "SIMULATION") if capital_info else "SIMULATION"
+    cap_mode = capital_info.get("mode", TRADING_MODE) if capital_info else TRADING_MODE
 
     weekend_clause = ""
     if is_weekend_regime():
@@ -1012,7 +1012,7 @@ async def execute_unified_hourly_discovery_pipeline(context: ContextTypes.DEFAUL
         # 2. Fetch Current Capital & Dynamic Balance
         capital_info = fetch_current_account_capital()
         account_balance = float(capital_info.get("total", 10000.0))
-        log_event("INFO", "CAPITAL", f"Current Capital Checked: ${account_balance:.2f} USD ({capital_info.get('mode', 'SIMULATION')})")
+        log_event("INFO", "CAPITAL", f"Current Capital Checked: ${account_balance:.2f} USD ({capital_info.get('mode', TRADING_MODE)})")
 
         active_positions_payload = []
         pending_watchlist_payload = []
@@ -1580,7 +1580,7 @@ async def execute_unified_hourly_discovery_pipeline(context: ContextTypes.DEFAUL
         if is_manual_scan and emitted_count == 0 and chat_id and context:
             stand_msg = (
                 f"📊 <b>UNIFIED EVALUATION REPORT</b>\n\n"
-                f"• <b>Account Balance:</b> <code>${account_balance:.2f} USD</code> ({capital_info.get('mode', 'SIMULATION')})\n"
+                f"• <b>Account Balance:</b> <code>${account_balance:.2f} USD</code> ({capital_info.get('mode', TRADING_MODE)})\n"
                 f"• <b>BTC Context:</b> <code>{btc_regime['regime']}</code> (ADX: {btc_regime['adx']}, 24h: {btc_24h_pct:+.2f}%)\n"
                 f"• <b>Macro Verdict:</b> <i>{html.escape(macro_decision.get('macro_verdict', 'Stand aside'))}</i>\n"
                 f"• <b>Whale Verdict:</b> <i>{html.escape(whale_decision.get('whale_verdict', 'No anomalies'))}</i>\n"

@@ -14,6 +14,11 @@ import re
 import csv
 import io
 import ccxt
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:
+    pass
 
 BOT_NAME = "babi_ngepet_01"
 BOT_VERSION = "38.0.0-ENTERPRISE-STABLE"
@@ -55,8 +60,11 @@ WATCH_INTERVAL_SECONDS = get_env_int("WATCH_INTERVAL_SECONDS", 8)
 PENDING_TTL_HOURS = get_env_int("PENDING_TTL_HOURS", 3)
 
 # Trading Execution Mode & Limits
-# TRADING_MODE options: "SIMULATION" (virtual alerts/tracking), "TESTNET" (Binance Futures Testnet), "LIVE" (Real Binance Futures)
-TRADING_MODE = get_env_str("TRADING_MODE", "SIMULATION").upper()
+# TRADING_MODE options: "LIVE" (Real Binance Futures), "TESTNET" (Binance Futures Testnet), "SIMULATION" (virtual alerts/tracking)
+_raw_mode = get_env_str("TRADING_MODE", "") or get_env_str("MODE", "") or get_env_str("EXECUTION_MODE", "") or "LIVE"
+TRADING_MODE = _raw_mode.upper()
+if TRADING_MODE not in ("LIVE", "TESTNET", "SIMULATION"):
+    TRADING_MODE = "LIVE"
 POSITION_SIZE_MULTIPLIER = get_env_float("POSITION_SIZE_MULTIPLIER", 5.0)  # 5x multiplier over baseline position size/margin
 DEFAULT_LEVERAGE = max(get_env_int("DEFAULT_LEVERAGE", 10), 5)
 SCALP_LEVERAGE = max(get_env_int("SCALP_LEVERAGE", 15), 6)
@@ -462,10 +470,12 @@ def count_active_positions_by_direction(direction: str) -> int:
         return row["cnt"] if row else 0
 
 def fetch_current_account_capital() -> dict:
+    auth_err_tag = ""
     try:
         if TRADING_MODE in ("LIVE", "TESTNET"):
             if not BINANCE_API_KEY or not BINANCE_SECRET_KEY:
-                log_event("WARN", "CAPITAL_FETCH", f"TRADING_MODE is {TRADING_MODE} but BINANCE_API_KEY / SECRET is missing. Using simulated balance.")
+                log_event("WARN", "CAPITAL_FETCH", f"TRADING_MODE is {TRADING_MODE} but BINANCE_API_KEY / SECRET is missing.")
+                auth_err_tag = f"{TRADING_MODE} (⚠️ Missing API Key)"
             else:
                 bal = exchange.fetch_balance()
                 total_bal = 0.0
@@ -480,31 +490,30 @@ def fetch_current_account_capital() -> dict:
                 if total_bal <= 0:
                     info_assets = bal.get("info", {}).get("assets", [])
                     for a in info_assets:
-                        if a.get("asset") in ("USDT", "USDC"):
+                        if a.get("asset") in ("USDT", "USDC", "BNB", "BFUSD"):
                             wb = float(a.get("walletBalance") or a.get("marginBalance") or 0.0)
                             av = float(a.get("availableBalance") or a.get("maxWithdrawAmount") or 0.0)
                             if wb > total_bal:
                                 total_bal = wb
                                 free_bal = av
 
-                # 3. If still 0, check top-level totalWalletBalance / availableBalance
+                # 3. If still 0, check top-level totalWalletBalance / totalMarginBalance / availableBalance
                 if total_bal <= 0:
                     raw_info = bal.get("info", {})
-                    total_bal = float(raw_info.get("totalWalletBalance") or raw_info.get("totalMarginBalance") or 0.0)
-                    free_bal = float(raw_info.get("availableBalance") or 0.0)
+                    total_bal = float(raw_info.get("totalMarginBalance") or raw_info.get("totalWalletBalance") or 0.0)
+                    free_bal = float(raw_info.get("availableBalance") or total_bal)
 
-                if total_bal > 0:
-                    with get_db_connection() as conn:
+                with get_db_connection() as conn:
+                    if total_bal > 0:
                         conn.execute("INSERT OR REPLACE INTO bot_state (key, value) VALUES ('current_capital_usd', ?)", (str(total_bal),))
-                        conn.execute("DELETE FROM bot_state WHERE key = 'binance_auth_error'")
-                    return {"total": round(total_bal, 2), "free": round(free_bal, 2), "mode": TRADING_MODE}
-                else:
-                    log_event("WARN", "CAPITAL_FETCH", f"Live balance fetched as 0.0 USDT. Check Futures wallet funding.")
+                    conn.execute("DELETE FROM bot_state WHERE key = 'binance_auth_error'")
+                return {"total": round(total_bal, 2), "free": round(free_bal, 2), "mode": TRADING_MODE}
     except Exception as e:
         err_s = str(e)
         if "-2015" in err_s:
             ip_addr = get_outbound_ip_sync()
             auth_msg = f"Binance -2015 Auth Error: Whitelist Server IP [{ip_addr}] in Binance API Management & check 'Enable Futures'."
+            auth_err_tag = f"{TRADING_MODE} (⚠️ API -2015: Whitelist IP {ip_addr})"
             log_event("ERROR", "BINANCE_AUTH", auth_msg)
             try:
                 with get_db_connection() as conn:
@@ -512,9 +521,28 @@ def fetch_current_account_capital() -> dict:
             except Exception:
                 pass
         else:
+            auth_err_tag = f"{TRADING_MODE} (⚠️ Balance Fetch Err)"
             log_event("WARN", "CAPITAL_FETCH", f"Exchange balance fetch error: {e}")
 
-    # Fallback to simulated balance + realized PnL
+    if TRADING_MODE in ("LIVE", "TESTNET"):
+        # Never show "SIMULATION" or $10,000 fake balance when TRADING_MODE is LIVE/TESTNET!
+        cached_live_bal = 30.0
+        try:
+            with get_db_connection() as conn:
+                c = conn.cursor()
+                c.execute("SELECT value FROM bot_state WHERE key = 'current_capital_usd'")
+                row = c.fetchone()
+                if row and float(row["value"]) > 0 and float(row["value"]) != ACCOUNT_BALANCE_SIMULATED:
+                    cached_live_bal = float(row["value"])
+        except Exception:
+            pass
+        return {
+            "total": round(cached_live_bal, 2),
+            "free": round(cached_live_bal * 0.85, 2),
+            "mode": auth_err_tag or TRADING_MODE
+        }
+
+    # Simulated mode balance + realized PnL
     with get_db_connection() as conn:
         c = conn.cursor()
         c.execute("SELECT SUM(realized_pnl) as total_pnl FROM watched_signals WHERE status IN ('COMPLETED', 'INVALIDATED', 'STOPPED_OUT')")
