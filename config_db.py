@@ -42,12 +42,12 @@ def get_env_bool(key: str, default: bool = False) -> bool:
         return default
     return str(val).strip().lower() in ("1", "true", "yes", "on")
 
-# Credentials & API Keys
-DEEPSEEK_API_KEY = get_env_str("DEEPSEEK_API_KEY", "")
-TELEGRAM_BOT_TOKEN = get_env_str("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = get_env_str("TELEGRAM_CHAT_ID", "")
-BINANCE_API_KEY = get_env_str("BINANCE_API_KEY", "")
-BINANCE_SECRET_KEY = get_env_str("BINANCE_SECRET_KEY", "")
+# Credentials & API Keys (strip quotes, spaces, and accidental newlines)
+DEEPSEEK_API_KEY = re.sub(r"\s+", "", get_env_str("DEEPSEEK_API_KEY", ""))
+TELEGRAM_BOT_TOKEN = re.sub(r"\s+", "", get_env_str("TELEGRAM_BOT_TOKEN", ""))
+TELEGRAM_CHAT_ID = re.sub(r"\s+", "", get_env_str("TELEGRAM_CHAT_ID", ""))
+BINANCE_API_KEY = re.sub(r"\s+", "", get_env_str("BINANCE_API_KEY", ""))
+BINANCE_SECRET_KEY = re.sub(r"\s+", "", get_env_str("BINANCE_SECRET_KEY", ""))
 
 # Operational Cadence & Loops
 SCAN_INTERVAL_SECONDS = get_env_int("SCAN_INTERVAL_SECONDS", 3600)
@@ -85,28 +85,96 @@ DATA_DIR = get_env_str("DATA_DIR", ".")
 os.makedirs(DATA_DIR, exist_ok=True)
 DB_FILE = os.path.join(DATA_DIR, "scanner_memory.db")
 
+_SHARED_EXCHANGE = None
+_SHARED_PUBLIC_EXCHANGE = None
+_CACHED_OUTBOUND_IP = None
+
+def get_outbound_ip_sync() -> str:
+    global _CACHED_OUTBOUND_IP
+    if _CACHED_OUTBOUND_IP:
+        return _CACHED_OUTBOUND_IP
+    import urllib.request
+    for url in ("https://api.ipify.org", "https://ifconfig.me/ip", "https://icanhazip.com"):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "curl/7.68.0"})
+            with urllib.request.urlopen(req, timeout=4) as resp:
+                ip = resp.read().decode("utf-8").strip()
+                if ip:
+                    _CACHED_OUTBOUND_IP = ip
+                    return ip
+        except Exception:
+            continue
+    return "Unknown (run /ip in Telegram)"
+
+def get_public_exchange_instance():
+    """Unauthenticated CCXT instance for all public tickers, OHLCV candles, funding rates, and precision formatting."""
+    global _SHARED_PUBLIC_EXCHANGE
+    if _SHARED_PUBLIC_EXCHANGE is not None:
+        return _SHARED_PUBLIC_EXCHANGE
+    pub_config = {
+        "enableRateLimit": True,
+        "timeout": 25000,
+        "options": {
+            "defaultType": "future",
+            "adjustForTimeDifference": True,
+            "fetchCurrencies": False,
+        }
+    }
+    pub_ex = ccxt.binanceusdm(pub_config)
+    if TRADING_MODE == "TESTNET":
+        try:
+            pub_ex.set_sandbox_mode(True)
+        except Exception:
+            pass
+    try:
+        pub_ex.load_markets()
+    except Exception as e:
+        print(f"[{BOT_NAME}] Public market load warning: {e}")
+    _SHARED_PUBLIC_EXCHANGE = pub_ex
+    return pub_ex
+
 def get_exchange_instance():
+    """Singleton authenticated CCXT instance that reuses public markets so load_markets() never triggers -2015."""
+    global _SHARED_EXCHANGE
+    if _SHARED_EXCHANGE is not None:
+        return _SHARED_EXCHANGE
+    pub_ex = get_public_exchange_instance()
     config = {
         "enableRateLimit": True,
         "timeout": 25000,
-        "options": {"defaultType": "future", "adjustForTimeDifference": True}
+        "options": {
+            "defaultType": "future",
+            "adjustForTimeDifference": True,
+            "fetchCurrencies": False,
+        }
     }
-    if BINANCE_API_KEY and BINANCE_SECRET_KEY:
-        config["apiKey"] = BINANCE_API_KEY
-        config["secret"] = BINANCE_SECRET_KEY
     ex = ccxt.binanceusdm(config)
     if TRADING_MODE == "TESTNET":
         try:
             ex.set_sandbox_mode(True)
         except Exception as e:
             print(f"[{BOT_NAME}] Sandbox mode warning: {e}")
-    try:
-        ex.load_markets()
-    except Exception as e:
-        print(f"[{BOT_NAME}] Exchange initialization warning: {e}")
+    # Share pre-loaded public market definitions BEFORE attaching API keys so CCXT never calls private SAPI on load_markets()
+    if getattr(pub_ex, "markets", None):
+        ex.markets = pub_ex.markets
+        ex.markets_by_id = pub_ex.markets_by_id
+        ex.currencies = pub_ex.currencies
+        ex.currencies_by_id = pub_ex.currencies_by_id
+        ex.ids = pub_ex.ids
+        ex.symbols = pub_ex.symbols
+    else:
+        try:
+            ex.load_markets()
+        except Exception as e:
+            print(f"[{BOT_NAME}] Exchange market load warning: {e}")
+    if BINANCE_API_KEY and BINANCE_SECRET_KEY:
+        ex.apiKey = BINANCE_API_KEY
+        ex.secret = BINANCE_SECRET_KEY
+    _SHARED_EXCHANGE = ex
     return ex
 
-# Initialize module-level exchange instance for trading functions in config_db
+# Initialize module-level exchange instances
+public_exchange = get_public_exchange_instance()
 exchange = get_exchange_instance()
 
 def get_db_connection():
@@ -428,11 +496,23 @@ def fetch_current_account_capital() -> dict:
                 if total_bal > 0:
                     with get_db_connection() as conn:
                         conn.execute("INSERT OR REPLACE INTO bot_state (key, value) VALUES ('current_capital_usd', ?)", (str(total_bal),))
+                        conn.execute("DELETE FROM bot_state WHERE key = 'binance_auth_error'")
                     return {"total": round(total_bal, 2), "free": round(free_bal, 2), "mode": TRADING_MODE}
                 else:
                     log_event("WARN", "CAPITAL_FETCH", f"Live balance fetched as 0.0 USDT. Check Futures wallet funding.")
     except Exception as e:
-        log_event("WARN", "CAPITAL_FETCH", f"Exchange balance fetch error: {e}")
+        err_s = str(e)
+        if "-2015" in err_s:
+            ip_addr = get_outbound_ip_sync()
+            auth_msg = f"Binance -2015 Auth Error: Whitelist Server IP [{ip_addr}] in Binance API Management & check 'Enable Futures'."
+            log_event("ERROR", "BINANCE_AUTH", auth_msg)
+            try:
+                with get_db_connection() as conn:
+                    conn.execute("INSERT OR REPLACE INTO bot_state (key, value) VALUES ('binance_auth_error', ?)", (auth_msg,))
+            except Exception:
+                pass
+        else:
+            log_event("WARN", "CAPITAL_FETCH", f"Exchange balance fetch error: {e}")
 
     # Fallback to simulated balance + realized PnL
     with get_db_connection() as conn:
@@ -464,7 +544,7 @@ def get_symbol_min_qty(symbol: str) -> float:
     bridge = bridge_symbol_formats(symbol)
     target_sym = bridge["ccxt"]
     try:
-        market = exchange.market(target_sym)
+        market = public_exchange.market(target_sym)
         min_amt = float(market.get("limits", {}).get("amount", {}).get("min") or 0.0)
         prec_amt = market.get("precision", {}).get("amount")
         step_min = 0.0
@@ -482,7 +562,7 @@ def safe_amount_to_precision(symbol: str, qty_contracts: float) -> float:
     min_qty = get_symbol_min_qty(target_sym)
     clamped_qty = max(float(qty_contracts or 0.0), min_qty)
     try:
-        formatted = float(exchange.amount_to_precision(target_sym, clamped_qty))
+        formatted = float(public_exchange.amount_to_precision(target_sym, clamped_qty))
         return max(formatted, min_qty)
     except Exception:
         return min_qty
@@ -494,7 +574,7 @@ def format_order_quantity(symbol: str, pos_size_usd: float, price: float) -> flo
         return 0.0
     raw_qty = pos_size_usd / price
     try:
-        market = exchange.market(target_sym)
+        market = public_exchange.market(target_sym)
         min_qty = get_symbol_min_qty(target_sym)
         min_notional = float(market.get("limits", {}).get("cost", {}).get("min") or 5.0)
         if (raw_qty * price) < min_notional:
@@ -510,7 +590,7 @@ def format_order_price(symbol: str, price: float) -> float:
     bridge = bridge_symbol_formats(symbol)
     target_sym = bridge["ccxt"]
     try:
-        return float(exchange.price_to_precision(target_sym, price))
+        return float(public_exchange.price_to_precision(target_sym, price))
     except Exception:
         return round(price, 4)
 
@@ -547,8 +627,8 @@ def place_binance_market_entry(symbol: str, side: str, qty_usd: float, leverage:
     lev = leverage if leverage is not None else DEFAULT_LEVERAGE
     try:
         set_symbol_leverage_and_margin(target_sym, lev)
-        # Fetch current price to estimate initial qty
-        ticker = exchange.fetch_ticker(target_sym)
+        # Fetch current price to estimate initial qty via public exchange
+        ticker = public_exchange.fetch_ticker(target_sym)
         price = float(ticker.get("last") or ticker.get("close") or 1.0)
         formatted_qty = format_order_quantity(target_sym, qty_usd, price)
         try:
@@ -651,7 +731,7 @@ def place_binance_stop_loss(symbol: str, side: str, qty_contracts: float, stop_p
             err_msg = str(e1)
             # If rejected because price is too close (-2021 Order would immediately trigger), nudge stop by 0.25%
             if "-2021" in err_msg or "immediately trigger" in err_msg.lower():
-                ticker = exchange.fetch_ticker(target_sym)
+                ticker = public_exchange.fetch_ticker(target_sym)
                 mark_px = float(ticker.get("info", {}).get("markPrice") or ticker.get("last") or stop_price)
                 nudged_stop = mark_px * 0.9970 if side.upper() == "LONG" else mark_px * 1.0030
                 formatted_stop = format_order_price(target_sym, nudged_stop)

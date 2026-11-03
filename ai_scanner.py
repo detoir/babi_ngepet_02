@@ -36,6 +36,7 @@ from config_db import (
     MAX_CORRELATED_SCALPS_PER_SIDE,
     DEFAULT_LEVERAGE,
     SCALP_LEVERAGE,
+    POSITION_SIZE_MULTIPLIER,
     SCALP_ENTRY_TYPE,
     TRADE_ENTRY_TYPE,
     TRADING_MODE,
@@ -50,6 +51,8 @@ from config_db import (
     generate_monthly_performance_report,
     export_monthly_report_csv,
     get_exchange_instance,
+    get_public_exchange_instance,
+    get_outbound_ip_sync,
     get_db_connection,
     log_event,
     is_scanning_enabled,
@@ -84,6 +87,7 @@ from config_db import (
 )
 
 exchange = get_exchange_instance()
+public_exchange = get_public_exchange_instance()
 ROUND_TRIP_FEE_PCT = 0.10
 ai_client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url="https://api.deepseek.com")
 
@@ -106,7 +110,7 @@ def extract_clean_json(raw_text: str) -> dict:
 def fetch_real_perp_market_price(symbol: str) -> float:
     try:
         bridge = bridge_symbol_formats(symbol)
-        ticker = exchange.fetch_ticker(bridge["ccxt"])
+        ticker = public_exchange.fetch_ticker(bridge["ccxt"])
         last_price = ticker.get("last") or ticker.get("close")
         if last_price:
             return float(last_price)
@@ -119,7 +123,7 @@ def fetch_real_perp_market_price(symbol: str) -> float:
 def fetch_candles(symbol: str, timeframe="1h", limit=35):
     try:
         bridge = bridge_symbol_formats(symbol)
-        ohlcv = exchange.fetch_ohlcv(bridge["ccxt"], timeframe=timeframe, limit=limit)
+        ohlcv = public_exchange.fetch_ohlcv(bridge["ccxt"], timeframe=timeframe, limit=limit)
         if not ohlcv or len(ohlcv) < 20:
             return []
         return [{"open": c[1], "high": c[2], "low": c[3], "close": c[4], "vol": c[5]} for c in ohlcv[:-1]]
@@ -349,10 +353,10 @@ def calculate_objective_quant_score(direction: str, rsi_1h: float, rsi_4h: float
 
 def calculate_dynamic_position_size(quant_score: float, risk_pct: float, balance=None, is_scalp: bool = False) -> float:
     bal = float(balance) if balance is not None else float(ACCOUNT_BALANCE_SIMULATED)
-    risk_alloc = 0.0050 if quant_score < 0.78 else (0.0075 if quant_score < 0.85 else 0.0100)
+    risk_alloc = (0.0050 if quant_score < 0.78 else (0.0075 if quant_score < 0.85 else 0.0100)) * POSITION_SIZE_MULTIPLIER
     risk_dollars = bal * risk_alloc
-    pos_size = (risk_dollars / (risk_pct / 100.0)) * 2.0 if risk_pct > 0 else 500.0
-    cap_fraction = 0.50 if is_scalp else 0.40
+    pos_size = (risk_dollars / (risk_pct / 100.0)) * 2.0 if risk_pct > 0 else (500.0 * POSITION_SIZE_MULTIPLIER)
+    cap_fraction = (0.50 if is_scalp else 0.40) * POSITION_SIZE_MULTIPLIER
     return round(min(pos_size, bal * cap_fraction), 0)
 
 async def fetch_microstructure_data_async(session: aiohttp.ClientSession, symbol_clean: str) -> dict:
@@ -484,14 +488,14 @@ async def fetch_live_world_and_crypto_news() -> str:
 
 async def fetch_full_market_universe_tickers() -> list:
     try:
-        tickers = await asyncio.to_thread(exchange.fetch_tickers)
+        tickers = await asyncio.to_thread(public_exchange.fetch_tickers)
     except Exception as e:
         log_event("ERROR", "SCANNER_TICKERS", f"Exchange fetch_tickers failure: {e}")
         return []
 
     funding_dict = {}
     try:
-        premium_data = await asyncio.to_thread(exchange.fapiPublicGetPremiumIndex)
+        premium_data = await asyncio.to_thread(public_exchange.fapiPublicGetPremiumIndex)
         for item in premium_data:
             s_raw = item.get("symbol")
             fr_raw = item.get("lastFundingRate")
@@ -975,12 +979,18 @@ async def execute_unified_hourly_discovery_pipeline(context: ContextTypes.DEFAUL
                         if db_pos["symbol"] not in open_live_symbols:
                             c_reconcile.execute("""
                                 UPDATE watched_signals
-                                SET status = 'COMPLETED', remaining_ratio = 0.0, exit_reason = 'EXCHANGE_CLOSED_SYNC', last_updated = CURRENT_TIMESTAMP
+                                SET status = 'COMPLETED', remaining_ratio = 0.0, exit_reason = 'EXCHANGE_CLOSED_SYNC',
+                                    binance_sl_order_id = '', binance_tp1_id = '', binance_tp2_id = '', binance_tp3_id = '',
+                                    last_updated = CURRENT_TIMESTAMP
                                 WHERE id = ?
                             """, (db_pos["id"],))
                             log_event("INFO", "BINANCE_SYNC", f"Freed zombie slot {db_pos['symbol']} (position already closed on Binance).")
             except Exception as e_pos:
-                log_event("WARN", "BINANCE_SYNC", f"Live position sync warning: {e_pos}")
+                if "-2015" in str(e_pos):
+                    ip_addr = await asyncio.to_thread(get_outbound_ip_sync)
+                    log_event("ERROR", "BINANCE_AUTH", f"Binance -2015 Auth Error on fetch_positions: Whitelist Server IP [{ip_addr}] in Binance API Management & enable 'Enable Futures'.")
+                else:
+                    log_event("WARN", "BINANCE_SYNC", f"Live position sync warning: {e_pos}")
 
         watched_cnt, daily_cnt = count_active_and_daily_trades()
         
@@ -1060,8 +1070,15 @@ async def execute_unified_hourly_discovery_pipeline(context: ContextTypes.DEFAUL
                     })
 
         # 3. Market Data Ingestion
+        def _safe_fetch_btc_ticker():
+            try:
+                return public_exchange.fetch_ticker("BTC/USDT:USDT")
+            except Exception as e_t:
+                log_event("WARN", "BTC_TICKER", f"BTC ticker fetch warning: {e_t}")
+                return {"percentage": 0.0}
+
         btc_candles_task = asyncio.to_thread(fetch_candles, "BTC/USDT:USDT", "1h", 35)
-        btc_ticker_task = asyncio.to_thread(exchange.fetch_ticker, "BTC/USDT:USDT")
+        btc_ticker_task = asyncio.to_thread(_safe_fetch_btc_ticker)
         news_task = fetch_live_world_and_crypto_news()
         tickers_task = fetch_full_market_universe_tickers()
 
@@ -1578,6 +1595,8 @@ async def execute_unified_hourly_discovery_pipeline(context: ContextTypes.DEFAUL
         total_duration = round(time.time() - t_start, 2)
         log_event("INFO", "PROFIT_ENGINE", f"Unified Hourly Scan completed in {total_duration}s. Emitted: {emitted_count}")
 
+    except Exception as e_pipe:
+        log_event("ERROR", "PROFIT_ENGINE", f"Discovery pipeline error: {e_pipe}")
     finally:
         with get_db_connection() as conn:
             conn.execute("UPDATE bot_state SET value = '0' WHERE key = 'eval_running'")
@@ -1617,6 +1636,7 @@ async def set_bot_menu_commands(application):
         BotCommand("enter", "Promote pending coin to active position"),
         BotCommand("start", "System status & resume"),
         BotCommand("stop", "Pause market scans"),
+        BotCommand("ip", "Show current server Outbound IP for Binance whitelist"),
         BotCommand("logs", "View recent logs"),
     ]
     try:
@@ -1641,7 +1661,14 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         conn.execute("INSERT OR REPLACE INTO bot_state (key, value) VALUES ('system_shutdown', '0')")
         conn.execute("INSERT OR REPLACE INTO bot_state (key, value) VALUES ('scanning_active', '1')")
         conn.execute("INSERT OR REPLACE INTO bot_state (key, value) VALUES ('eval_running', '0')")
-    await update.message.reply_text("🟢 <b>System Active.</b> Hourly AI discovery and silent 8s Sentinel running.", parse_mode="HTML")
+    ip_addr = await asyncio.to_thread(get_outbound_ip_sync)
+    cap = await asyncio.to_thread(fetch_current_account_capital)
+    await update.message.reply_text(
+        f"🟢 <b>System Active.</b> Hourly AI discovery and silent 8s Sentinel running.\n"
+        f"• <b>Mode / Balance:</b> <code>{cap.get('mode')}</code> (<code>${cap.get('total', 0.0):.2f} USD</code>)\n"
+        f"• <b>Server Outbound IP:</b> <code>{ip_addr}</code>",
+        parse_mode="HTML"
+    )
 
 async def stop_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not auth_guard(update): return
@@ -1936,6 +1963,26 @@ async def logs_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines = [f"<code>[{r['timestamp'].split(' ')[1]}]</code> <b>{r['component']}:</b> {html.escape(r['message'])}" for r in reversed(log_rows)]
     await update.message.reply_text("\n".join(lines) if lines else "No logs recorded.", parse_mode="HTML")
 
+async def ip_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not auth_guard(update): return
+    outbound_ip = "Unknown"
+    async with aiohttp.ClientSession() as session:
+        for url in ("https://api.ipify.org", "https://ifconfig.me/ip", "https://icanhazip.com"):
+            try:
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=4.0)) as resp:
+                    if resp.status == 200:
+                        txt = (await resp.text()).strip()
+                        if txt:
+                            outbound_ip = txt
+                            break
+            except Exception:
+                continue
+    await update.message.reply_text(
+        f"🌐 <b>Server Outbound IP:</b> <code>{outbound_ip}</code>\n\n"
+        f"👉 Copy this IP into <b>Binance API Management → Restrict access to trusted IPs only</b> and ensure <b>Enable Futures</b> is checked.",
+        parse_mode="HTML"
+    )
+
 async def scheduled_hourly_scan_job(context: ContextTypes.DEFAULT_TYPE):
     try:
         await execute_hourly_discovery_pipeline(context, is_manual_scan=False)
@@ -1956,6 +2003,7 @@ def main():
     app.add_handler(CommandHandler("clearwatch", clearwatch_cmd))
     app.add_handler(CommandHandler("enter", enter_cmd))
     app.add_handler(CommandHandler("logs", logs_cmd))
+    app.add_handler(CommandHandler("ip", ip_cmd))
 
     if app.job_queue:
         app.job_queue.run_repeating(

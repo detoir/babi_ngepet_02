@@ -27,6 +27,7 @@ from config_db import (
     is_weekend_regime,
     utc_now,
     get_exchange_instance,
+    get_public_exchange_instance,
     get_db_connection,
     log_event,
     bridge_symbol_formats,
@@ -41,11 +42,13 @@ from config_db import (
     fetch_binance_order_status,
     fetch_live_binance_position,
     get_symbol_min_qty,
+    safe_amount_to_precision,
     format_order_quantity,
     set_symbol_leverage_and_margin,
 )
 
 exchange = get_exchange_instance()
+public_exchange = get_public_exchange_instance()
 ROUND_TRIP_FEE_PCT = 0.10  # 0.05% entry + 0.05% exit Binance USD-M Futures fee allowance
 
 LAST_BTC_PRICE = 0.0
@@ -70,7 +73,7 @@ async def send_telegram_alert(session: aiohttp.ClientSession, message: str):
 def fetch_real_perp_market_price(symbol: str) -> float:
     try:
         bridge = bridge_symbol_formats(symbol)
-        ticker = exchange.fetch_ticker(bridge["ccxt"])
+        ticker = public_exchange.fetch_ticker(bridge["ccxt"])
         last_price = ticker.get("last") or ticker.get("close")
         if last_price:
             return float(last_price)
@@ -432,7 +435,13 @@ async def run_sentinel_cycle(session: aiohttp.ClientSession):
                             if oid:
                                 await asyncio.to_thread(cancel_binance_order, sym, oid)
                         with get_db_connection() as conn_flat:
-                            conn_flat.execute("UPDATE watched_signals SET status = 'COMPLETED', remaining_ratio = 0.0, exit_reason = 'EXCHANGE_CLOSED_SYNC', last_updated = CURRENT_TIMESTAMP WHERE id = ?", (w_id,))
+                            conn_flat.execute("""
+                                UPDATE watched_signals
+                                SET status = 'COMPLETED', remaining_ratio = 0.0, exit_reason = 'EXCHANGE_CLOSED_SYNC',
+                                    binance_sl_order_id = '', binance_tp1_id = '', binance_tp2_id = '', binance_tp3_id = '',
+                                    last_updated = CURRENT_TIMESTAMP
+                                WHERE id = ?
+                            """, (w_id,))
                         log_event("INFO", "SENTINEL_SYNC", f"Reconciled flat Binance position on {sym}. Closed zombie WATCHING row.")
                         continue
                     if executed_qty <= 0:
@@ -582,7 +591,7 @@ async def run_sentinel_cycle(session: aiohttp.ClientSession):
 
                     new_tp2_id = tp2_order_id
                     if TRADING_MODE in ("LIVE", "TESTNET") and executed_qty > 0:
-                        close_qty = tp1_q_est if tp1_q_est > 0 else (executed_qty * tp1_close_ratio)
+                        close_qty = float(tp1_info.get("filled") or 0.0) if (tp1_order_filled and float(tp1_info.get("filled") or 0.0) > 0) else (tp1_q_est if tp1_q_est > 0 else (executed_qty * tp1_close_ratio))
                         if not tp1_order_filled:
                             if tp1_order_id:
                                 await asyncio.to_thread(cancel_binance_order, sym, tp1_order_id)
@@ -679,7 +688,7 @@ async def run_sentinel_cycle(session: aiohttp.ClientSession):
 
                     new_tp3_id = tp3_order_id
                     if TRADING_MODE in ("LIVE", "TESTNET") and executed_qty > 0:
-                        tp2_qty = executed_qty * 0.50
+                        tp2_qty = float(tp2_info.get("filled") or 0.0) if (tp2_order_filled and float(tp2_info.get("filled") or 0.0) > 0) else safe_amount_to_precision(sym, executed_qty * 0.50)
                         if not tp2_order_filled:
                             if tp2_order_id:
                                 await asyncio.to_thread(cancel_binance_order, sym, tp2_order_id)
