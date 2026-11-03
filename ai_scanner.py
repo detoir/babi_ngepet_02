@@ -353,11 +353,14 @@ def calculate_objective_quant_score(direction: str, rsi_1h: float, rsi_4h: float
 
 def calculate_dynamic_position_size(quant_score: float, risk_pct: float, balance=None, is_scalp: bool = False) -> float:
     bal = float(balance) if balance is not None else float(ACCOUNT_BALANCE_SIMULATED)
+    # Allocate ~22% of wallet balance as margin per slot so 4 concurrent positions fit inside 88% of total margin
+    lev = SCALP_LEVERAGE if is_scalp else DEFAULT_LEVERAGE
+    slot_margin_fraction = 0.22
+    max_slot_notional = bal * slot_margin_fraction * lev
     risk_alloc = (0.0050 if quant_score < 0.78 else (0.0075 if quant_score < 0.85 else 0.0100)) * POSITION_SIZE_MULTIPLIER
     risk_dollars = bal * risk_alloc
-    pos_size = (risk_dollars / (risk_pct / 100.0)) * 2.0 if risk_pct > 0 else (500.0 * POSITION_SIZE_MULTIPLIER)
-    cap_fraction = (0.50 if is_scalp else 0.40) * POSITION_SIZE_MULTIPLIER
-    return round(min(pos_size, bal * cap_fraction), 0)
+    pos_size = (risk_dollars / (risk_pct / 100.0)) * 2.0 if risk_pct > 0 else max_slot_notional
+    return round(min(pos_size, max_slot_notional), 0)
 
 async def fetch_microstructure_data_async(session: aiohttp.ClientSession, symbol_clean: str) -> dict:
     oi_url = f"https://fapi.binance.com/fapi/v1/openInterest?symbol={symbol_clean}"
@@ -1385,6 +1388,7 @@ async def execute_unified_hourly_discovery_pipeline(context: ContextTypes.DEFAUL
         processed_candidates.sort(key=lambda x: x["profit_index"], reverse=True)
 
         emitted_count = 0
+        emitted_symbols = set()
         for item in processed_candidates:
             if watched_cnt + emitted_count >= MAX_CONCURRENT_POSITIONS:
                 break
@@ -1396,7 +1400,7 @@ async def execute_unified_hourly_discovery_pipeline(context: ContextTypes.DEFAUL
             is_scalp = item.get("is_scalp", False)
 
             # Prevent Duplicate Orders: Never open a new setup on a symbol that is already active/watching
-            active_symbols = [p["symbol"] for p in active_positions_payload] + [p["symbol"] for p in pending_watchlist_payload]
+            active_symbols = [p["symbol"] for p in active_positions_payload] + [p["symbol"] for p in pending_watchlist_payload] + list(emitted_symbols)
             if sym in active_symbols:
                 log_event("INFO", "PROFIT_ENGINE", f"Symbol {sym} already active on watchlist/position. Skipping duplicate emission.")
                 continue
@@ -1516,6 +1520,7 @@ async def execute_unified_hourly_discovery_pipeline(context: ContextTypes.DEFAUL
                 binance_tp3_id=binance_tp3_id
             )
             emitted_count += 1
+            emitted_symbols.add(sym)
 
             side_badge = "🟢 BUY / LONG" if act == "LONG" else "🔴 SELL / SHORT"
             if cand["source"] == "WHALE_FLOW":

@@ -66,18 +66,18 @@ TRADING_MODE = _raw_mode.upper()
 if TRADING_MODE not in ("LIVE", "TESTNET", "SIMULATION"):
     TRADING_MODE = "LIVE"
 POSITION_SIZE_MULTIPLIER = get_env_float("POSITION_SIZE_MULTIPLIER", 5.0)  # 5x multiplier over baseline position size/margin
-DEFAULT_LEVERAGE = max(get_env_int("DEFAULT_LEVERAGE", 10), 5)
-SCALP_LEVERAGE = max(get_env_int("SCALP_LEVERAGE", 15), 6)
+DEFAULT_LEVERAGE = max(get_env_int("DEFAULT_LEVERAGE", 10), 10)  # 10x min leverage so 3-4 trades fit in $19 margin
+SCALP_LEVERAGE = max(get_env_int("SCALP_LEVERAGE", 12), 10)    # 12x leverage for scalps so 3-4 trades fit in $19 margin
 SCALP_ENTRY_TYPE = get_env_str("SCALP_ENTRY_TYPE", "MARKET").upper()  # MARKET by default so SL and TP brackets attach immediately on trade send
 TRADE_ENTRY_TYPE = get_env_str("TRADE_ENTRY_TYPE", "MARKET").upper()  # MARKET by default so SL and TP brackets attach immediately on trade send
-MAX_CORRELATED_POSITIONS_PER_SIDE = get_env_int("MAX_CORRELATED_POSITIONS_PER_SIDE", 2)
-MAX_CORRELATED_SCALPS_PER_SIDE = get_env_int("MAX_CORRELATED_SCALPS_PER_SIDE", 1)  # 1 scalp at a time to prevent margin exhaustion
+MAX_CORRELATED_POSITIONS_PER_SIDE = max(get_env_int("MAX_CORRELATED_POSITIONS_PER_SIDE", 3), 3)
+MAX_CORRELATED_SCALPS_PER_SIDE = max(get_env_int("MAX_CORRELATED_SCALPS_PER_SIDE", 3), 3)  # Allow up to 3 scalps per side
 
 # Risk & Gate Parameters
 MIN_RRR = get_env_float("MIN_RRR", 1.8)
 CONFIDENCE_THRESHOLD = get_env_float("CONFIDENCE_THRESHOLD", 0.75)
 MAX_24H_LOSS_THRESHOLD = get_env_float("MAX_24H_LOSS_THRESHOLD", -25.0)
-MAX_CONCURRENT_POSITIONS = get_env_int("MAX_CONCURRENT_POSITIONS", 2)  # Max 2 concurrent positions for $30 balance
+MAX_CONCURRENT_POSITIONS = max(get_env_int("MAX_CONCURRENT_POSITIONS", 4), 4)  # Allow 3-4 concurrent positions
 MAX_DAILY_TRADES = get_env_int("MAX_DAILY_TRADES", 999999)  # Fully uncapped by default
 ACCOUNT_BALANCE_SIMULATED = get_env_float("ACCOUNT_BALANCE_SIM", 10000.0)
 
