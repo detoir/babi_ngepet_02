@@ -1185,9 +1185,10 @@ async def execute_unified_hourly_discovery_pipeline(context: ContextTypes.DEFAUL
         macro_decision, whale_decision, scalp_decision = await asyncio.gather(macro_task, whale_task, scalp_task)
 
         # 5. Market Regime Logging
+        regime_str = btc_regime.get("regime", "RANGING")
         market_regime_info = macro_decision.get("market_regime", {})
         if market_regime_info:
-            reg_name = market_regime_info.get("classification", regime_str)
+            reg_name = market_regime_info.get("classification") or regime_str
             reg_conf = float(market_regime_info.get("confidence") or 0.85)
             reg_ev = market_regime_info.get("evidence", "")
             log_event("INFO", "AI_REGIME", f"Institutional Market Regime: {reg_name} (Conf: {reg_conf:.2f}). Evidence: {reg_ev}")
