@@ -315,9 +315,9 @@ def calculate_objective_quant_score(direction: str, rsi_1h: float, rsi_4h: float
     else:  # SHORT
         if btc_24h_pct > 2.2:
             return 0.10
-        if rsi_1h < 34.0 or rsi_1h > 60.0:
+        if rsi_1h < 41.0 or rsi_1h > 60.0:  # Hard Gate: Never short into oversold bottoms (<41.0)
             return 0.10
-        if change_24h <= -9.0 or funding_rate <= -0.035 or book_ratio > 1.28:
+        if change_24h <= -8.0 or funding_rate <= -0.035 or book_ratio > 1.25:
             return 0.10
 
     score = 0.62
@@ -332,8 +332,8 @@ def calculate_objective_quant_score(direction: str, rsi_1h: float, rsi_4h: float
     else:  # SHORT
         if btc_24h_pct <= -0.3: score += 0.12
         if -6.5 <= (change_24h - btc_24h_pct) <= -0.3: score += 0.10
-        if 36.0 <= rsi_1h <= 54.0: score += 0.10
-        if 36.0 <= rsi_4h <= 56.0: score += 0.08
+        if 42.0 <= rsi_1h <= 55.0: score += 0.12  # Prime swing rollover zone (like SKHYNIX 49.1 / SKHY 51.6)
+        if 42.0 <= rsi_4h <= 58.0: score += 0.08
         if -0.025 <= funding_rate <= 0.015: score += 0.06
         if book_ratio <= 0.90: score += 0.08
 
@@ -347,16 +347,20 @@ def calculate_objective_quant_score(direction: str, rsi_1h: float, rsi_4h: float
         if rsi_1h > 63.0: score -= 0.20
         if change_24h >= 6.5: score -= 0.20
     else:
-        if rsi_1h < 36.5: score -= 0.20
+        if rsi_1h < 42.0: score -= 0.25  # Heavy penalty for selling into late downward momentum
         if change_24h <= -6.5: score -= 0.20
 
     return round(max(0.10, min(0.95, score)), 2)
 
 def calculate_dynamic_position_size(quant_score: float, risk_pct: float, balance=None, is_scalp: bool = False) -> float:
     bal = float(balance) if balance is not None else float(ACCOUNT_BALANCE_SIMULATED)
-    # Allocate ~40% of wallet balance as margin per slot (2x bigger margin per trade)
     lev = SCALP_LEVERAGE if is_scalp else DEFAULT_LEVERAGE
-    slot_margin_fraction = 0.40  # Twice bigger margin per trade
+
+    # Dynamic Profit Defense (Bank the Win):
+    # When rolling 24h PnL is up >= +6.0%, automatically cut margin fraction in half (0.20) to lock and preserve daily gains
+    rolling_24h_pnl = check_rolling_24h_drawdown()
+    slot_margin_fraction = 0.20 if rolling_24h_pnl >= 6.0 else 0.40
+
     max_slot_notional = bal * slot_margin_fraction * lev
     risk_alloc = (0.0050 if quant_score < 0.78 else (0.0075 if quant_score < 0.85 else 0.0100)) * POSITION_SIZE_MULTIPLIER
     risk_dollars = bal * risk_alloc
@@ -812,8 +816,10 @@ def analyze_whale_microstructure_with_ai(market_universe: list, btc_regime: dict
     {json.dumps(top_candidates)}
 
     INSTITUTIONAL RULES & TRAP PREVENTION:
-    1. CROWDED TRAP RULE:
-       - If BTC is red (< -0.5%) and whale_ls_ratio > 1.6, DO NOT LONG. Top accounts are trapped long. Target these for LIQUIDATION FLUSH SHORTS.
+    1. WHALE LONG DEFENSE & TRAP RULE:
+       - If whale_ls_ratio > 2.5, NEVER SHORT. Top institutional accounts are heavily defending support walls.
+       - If BTC is red (< -0.5%) and whale_ls_ratio > 1.6, DO NOT LONG.
+       - Only short when whale_ls_ratio is balanced (0.8 to 2.2) and 1H RSI is rolling off from swing highs (41.0 to 58.0). Never short the bottom of a drop!
     2. SPOOFING FILTER:
        - Book_ratio > 2.5 near 24h lows is often fake bid support. Require negative funding and relative strength vs BTC before considering any long.
     3. MOMENTUM SHORTS:
@@ -1457,9 +1463,11 @@ async def execute_unified_hourly_discovery_pipeline(context: ContextTypes.DEFAUL
                     log_event("INFO", "ALIGNMENT_GATE", f"Filtered LONG on {sym}: Failed alignment (Price ${curr_price:.4f} vs EMA21 ${ema21_1h:.4f}, 24h High ${hi_24h:.4f}, RSI {rsi_1h:.1f}, Book {book_ratio}x, BTC {btc_24h_pct:+.2f}%).")
                     continue
             elif act == "SHORT":
-                near_24h_bottom = (chg <= -3.5 and lo_24h > 0 and curr_price <= lo_24h * 1.007)
-                if curr_price > (ema21_1h * 1.008) or rsi_1h > 58.0 or rsi_1h < 35.0 or book_ratio > 1.22 or btc_24h_pct > 1.80 or near_24h_bottom:
-                    log_event("INFO", "ALIGNMENT_GATE", f"Filtered SHORT on {sym}: Failed alignment (Price ${curr_price:.4f} vs EMA21 ${ema21_1h:.4f}, 24h Low ${lo_24h:.4f}, RSI {rsi_1h:.1f}, Book {book_ratio}x, BTC {btc_24h_pct:+.2f}%).")
+                near_24h_bottom = (lo_24h > 0 and curr_price <= lo_24h * 1.012)
+                whale_long_wall = (whale_ls >= 2.5)
+                if curr_price > (ema21_1h * 1.008) or rsi_1h > 58.0 or rsi_1h < 41.0 or book_ratio > 1.20 or btc_24h_pct > 1.80 or near_24h_bottom or whale_long_wall:
+                    reason = "Whale Long Defense (L/S >= 2.5)" if whale_long_wall else ("Near 24h Low (<1.2%)" if near_24h_bottom else "Failed Alignment")
+                    log_event("INFO", "ALIGNMENT_GATE", f"Filtered SHORT on {sym}: {reason} (Price ${curr_price:.4f} vs 24h Low ${lo_24h:.4f}, RSI {rsi_1h:.1f}, Whale L/S {whale_ls:.2f}x, Book {book_ratio}x).")
                     continue
 
             levels = calculate_deterministic_trade_levels(curr_price, atr_1h, act, ema21_1h, cand["strategy_mode"], change_24h=chg, is_scalp=is_scalp)
@@ -1518,6 +1526,7 @@ async def execute_unified_hourly_discovery_pipeline(context: ContextTypes.DEFAUL
         watched_cnt, _ = count_active_and_daily_trades()
         emitted_count = 0
         emitted_symbols = set()
+        emitted_directions = []
         for item in processed_candidates:
             if watched_cnt + emitted_count >= MAX_CONCURRENT_POSITIONS:
                 break
@@ -1534,11 +1543,12 @@ async def execute_unified_hourly_discovery_pipeline(context: ContextTypes.DEFAUL
                 log_event("INFO", "PROFIT_ENGINE", f"Symbol {sym} already active on watchlist/position. Skipping duplicate emission.")
                 continue
 
-            # Enforce correlation / cluster limit (Scalps have separate higher concurrency)
+            # Enforce directional correlation limit (Scalps & Trades up to 4 concurrent slots in trend direction)
             dir_count = count_active_positions_by_direction(act)
+            already_emitted_same_dir = emitted_directions.count(act)
             max_allowed_dir = MAX_CORRELATED_SCALPS_PER_SIDE if is_scalp else MAX_CORRELATED_POSITIONS_PER_SIDE
-            if dir_count >= max_allowed_dir:
-                log_event("INFO", "PROFIT_ENGINE", f"Correlated {act} limit ({dir_count}/{max_allowed_dir}) reached. Skipping {sym}.")
+            if (dir_count + already_emitted_same_dir) >= max_allowed_dir:
+                log_event("INFO", "PROFIT_ENGINE", f"Correlated {act} limit reached ({dir_count + already_emitted_same_dir}/{max_allowed_dir}). Skipping {sym}.")
                 continue
 
             # Re-fetch fresh live price after AI evaluation so 20s LLM latency never causes stale fills
@@ -1650,6 +1660,7 @@ async def execute_unified_hourly_discovery_pipeline(context: ContextTypes.DEFAUL
             )
             emitted_count += 1
             emitted_symbols.add(sym)
+            emitted_directions.append(act)
 
             side_badge = "🟢 BUY / LONG" if act == "LONG" else "🔴 SELL / SHORT"
             if cand["source"] == "WHALE_FLOW":

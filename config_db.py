@@ -70,8 +70,9 @@ DEFAULT_LEVERAGE = max(get_env_int("DEFAULT_LEVERAGE", 12), 10)  # 12x leverage 
 SCALP_LEVERAGE = max(get_env_int("SCALP_LEVERAGE", 12), 12)    # 12x leverage for scalps so 3-4 trades fit in $19 margin
 SCALP_ENTRY_TYPE = get_env_str("SCALP_ENTRY_TYPE", "MARKET").upper()  # MARKET by default so SL and TP brackets attach immediately on trade send
 TRADE_ENTRY_TYPE = get_env_str("TRADE_ENTRY_TYPE", "MARKET").upper()  # MARKET by default so SL and TP brackets attach immediately on trade send
-MAX_CORRELATED_POSITIONS_PER_SIDE = max(get_env_int("MAX_CORRELATED_POSITIONS_PER_SIDE", 4), 4)
+MAX_CORRELATED_POSITIONS_PER_SIDE = max(get_env_int("MAX_CORRELATED_POSITIONS_PER_SIDE", 4), 4)  # Allow all 4 slots to trade in trend direction
 MAX_CORRELATED_SCALPS_PER_SIDE = max(get_env_int("MAX_CORRELATED_SCALPS_PER_SIDE", 4), 4)  # Allow all 4 slots to trade in trend direction
+MAX_CONCURRENT_SAME_DIRECTION = max(get_env_int("MAX_CONCURRENT_SAME_DIRECTION", 4), 4)
 
 # Risk & Gate Parameters
 MIN_RRR = get_env_float("MIN_RRR", 1.8)
