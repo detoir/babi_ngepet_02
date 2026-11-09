@@ -55,7 +55,7 @@ BINANCE_API_KEY = re.sub(r"\s+", "", get_env_str("BINANCE_API_KEY", ""))
 BINANCE_SECRET_KEY = re.sub(r"\s+", "", get_env_str("BINANCE_SECRET_KEY", ""))
 
 # Operational Cadence & Loops
-SCAN_INTERVAL_SECONDS = get_env_int("SCAN_INTERVAL_SECONDS", 3600)
+SCAN_INTERVAL_SECONDS = get_env_int("SCAN_INTERVAL_SECONDS", 900)  # 15-minute continuous capital turnover for maximum compounding
 WATCH_INTERVAL_SECONDS = get_env_int("WATCH_INTERVAL_SECONDS", 8)
 PENDING_TTL_HOURS = get_env_int("PENDING_TTL_HOURS", 3)
 

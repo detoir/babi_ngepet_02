@@ -199,15 +199,15 @@ def calculate_deterministic_trade_levels(price: float, atr_1h: float, direction:
 
     if is_scalp or strat_mode == "SCALP":
         # Professional Scalp Sniper:
-        # Balanced ATR swing risk (0.85% min to avoid 5m spread/wick noise, 1.20% max to cap single loss)
-        raw_risk = atr_1h * 0.75
-        risk_dist = max(raw_risk, price * 0.0085)
-        risk_dist = min(risk_dist, price * 0.0120)
+        # Tightened risk distance (0.80% min to avoid 5m wick noise, 0.95% max to strictly cap single loss at ~1.05% net)
+        raw_risk = atr_1h * 0.70
+        risk_dist = max(raw_risk, price * 0.0080)
+        risk_dist = min(risk_dist, price * 0.0095)
 
-        # High-Hit-Rate Scalp Targets: Bank 50% early at 1.0R so winning positions pay out before reversals!
+        # High-Hit-Rate Asymmetric Scalp Targets: Bank 50% early at 1.0R, expand runners to 2.0R and 3.2R!
         tp1_mult = 1.0
-        tp2_mult = 1.8
-        tp3_mult = 2.8
+        tp2_mult = 2.0
+        tp3_mult = 3.2
 
         # If MARKET mode is active (default), use mark price so entry + SL + TP execute immediately
         if SCALP_ENTRY_TYPE == "MARKET":
@@ -240,15 +240,15 @@ def calculate_deterministic_trade_levels(price: float, atr_1h: float, direction:
             "tp2_mult": tp2_mult,
             "tp3_mult": tp3_mult,
             "risk_dist": risk_dist,
-            "risk_pct": round((risk_dist / entry) * 100.0, 2) if entry > 0 else 1.0
+            "risk_pct": round((risk_dist / entry) * 100.0, 2) if entry > 0 else 0.95
         }
 
-    # Dynamic risk distance for Fast/Swing trades: Cap strictly at 1.45%
-    raw_risk = atr_1h * 1.10
-    risk_dist = max(raw_risk, price * 0.010)
-    risk_dist = min(risk_dist, price * 0.0145)
+    # Dynamic risk distance for Fast/Swing trades: Cap strictly at 1.15% to eliminate large stop-outs
+    raw_risk = atr_1h * 0.95
+    risk_dist = max(raw_risk, price * 0.0090)
+    risk_dist = min(risk_dist, price * 0.0115)
 
-    # Adaptive reward multipliers: Closer TP1 (1.1R-1.2R) to bank 50% early on first impulse
+    # Adaptive reward multipliers: Bank 50% early at 1.2R, let runners hit 2.0R and 3.2R
     if is_sweep:
         tp1_mult = 1.1
         tp2_mult = 1.9
@@ -256,7 +256,7 @@ def calculate_deterministic_trade_levels(price: float, atr_1h: float, direction:
     else:
         tp1_mult = 1.2
         tp2_mult = 2.0
-        tp3_mult = 3.0
+        tp3_mult = 3.2
 
     if TRADE_ENTRY_TYPE == "MARKET":
         entry = round(price, 6)
@@ -1495,11 +1495,19 @@ async def execute_unified_hourly_discovery_pipeline(context: ContextTypes.DEFAUL
             if any(other["symbol"] == sym and other["source"] != cand["source"] for other in raw_candidates):
                 profit_index += 10.0
 
-            # Order book ratio and whale alignment bonus
-            if (act == "SHORT" and book_ratio < 0.70) or (act == "LONG" and book_ratio > 1.30):
-                profit_index += 5.0
-            if (act == "SHORT" and whale_ls > 1.8 and btc_24h_pct < -0.5):
-                profit_index += 5.0
+            # Order book ratio imbalance bonus
+            if (act == "SHORT" and book_ratio < 0.65) or (act == "LONG" and book_ratio > 1.35):
+                profit_index += 6.0
+
+            # Sweet-Spot Rollover / Pullback Confluence (+10.0 bonus like SKHYNIX 49.1 / SKHY 51.6):
+            if (act == "SHORT" and 44.0 <= rsi_1h <= 54.0) or (act == "LONG" and 46.0 <= rsi_1h <= 56.0):
+                profit_index += 10.0
+
+            # Balanced Institutional Flow Bonus (Whale L/S between 0.8 and 2.2, avoiding whale defense traps):
+            if (act == "SHORT" and 0.8 <= whale_ls <= 2.2 and btc_24h_pct < -0.4):
+                profit_index += 8.0
+            elif (act == "LONG" and 1.1 <= whale_ls <= 2.2 and btc_24h_pct > 0.4):
+                profit_index += 8.0
 
             processed_candidates.append({
                 "cand": cand,

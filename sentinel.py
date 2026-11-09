@@ -319,15 +319,15 @@ async def run_sentinel_cycle(session: aiohttp.ClientSession):
                     speed_badge = "⚡ SCALP SNIPER"
                     tp_display = (
                         f"   • TP1 (50% Size): <code>${t1:.6f}</code> (+1.0R) {'✅' if new_tp1_id else ''}\n"
-                        f"   • TP2 (25% Size): <code>${t2:.6f}</code> (+1.8R) {'✅' if new_tp2_id else ''}\n"
-                        f"   • TP3 (25% Size): <code>${t3:.6f}</code> (+2.8R) {'✅' if new_tp3_id else ''}"
+                        f"   • TP2 (25% Size): <code>${t2:.6f}</code> (+2.0R) {'✅' if new_tp2_id else ''}\n"
+                        f"   • TP3 (25% Size): <code>${t3:.6f}</code> (+3.2R) {'✅' if new_tp3_id else ''}"
                     )
                 else:
                     speed_badge = "🚀 FAST TRADE" if speed_tag == "FAST TRADE" else "⏳ SLOW TRADE"
                     tp_display = (
                         f"   • TP1 (50% Size): <code>${t1:.6f}</code> (+1.2R) {'✅' if new_tp1_id else ''}\n"
                         f"   • TP2 (25% Size): <code>${t2:.6f}</code> (+2.0R) {'✅' if new_tp2_id else ''}\n"
-                        f"   • TP3 (25% Size): <code>${t3:.6f}</code> (+3.0R) {'✅' if new_tp3_id else ''}"
+                        f"   • TP3 (25% Size): <code>${t3:.6f}</code> (+3.2R) {'✅' if new_tp3_id else ''}"
                     )
 
                 exec_mode_tag = f"🤖 [AUTO-{TRADING_MODE}]" if TRADING_MODE in ("LIVE", "TESTNET") else "📋 [SIMULATION]"
@@ -719,7 +719,7 @@ async def run_sentinel_cycle(session: aiohttp.ClientSession):
                     tp2_order_id = ""
                     tp3_order_id = new_tp3_id
                     msg = (
-                        f"🎯🎯 <b>TP 2 HIT (+1.8R/+2.0R) — 75% TOTAL POSITION BANKED</b>\n\n"
+                        f"🎯🎯 <b>TP 2 HIT (+2.0R) — 75% TOTAL POSITION BANKED</b>\n\n"
                         f"• <b>Contract:</b> <code>{sym}</code> ({act})\n"
                         f"• <b>Fill Price:</b> ${tp2_fill_price:.6f} (<code>{net_leg_pnl:+.2f}% net</code>)\n"
                         f"• <b>Banked on Leg:</b> <code>+{tp2_gain:.2f}%</code>\n\n"
@@ -760,7 +760,7 @@ async def run_sentinel_cycle(session: aiohttp.ClientSession):
                             WHERE id = ?
                         """, (final_pnl, w_id))
                     msg = (
-                        f"🏆 <b>FULL TAKE-PROFIT ACHIEVED (+2.8R/+3.0R)!</b>\n\n"
+                        f"🏆 <b>FULL TAKE-PROFIT ACHIEVED (+3.2R)!</b>\n\n"
                         f"• <b>Contract:</b> <code>{sym}</code> ({act})\n"
                         f"• <b>Final Fill:</b> ${tp3_fill_price:.6f}\n"
                         f"• <b>Total Net Trade Return:</b> <code>{final_pnl:+.2f}%</code>\n\n"
