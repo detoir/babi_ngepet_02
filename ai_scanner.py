@@ -305,57 +305,57 @@ def calculate_deterministic_trade_levels(price: float, atr_1h: float, direction:
 def calculate_objective_quant_score(direction: str, rsi_1h: float, rsi_4h: float, btc_regime: str, vol_m: float, funding_rate: float, change_24h: float, btc_24h_pct: float, book_ratio: float = 1.0) -> float:
     # Hard Disqualification Gates: Never buy overbought tops / falling knives or short oversold capitulation bottoms
     if direction == "LONG":
-        if btc_24h_pct < -0.8:
+        if btc_24h_pct < -1.5:
             return 0.10
-        if rsi_1h > 64.0 or rsi_1h < 42.0:
+        if rsi_1h > 66.0 or rsi_1h < 38.0:
             return 0.10
-        if change_24h >= 7.5 or funding_rate >= 0.025 or book_ratio < 1.05:
+        if change_24h >= 9.0 or funding_rate >= 0.030 or book_ratio < 0.78:
             return 0.10
     else:  # SHORT
-        if btc_24h_pct > 1.8:
+        if btc_24h_pct > 2.2:
             return 0.10
-        if rsi_1h < 36.0 or rsi_1h > 56.0:
+        if rsi_1h < 34.0 or rsi_1h > 60.0:
             return 0.10
-        if change_24h <= -7.0 or funding_rate <= -0.030 or book_ratio > 0.95:
+        if change_24h <= -9.0 or funding_rate <= -0.035 or book_ratio > 1.28:
             return 0.10
 
-    score = 0.50
+    score = 0.62
     
     if direction == "LONG":
-        if btc_24h_pct >= 0.5: score += 0.12
-        if 0.5 <= (change_24h - btc_24h_pct) <= 5.0: score += 0.12
-        if 48.0 <= rsi_1h <= 60.0: score += 0.12
-        if 48.0 <= rsi_4h <= 63.0: score += 0.10
-        if funding_rate <= 0.010: score += 0.08
-        if book_ratio >= 1.25: score += 0.10
+        if btc_24h_pct >= 0.2: score += 0.10
+        if 0.2 <= (change_24h - btc_24h_pct) <= 6.0: score += 0.10
+        if 44.0 <= rsi_1h <= 62.0: score += 0.10
+        if 44.0 <= rsi_4h <= 64.0: score += 0.08
+        if funding_rate <= 0.012: score += 0.06
+        if book_ratio >= 1.10: score += 0.08
     else:  # SHORT
-        if btc_24h_pct <= -1.0: score += 0.15
-        if -5.5 <= (change_24h - btc_24h_pct) <= -0.8: score += 0.12
-        if 38.0 <= rsi_1h <= 50.0: score += 0.12
-        if 38.0 <= rsi_4h <= 55.0: score += 0.10
-        if -0.020 <= funding_rate <= 0.012: score += 0.08
-        if book_ratio <= 0.78: score += 0.10
+        if btc_24h_pct <= -0.3: score += 0.12
+        if -6.5 <= (change_24h - btc_24h_pct) <= -0.3: score += 0.10
+        if 36.0 <= rsi_1h <= 54.0: score += 0.10
+        if 36.0 <= rsi_4h <= 56.0: score += 0.08
+        if -0.025 <= funding_rate <= 0.015: score += 0.06
+        if book_ratio <= 0.90: score += 0.08
 
-    if vol_m >= 35.0: score += 0.08
+    if vol_m >= 35.0: score += 0.06
     elif vol_m >= 10.0: score += 0.04
 
     # Clamp positive bonuses BEFORE applying any edge exhaustion penalties
     score = min(0.92, score)
 
     if direction == "LONG":
-        if rsi_1h > 61.5: score -= 0.25
-        if change_24h >= 5.5: score -= 0.25
+        if rsi_1h > 63.0: score -= 0.20
+        if change_24h >= 6.5: score -= 0.20
     else:
-        if rsi_1h < 38.5: score -= 0.25
-        if change_24h <= -5.5: score -= 0.25
+        if rsi_1h < 36.5: score -= 0.20
+        if change_24h <= -6.5: score -= 0.20
 
     return round(max(0.10, min(0.95, score)), 2)
 
 def calculate_dynamic_position_size(quant_score: float, risk_pct: float, balance=None, is_scalp: bool = False) -> float:
     bal = float(balance) if balance is not None else float(ACCOUNT_BALANCE_SIMULATED)
-    # Allocate ~22% of wallet balance as margin per slot so 4 concurrent positions fit inside 88% of total margin
+    # Allocate ~40% of wallet balance as margin per slot (2x bigger margin per trade)
     lev = SCALP_LEVERAGE if is_scalp else DEFAULT_LEVERAGE
-    slot_margin_fraction = 0.22
+    slot_margin_fraction = 0.40  # Twice bigger margin per trade
     max_slot_notional = bal * slot_margin_fraction * lev
     risk_alloc = (0.0050 if quant_score < 0.78 else (0.0075 if quant_score < 0.85 else 0.0100)) * POSITION_SIZE_MULTIPLIER
     risk_dollars = bal * risk_alloc
@@ -661,6 +661,8 @@ def analyze_macro_universe_with_ai(market_universe: list, live_news: str, btc_re
        - For any active position showing momentum exhaustion or adverse flow, prescribe HARVEST_NOW or TIGHTEN_SL.
     5. Watchlist Applicability Audit:
        - For each pending Stage 0 limit setup: check if the original thesis holds. If market trend flipped, price ran away without fill, or order book structure deteriorated, prescribe CANCEL_INVALID to purge it. Otherwise, prescribe KEEP.
+    6. Multi-Slot Portfolio Allocation:
+       - Return 4 to 5 distinct high-conviction setups in `selected_setups` so all 4 portfolio slots can be filled simultaneously.
 
     Respond ONLY in strict JSON format:
     {{
@@ -820,6 +822,21 @@ def analyze_scalp_opportunities_with_ai(market_universe: list, btc_regime: dict,
     cap_total = capital_info.get("total", 10000.0) if capital_info else 10000.0
     cap_free = capital_info.get("free", 8000.0) if capital_info else 8000.0
 
+    btc_market_bias = ""
+    if btc_24h_pct < -0.4:
+        btc_market_bias = f"""
+    [CRITICAL MARKET REGIME DIRECTIVE: BEARISH / RED BTC ({btc_24h_pct:+.2f}%)]
+    - Bitcoin is currently red/dumping.
+    - NEVER propose LONG setups on falling altcoins. (Bid walls during red tapes are often exit liquidity / liquidation traps).
+    - PRIORITIZE SHORT setups on high-OI, ask-heavy, or breakdown altcoins in alignment with market weakness.
+    """
+    elif btc_24h_pct > 0.8:
+        btc_market_bias = f"""
+    [CRITICAL MARKET REGIME DIRECTIVE: BULLISH / GREEN BTC ({btc_24h_pct:+.2f}%)]
+    - Bitcoin is strong and rising.
+    - PRIORITIZE LONG breakout setups on high relative-strength altcoins with strong bid support.
+    """
+
     prompt = f"""
     You are the Chief High-Speed Scalp Sniper Specialist for {BOT_NAME}.
     PRIMARY OBJECTIVE:
@@ -842,6 +859,7 @@ def analyze_scalp_opportunities_with_ai(market_universe: list, btc_regime: dict,
 
     [BTC HOURLY MACRO ANCHOR]
     Regime: {btc_regime.get('regime')} | ADX: {btc_regime.get('adx')} | BTC 24h Change: {btc_24h_pct:+.2f}%
+    {btc_market_bias}
 
     [TOP LIQUID PERPETUALS FOR SCALPING]
     Format: [s: symbol, p: price, c: 24h %, v_m: volume M$, fr: funding %, oi_m: Open Interest M$, book_ratio: bid/ask depth, whale_ls_ratio: top trader long/short ratio, hi: 24h high, lo: 24h low]
@@ -860,7 +878,7 @@ def analyze_scalp_opportunities_with_ai(market_universe: list, btc_regime: dict,
 
     SCALPING PROBABILITY ASSESSMENT:
     For each setup, compute an explicit "scalp_probability" integer between 70 and 95 based on technical edge confluence, book depth skew, and market alignment.
-    Only select setups with scalp_probability >= 75.
+    Select 4 to 5 distinct top setups with scalp_probability >= 72 so all 4 concurrent scalp slots can be populated.
 
     Respond ONLY in strict JSON:
     {{
@@ -974,20 +992,22 @@ async def execute_unified_hourly_discovery_pipeline(context: ContextTypes.DEFAUL
                                 ))
                                 log_event("INFO", "BINANCE_SYNC", f"Auto-synced open Binance {b_side} position on {raw_sym}: {contracts} contracts (${pos_notional:.1f}) with SL/TP brackets.")
 
-                # Reconcile any Stage >= 1 WATCHING rows whose positions are now closed (0 contracts) on Binance
+                # Reconcile any WATCHING rows whose positions are now closed (0 contracts) on Binance, or stale Stage 0 rows in MARKET mode
                 with get_db_connection() as c_reconcile:
                     c_cur = c_reconcile.cursor()
-                    c_cur.execute("SELECT id, symbol, action, entry_limit, current_sl, partial_realized_pnl, remaining_ratio FROM watched_signals WHERE status = 'WATCHING' AND stage >= 1")
+                    c_cur.execute("SELECT id, symbol, stage, action, entry_limit, current_sl, partial_realized_pnl, remaining_ratio FROM watched_signals WHERE status = 'WATCHING'")
                     for db_pos in c_cur.fetchall():
-                        if db_pos["symbol"] not in open_live_symbols:
-                            c_reconcile.execute("""
-                                UPDATE watched_signals
-                                SET status = 'COMPLETED', remaining_ratio = 0.0, exit_reason = 'EXCHANGE_CLOSED_SYNC',
-                                    binance_sl_order_id = '', binance_tp1_id = '', binance_tp2_id = '', binance_tp3_id = '',
-                                    last_updated = CURRENT_TIMESTAMP
-                                WHERE id = ?
-                            """, (db_pos["id"],))
-                            log_event("INFO", "BINANCE_SYNC", f"Freed zombie slot {db_pos['symbol']} (position already closed on Binance).")
+                        b_sym = bridge_symbol_formats(db_pos["symbol"])["ccxt"]
+                        if db_pos["symbol"] not in open_live_symbols and b_sym not in open_live_symbols:
+                            if int(db_pos["stage"] or 0) >= 1 or (TRADE_ENTRY_TYPE == "MARKET" and SCALP_ENTRY_TYPE == "MARKET"):
+                                c_reconcile.execute("""
+                                    UPDATE watched_signals
+                                    SET status = 'COMPLETED', remaining_ratio = 0.0, exit_reason = 'EXCHANGE_CLOSED_SYNC',
+                                        binance_sl_order_id = '', binance_tp1_id = '', binance_tp2_id = '', binance_tp3_id = '',
+                                        last_updated = CURRENT_TIMESTAMP
+                                    WHERE id = ?
+                                """, (db_pos["id"],))
+                                log_event("INFO", "BINANCE_SYNC", f"Freed slot {db_pos['symbol']} (not open on Binance).")
             except Exception as e_pos:
                 if "-2015" in str(e_pos):
                     ip_addr = await asyncio.to_thread(get_outbound_ip_sync)
@@ -1320,17 +1340,15 @@ async def execute_unified_hourly_discovery_pipeline(context: ContextTypes.DEFAUL
             is_scalp = (cand.get("trade_speed") == "SCALP TRADE" or cand.get("strategy_mode") == "SCALP")
 
             # Strict Trend, Orderbook & 24h Range Room Alignment Gate (Enforced on ALL trades):
-            # Eliminates counter-trend knife-catching, overbought/oversold chasing, and buying 24h highs / shorting 24h lows
+            # Eliminates extreme overbought/oversold chasing and buying 24h highs / shorting 24h lows while allowing 3-4 clean setups
             if act == "LONG":
-                min_book = 1.15 if is_scalp else 1.10
-                near_24h_top = (chg >= 2.5 and hi_24h > 0 and curr_price >= hi_24h * 0.992)
-                if curr_price < (ema21_1h * 0.998) or rsi_1h < 46.0 or rsi_1h > 63.0 or book_ratio < min_book or btc_24h_pct < -0.50 or near_24h_top:
+                near_24h_top = (chg >= 3.5 and hi_24h > 0 and curr_price >= hi_24h * 0.993)
+                if curr_price < (ema21_1h * 0.992) or rsi_1h < 40.0 or rsi_1h > 65.0 or book_ratio < 0.82 or btc_24h_pct < -1.20 or near_24h_top:
                     log_event("INFO", "ALIGNMENT_GATE", f"Filtered LONG on {sym}: Failed alignment (Price ${curr_price:.4f} vs EMA21 ${ema21_1h:.4f}, 24h High ${hi_24h:.4f}, RSI {rsi_1h:.1f}, Book {book_ratio}x, BTC {btc_24h_pct:+.2f}%).")
                     continue
             elif act == "SHORT":
-                max_book = 0.85 if is_scalp else 0.90
-                near_24h_bottom = (chg <= -2.5 and lo_24h > 0 and curr_price <= lo_24h * 1.008)
-                if curr_price > (ema21_1h * 1.002) or rsi_1h > 53.0 or rsi_1h < 37.0 or book_ratio > max_book or btc_24h_pct > 1.00 or near_24h_bottom:
+                near_24h_bottom = (chg <= -3.5 and lo_24h > 0 and curr_price <= lo_24h * 1.007)
+                if curr_price > (ema21_1h * 1.008) or rsi_1h > 58.0 or rsi_1h < 35.0 or book_ratio > 1.22 or btc_24h_pct > 1.80 or near_24h_bottom:
                     log_event("INFO", "ALIGNMENT_GATE", f"Filtered SHORT on {sym}: Failed alignment (Price ${curr_price:.4f} vs EMA21 ${ema21_1h:.4f}, 24h Low ${lo_24h:.4f}, RSI {rsi_1h:.1f}, Book {book_ratio}x, BTC {btc_24h_pct:+.2f}%).")
                     continue
 
@@ -1387,6 +1405,7 @@ async def execute_unified_hourly_discovery_pipeline(context: ContextTypes.DEFAUL
         # 7. PRIORITIZE PROFIT: Sort all setups by Expected Profit Index descending
         processed_candidates.sort(key=lambda x: x["profit_index"], reverse=True)
 
+        watched_cnt, _ = count_active_and_daily_trades()
         emitted_count = 0
         emitted_symbols = set()
         for item in processed_candidates:

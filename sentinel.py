@@ -781,28 +781,23 @@ async def run_sentinel_cycle(session: aiohttp.ClientSession):
                 if peak_gain_pct >= 2.00 and pnl_approx >= 1.55:
                     target_floor_sl = round(entry * 1.0135, 6) if act == "LONG" else round(entry * 0.9865, 6)
                     floor_label = "🔒 SCALP_FLOOR_+1.35%"
-                elif peak_gain_pct >= 1.35 and pnl_approx >= 1.00:
+                elif peak_gain_pct >= 1.45 and pnl_approx >= 1.10:
                     target_floor_sl = round(entry * 1.0080, 6) if act == "LONG" else round(entry * 0.9920, 6)
                     floor_label = "🔒 SCALP_FLOOR_+0.80%"
-                elif peak_gain_pct >= 0.85 and pnl_approx >= 0.60:
-                    target_floor_sl = round(entry * 1.0040, 6) if act == "LONG" else round(entry * 0.9960, 6)
-                    floor_label = "🔒 SCALP_FLOOR_+0.40%"
-                elif peak_gain_pct >= 0.55 and pnl_approx >= 0.35:
-                    target_floor_sl = round(entry * 1.0018, 6) if act == "LONG" else round(entry * 0.9982, 6)
-                    floor_label = "🛡️ SCALP_BE_SHIELD_+0.18%"
+                elif peak_gain_pct >= 0.95 and pnl_approx >= 0.65:
+                    # Give trade room to reach TP1 (+1.0R); only ratchet once solid green (+0.95% peak)
+                    target_floor_sl = round(entry * 1.0035, 6) if act == "LONG" else round(entry * 0.9965, 6)
+                    floor_label = "🛡️ SCALP_PROFIT_SHIELD_+0.35%"
             else:
                 if peak_gain_pct >= 2.40 and pnl_approx >= 1.90:
                     target_floor_sl = round(entry * 1.0155, 6) if act == "LONG" else round(entry * 0.9845, 6)
                     floor_label = "🔒 PROFIT_FLOOR_+1.55%"
-                elif peak_gain_pct >= 1.65 and pnl_approx >= 1.25:
+                elif peak_gain_pct >= 1.70 and pnl_approx >= 1.30:
                     target_floor_sl = round(entry * 1.0095, 6) if act == "LONG" else round(entry * 0.9905, 6)
                     floor_label = "🔒 PROFIT_FLOOR_+0.95%"
-                elif peak_gain_pct >= 1.05 and pnl_approx >= 0.75:
-                    target_floor_sl = round(entry * 1.0050, 6) if act == "LONG" else round(entry * 0.9950, 6)
-                    floor_label = "🔒 PROFIT_FLOOR_+0.50%"
-                elif peak_gain_pct >= 0.70 and pnl_approx >= 0.45:
-                    target_floor_sl = round(entry * 1.0020, 6) if act == "LONG" else round(entry * 0.9980, 6)
-                    floor_label = "🛡️ PROFIT_BE_SHIELD_+0.20%"
+                elif peak_gain_pct >= 1.15 and pnl_approx >= 0.85:
+                    target_floor_sl = round(entry * 1.0040, 6) if act == "LONG" else round(entry * 0.9960, 6)
+                    floor_label = "🛡️ PROFIT_BE_SHIELD_+0.40%"
 
             if target_floor_sl is not None:
                 is_better_sl = (target_floor_sl > current_sl) if act == "LONG" else (target_floor_sl < current_sl)
@@ -890,8 +885,8 @@ async def run_sentinel_cycle(session: aiohttp.ClientSession):
                         with get_db_connection() as conn:
                             conn.execute("UPDATE watched_signals SET current_sl = ?, binance_sl_order_id = ?, movement_tag = ? WHERE id = ?", (current_sl, sl_order_id, tag_current, w_id))
                         log_event("INFO", "SENTINEL_DEFENSE", f"Stagnant scalp {sym} ({pnl_approx:+.2f}% after {holding_mins:.0f}m) secured at BE Stop-Loss ${current_sl:.6f}")
-                elif pnl_approx < -0.60 and holding_mins >= 240.0:
-                    # Prolonged negative stagnation (> 4 hours): Close on Binance to reclaim margin
+                elif holding_mins >= 480.0 and abs(pnl_approx) <= 0.15:
+                    # Flat tape stagnation (> 8 hours near break-even): Safely recycle capital at scratch without taking an arbitrary forced loss
                     for oid in (sl_order_id, tp1_order_id, tp2_order_id, tp3_order_id):
                         if oid:
                             await asyncio.to_thread(cancel_binance_order, sym, oid)
@@ -915,16 +910,16 @@ async def run_sentinel_cycle(session: aiohttp.ClientSession):
                         conn.execute("""
                             INSERT INTO loss_diagnostics (symbol, action, entry_price, exit_price, stop_loss_price, exit_type, holding_duration_mins, market_regime, diagnostic_reason)
                             VALUES (?, ?, ?, ?, ?, 'SCALP_STAGNATION', ?, 'SCALP_SNIPER', ?)
-                        """, (sym, act, entry, exit_price, current_sl, holding_mins, f"Scalp stalled at {pnl_approx:+.2f}% after {holding_mins:.0f}m."))
+                        """, (sym, act, entry, exit_price, current_sl, holding_mins, f"Scalp stalled at scratch {pnl_approx:+.2f}% after {holding_mins:.0f}m."))
 
                     log_event("INFO", "SENTINEL_EXIT", f"Trade {sym} {act} closed via SCALP_STAGNATION_KILL at {final_pnl:+.2f}% net after {holding_mins:.0f}m")
 
                     msg = (
-                        f"⚡ <b>SCALP STAGNATION RECYCLE ({holding_mins:.0f}m)</b>\n\n"
+                        f"⚡ <b>SCALP FLAT STAGNATION RECYCLE ({holding_mins:.0f}m)</b>\n\n"
                         f"• <b>Contract:</b> <code>{sym}</code> ({act})\n"
                         f"• <b>Exit Mark:</b> ${exit_price:.6f} (<code>{net_leg_pnl:+.2f}% net</code>)\n"
                         f"• <b>Total Realized Trade PnL:</b> <code>{final_pnl:+.2f}%</code>\n"
-                        f"🤖 <b>Prolonged drawdown recycled to protect capital.</b>"
+                        f"🤖 <b>Flat stalled trade recycled after 8+ hours.</b>"
                     )
                     await send_telegram_alert(session, msg)
                     continue

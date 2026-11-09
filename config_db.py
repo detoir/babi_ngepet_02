@@ -65,19 +65,19 @@ _raw_mode = get_env_str("TRADING_MODE", "") or get_env_str("MODE", "") or get_en
 TRADING_MODE = _raw_mode.upper()
 if TRADING_MODE not in ("LIVE", "TESTNET", "SIMULATION"):
     TRADING_MODE = "LIVE"
-POSITION_SIZE_MULTIPLIER = get_env_float("POSITION_SIZE_MULTIPLIER", 5.0)  # 5x multiplier over baseline position size/margin
-DEFAULT_LEVERAGE = max(get_env_int("DEFAULT_LEVERAGE", 10), 10)  # 10x min leverage so 3-4 trades fit in $19 margin
-SCALP_LEVERAGE = max(get_env_int("SCALP_LEVERAGE", 12), 10)    # 12x leverage for scalps so 3-4 trades fit in $19 margin
+POSITION_SIZE_MULTIPLIER = get_env_float("POSITION_SIZE_MULTIPLIER", 10.0)  # 10x multiplier (2x bigger margin per trade)
+DEFAULT_LEVERAGE = max(get_env_int("DEFAULT_LEVERAGE", 12), 10)  # 12x leverage so 3-4 trades fit comfortably in $19 margin
+SCALP_LEVERAGE = max(get_env_int("SCALP_LEVERAGE", 12), 12)    # 12x leverage for scalps so 3-4 trades fit in $19 margin
 SCALP_ENTRY_TYPE = get_env_str("SCALP_ENTRY_TYPE", "MARKET").upper()  # MARKET by default so SL and TP brackets attach immediately on trade send
 TRADE_ENTRY_TYPE = get_env_str("TRADE_ENTRY_TYPE", "MARKET").upper()  # MARKET by default so SL and TP brackets attach immediately on trade send
-MAX_CORRELATED_POSITIONS_PER_SIDE = max(get_env_int("MAX_CORRELATED_POSITIONS_PER_SIDE", 3), 3)
-MAX_CORRELATED_SCALPS_PER_SIDE = max(get_env_int("MAX_CORRELATED_SCALPS_PER_SIDE", 3), 3)  # Allow up to 3 scalps per side
+MAX_CORRELATED_POSITIONS_PER_SIDE = max(get_env_int("MAX_CORRELATED_POSITIONS_PER_SIDE", 4), 4)
+MAX_CORRELATED_SCALPS_PER_SIDE = max(get_env_int("MAX_CORRELATED_SCALPS_PER_SIDE", 4), 4)  # Allow all 4 slots to trade in trend direction
 
 # Risk & Gate Parameters
 MIN_RRR = get_env_float("MIN_RRR", 1.8)
-CONFIDENCE_THRESHOLD = get_env_float("CONFIDENCE_THRESHOLD", 0.75)
+CONFIDENCE_THRESHOLD = get_env_float("CONFIDENCE_THRESHOLD", 0.70)
 MAX_24H_LOSS_THRESHOLD = get_env_float("MAX_24H_LOSS_THRESHOLD", -25.0)
-MAX_CONCURRENT_POSITIONS = max(get_env_int("MAX_CONCURRENT_POSITIONS", 4), 4)  # Allow 3-4 concurrent positions
+MAX_CONCURRENT_POSITIONS = max(get_env_int("MAX_CONCURRENT_POSITIONS", 4), 4)  # Allow 4 concurrent positions
 MAX_DAILY_TRADES = get_env_int("MAX_DAILY_TRADES", 999999)  # Fully uncapped by default
 ACCOUNT_BALANCE_SIMULATED = get_env_float("ACCOUNT_BALANCE_SIM", 10000.0)
 
@@ -668,19 +668,31 @@ def place_binance_market_entry(symbol: str, side: str, qty_usd: float, leverage:
             )
         except Exception as e_inner:
             if "-2019" in str(e_inner) or "margin is insufficient" in str(e_inner).lower():
-                # Auto-scale leverage up to 15x or clamp to 85% of free margin so 5x sized trades never fail
-                boost_lev = max(lev * 2, 12)
+                # Auto-scale leverage up to 15x-20x and size to remaining free margin so 3rd/4th trades always succeed
+                boost_lev = max(lev, 15)
                 set_symbol_leverage_and_margin(target_sym, boost_lev)
                 cap = fetch_current_account_capital()
                 free_usd = float(cap.get("free", 0.0))
-                safe_qty_usd = min(qty_usd, free_usd * boost_lev * 0.85) if free_usd > 0 else (qty_usd * 0.6)
+                safe_qty_usd = min(qty_usd, free_usd * boost_lev * 0.75) if free_usd > 0.5 else 15.0
+                safe_qty_usd = max(safe_qty_usd, 6.0)
                 formatted_qty = format_order_quantity(target_sym, safe_qty_usd, price)
-                order = exchange.create_order(
-                    symbol=target_sym,
-                    type="MARKET",
-                    side=order_side,
-                    amount=formatted_qty
-                )
+                try:
+                    order = exchange.create_order(
+                        symbol=target_sym,
+                        type="MARKET",
+                        side=order_side,
+                        amount=formatted_qty
+                    )
+                except Exception:
+                    # Final minimum-notional ($12) fallback at 20x leverage (~$0.60 margin)
+                    set_symbol_leverage_and_margin(target_sym, 20)
+                    formatted_qty = format_order_quantity(target_sym, 12.0, price)
+                    order = exchange.create_order(
+                        symbol=target_sym,
+                        type="MARKET",
+                        side=order_side,
+                        amount=formatted_qty
+                    )
             else:
                 raise e_inner
         order_id = str(order.get("id"))
