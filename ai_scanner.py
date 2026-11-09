@@ -81,6 +81,7 @@ from config_db import (
     cancel_binance_order,
     emergency_binance_market_close,
     get_symbol_min_qty,
+    safe_amount_to_precision,
     format_order_quantity,
     parse_database_timestamp,
     utc_now,
@@ -610,11 +611,74 @@ def analyze_macro_universe_with_ai(market_universe: list, live_news: str, btc_re
 
     prompt = f"""
     You are the Chief Quantitative Strategist & Portfolio Risk Sentinel for {BOT_NAME}.
-    PRIMARY OBJECTIVES:
-    1. Maximize Positive Expected Value (+EV) by synthesizing Global Financial News, Central Bank Catalysts, and Order Flow Microstructure.
-    2. Adapt strategy dynamically: Unleash TREND_MOMENTUM on institutional weekdays, enforce SWEEP_REVERSION / fast scalp harvesting during Chop/Weekends.
-    3. Defend active positions: Detect sudden macro shock reversals and order book flips.
-    4. Audit pending watchlist limit orders: Verify whether unfilled limit orders are still technically/fundamentally applicable or should be cancelled to free capital.
+
+    ======================================================================
+    INSTITUTIONAL ARCHITECTURE & TRADING PRINCIPLES:
+    ======================================================================
+    1. MARKET REGIME CLASSIFICATION:
+       Classify the current macro environment into exactly one of:
+       - TREND_UP
+       - TREND_DOWN
+       - CHOP
+       - BREAKOUT
+       - HIGH_VOLATILITY
+       - MACRO_SHOCK
+       - LIQUIDITY_STRESS
+       Provide: classification, confidence (0.00-1.00), evidence, and invalidation conditions.
+
+    2. STRATEGY SELECTION BY REGIME:
+       - TREND_UP / TREND_DOWN: Prefer TREND_MOMENTUM with directional conviction.
+       - CHOP: Prefer SWEEP_REVERSION or quick mean-reversion setups at range boundaries.
+       - BREAKOUT: Require clear volume thrust and book depth backing.
+       - HIGH_VOLATILITY: Moderate position risk and widen execution tolerances.
+       - MACRO_SHOCK: Suspend counter-trend directional trades; prioritize protection of existing positions.
+       - LIQUIDITY_STRESS: Avoid aggressive limit chasing; demand tight spreads.
+       (Weekday/weekend cycle influences regime, but MUST NOT override real order-flow or market structure evidence).
+
+    3. SIGNAL CONFLUENCE & ACTIVE DISCOVERY:
+       Synthesize agreement across independent signal groups:
+       - Market Structure (24h high/low bounds, breakout levels)
+       - Momentum (impulse velocity, RSI trajectory, BTC alignment)
+       - Order Flow Microstructure (Bid/Ask depth skew, top trader L/S ratio, funding rate)
+       - Macro/News Catalysts
+       Explicitly identify contradictory signals. Actively identify and output high-conviction +EV setups that satisfy confluence to fill available portfolio slots.
+
+    4. POSITION MANAGEMENT:
+       For every active position evaluate:
+       - Thesis still valid? Momentum deterioration? Order-book reversal?
+       - Volatility expansion? Macro shock? Profit protection?
+       Return exactly one recommendation:
+       - HOLD: Thesis intact, allow setup to mature.
+       - REDUCE: Momentum stalling or partial risk-off, bank 50% partial profit.
+       - EXIT: Thesis invalidated or order book flipped against us, market close immediately.
+       - MOVE_STOP: Accrued profit protection, move SL to break-even or tighter level.
+       - TAKE_PARTIAL_PROFIT: Bank early milestone gains on impulse exhaustion.
+
+    5. PENDING ORDER AUDIT:
+       For every unfilled Stage 0 limit order evaluate:
+       - Signal freshness, regime changes, price displacement, order-flow shifts.
+       Return:
+       - KEEP: Setup remains technically valid.
+       - MODIFY: Limit entry needs minor level adjustment.
+       - CANCEL: Thesis materially invalidated or price displaced without fill.
+
+    6. EXECUTION GUARDRAILS:
+       - Evaluate spread, slippage, order-book depth, funding rates, and volatility.
+       - Reject setups where adverse fees or poor liquidity eliminate expected edge.
+
+    7. DECISION HIERARCHY:
+       1. System/data integrity
+       2. Portfolio risk & margin allocation
+       3. Existing-position protection & profit harvest
+       4. Macro/event risk
+       5. Market regime classification
+       6. Signal confluence
+       7. Execution conditions
+       8. New opportunity capture
+
+    8. DATA INTEGRITY:
+       Never fabricate missing market, news, order-book, indicator, or portfolio data.
+       If critical data for a coin is missing, disqualify that candidate.
 
     [CURRENT ACCOUNT CAPITAL & MARGIN CAPACITY]
     • Total Balance: ${cap_total:.2f} USD | Free Margin: ${cap_free:.2f} USD | Mode: {cap_mode}
@@ -627,7 +691,7 @@ def analyze_macro_universe_with_ai(market_universe: list, live_news: str, btc_re
     
     {live_news}
 
-    [ACTIVE POSITIONS - REVERSAL AUDIT]
+    [ACTIVE POSITIONS - DEFENSE & REVERSAL AUDIT]
     Format: [symbol, action, entry, curr_price, pnl_pct, peak_gain_pct, pullback_from_peak]
     {active_pos_section}
 
@@ -645,27 +709,17 @@ def analyze_macro_universe_with_ai(market_universe: list, live_news: str, btc_re
     [RECENT POST-MORTEM LESSONS]
     {lessons}
 
-    ======================================================================
-    EXECUTION & RISK DIRECTIVE:
-    ======================================================================
-    1. Macro & News Alignment:
-       - If High-Impact Catalysts (FOMC/CPI/War) are detected or BTC < -0.8%, focus on SHORT relative weakness altcoins.
-       - Disqualify long breakouts when broader financial markets or crypto are in risk-off mode.
-    2. Adaptive Strategy Mode:
-       - Trending weekdays (ADX >= 25): Select TREND_MOMENTUM with BEARISH DOWNTREND or BULLISH UPTREND.
-       - Ranging / Chop (ADX < 22) or Weekends: Select SWEEP_REVERSION with NEUTRAL CONSOLIDATION.
-    3. Traps to Disqualify:
-       - No longs when BTC is red.
-       - No shorts if the asset has already dumped > -10% in 24h (capitulation wick risk).
-    4. Sudden Reversal Management:
-       - For any active position showing momentum exhaustion or adverse flow, prescribe HARVEST_NOW or TIGHTEN_SL.
-    5. Watchlist Applicability Audit:
-       - For each pending Stage 0 limit setup: check if the original thesis holds. If market trend flipped, price ran away without fill, or order book structure deteriorated, prescribe CANCEL_INVALID to purge it. Otherwise, prescribe KEEP.
-    6. Multi-Slot Portfolio Allocation:
-       - Return 4 to 5 distinct high-conviction setups in `selected_setups` so all 4 portfolio slots can be filled simultaneously.
+    Multi-Slot Portfolio Allocation:
+    Return 4 to 5 distinct high-conviction setups in `selected_setups` with valid confluence so available portfolio slots can be filled.
 
     Respond ONLY in strict JSON format:
     {{
+        "market_regime": {{
+            "classification": "TREND_UP" | "TREND_DOWN" | "CHOP" | "BREAKOUT" | "HIGH_VOLATILITY" | "MACRO_SHOCK" | "LIQUIDITY_STRESS",
+            "confidence": 0.85,
+            "evidence": "1-sentence summary of order-flow/volatility/news evidence",
+            "invalidation_conditions": "1-sentence invalidation trigger"
+        }},
         "action": "TRADE" | "HOLD",
         "selected_setups": [
             {{
@@ -674,20 +728,22 @@ def analyze_macro_universe_with_ai(market_universe: list, live_news: str, btc_re
                 "strategy_mode": "TREND_MOMENTUM" | "SWEEP_REVERSION",
                 "trade_speed": "FAST TRADE" | "SLOW TRADE",
                 "coin_trend": "BULLISH UPTREND" | "BEARISH DOWNTREND" | "NEUTRAL CONSOLIDATION",
+                "confluence_signals": "1-sentence noting agreement between momentum, orderbook, and structure",
+                "contradictory_signals": "None or 1-sentence noting any friction",
                 "strategic_thesis": "1-sentence explicit technical/news/funding edge"
             }}
         ],
         "active_position_directives": [
             {{
                 "symbol": "SYMBOL/USDT:USDT",
-                "verdict": "HOLD" | "TIGHTEN_SL" | "HARVEST_NOW",
+                "verdict": "HOLD" | "REDUCE" | "EXIT" | "MOVE_STOP" | "TAKE_PARTIAL_PROFIT",
                 "reason": "1-sentence explanation"
             }}
         ],
         "watchlist_directives": [
             {{
                 "symbol": "SYMBOL/USDT:USDT",
-                "verdict": "KEEP" | "CANCEL_INVALID",
+                "verdict": "KEEP" | "MODIFY" | "CANCEL",
                 "reason": "1-sentence explanation why setup remains valid or is invalidated"
             }}
         ],
@@ -782,14 +838,14 @@ def analyze_whale_microstructure_with_ai(market_universe: list, btc_regime: dict
         "active_position_directives": [
             {{
                 "symbol": "SYMBOL/USDT:USDT",
-                "verdict": "HOLD" | "TIGHTEN_SL" | "HARVEST_NOW",
+                "verdict": "HOLD" | "REDUCE" | "EXIT" | "MOVE_STOP" | "TAKE_PARTIAL_PROFIT",
                 "reason": "1-sentence explanation"
             }}
         ],
         "watchlist_directives": [
             {{
                 "symbol": "SYMBOL/USDT:USDT",
-                "verdict": "KEEP" | "CANCEL_INVALID",
+                "verdict": "KEEP" | "MODIFY" | "CANCEL",
                 "reason": "1-sentence explanation"
             }}
         ],
@@ -1128,7 +1184,15 @@ async def execute_unified_hourly_discovery_pipeline(context: ContextTypes.DEFAUL
 
         macro_decision, whale_decision, scalp_decision = await asyncio.gather(macro_task, whale_task, scalp_task)
 
-        # 5. Apply AI Watchlist Applicability Directives (Purge Invalid Pending Setups)
+        # 5. Market Regime Logging
+        market_regime_info = macro_decision.get("market_regime", {})
+        if market_regime_info:
+            reg_name = market_regime_info.get("classification", regime_str)
+            reg_conf = float(market_regime_info.get("confidence") or 0.85)
+            reg_ev = market_regime_info.get("evidence", "")
+            log_event("INFO", "AI_REGIME", f"Institutional Market Regime: {reg_name} (Conf: {reg_conf:.2f}). Evidence: {reg_ev}")
+
+        # 6. Apply AI Watchlist Applicability Directives (Stage 0 Audit)
         all_watchlist_directives = (
             macro_decision.get("watchlist_directives", []) +
             whale_decision.get("watchlist_directives", [])
@@ -1138,7 +1202,7 @@ async def execute_unified_hourly_discovery_pipeline(context: ContextTypes.DEFAUL
             w_sym = w_dir.get("symbol")
             w_verdict = str(w_dir.get("verdict") or "KEEP").upper()
             w_reason = w_dir.get("reason", "")
-            if not w_sym or w_verdict != "CANCEL_INVALID":
+            if not w_sym or w_verdict not in ("CANCEL", "CANCEL_INVALID"):
                 continue
 
             match_pending = next((p for p in pending_watchlist_payload if p["symbol"] == w_sym), None)
@@ -1156,7 +1220,7 @@ async def execute_unified_hourly_discovery_pipeline(context: ContextTypes.DEFAUL
                     WHERE id = ?
                 """, (match_pending["id"],))
 
-            log_event("INFO", "AI_WATCHLIST", f"Pending setup {w_sym} cancelled by AI audit: {w_reason}")
+            log_event("INFO", "AI_WATCHLIST", f"Pending setup {w_sym} cancelled by AI audit ({w_verdict}): {w_reason}")
             if chat_id and context:
                 msg = (
                     f"🚫 <b>WATCHLIST AUDIT: SETUP CANCELLED</b>\n\n"
@@ -1170,7 +1234,7 @@ async def execute_unified_hourly_discovery_pipeline(context: ContextTypes.DEFAUL
                 except Exception:
                     pass
 
-        # 6. Apply AI Active Position Sudden Reversal & Profit Management Directives
+        # 7. Apply Institutional Position Defense Directives (HOLD, REDUCE, EXIT, MOVE_STOP, TAKE_PARTIAL_PROFIT)
         all_reversal_directives = (
             macro_decision.get("active_position_directives", []) +
             whale_decision.get("active_position_directives", [])
@@ -1178,7 +1242,7 @@ async def execute_unified_hourly_discovery_pipeline(context: ContextTypes.DEFAUL
 
         for directive in all_reversal_directives:
             d_sym = directive.get("symbol")
-            d_verdict = directive.get("verdict", "HOLD").upper()
+            d_verdict = str(directive.get("verdict") or "HOLD").upper()
             d_reason = directive.get("reason", "")
             if not d_sym or d_verdict == "HOLD":
                 continue
@@ -1187,37 +1251,81 @@ async def execute_unified_hourly_discovery_pipeline(context: ContextTypes.DEFAUL
             if not match_pos:
                 continue
 
-            if d_verdict == "HARVEST_NOW" and match_pos["pnl_pct"] >= 0.65:
-                # Emergency Harvest (only when net profit comfortably exceeds exchange fees)
+            # EXIT / HARVEST_NOW: Full emergency exit on thesis invalidation or momentum collapse
+            if d_verdict in ("EXIT", "HARVEST_NOW"):
+                if match_pos["pnl_pct"] >= 0.50 or any(k in d_reason.upper() for k in ["REVERSAL", "SHOCK", "INVALID", "FLIP", "COLLAPSE"]):
+                    if match_pos["sl_order_id"]:
+                        await asyncio.to_thread(cancel_binance_order, match_pos["symbol"], match_pos["sl_order_id"])
+                    if match_pos.get("tp1_order_id"):
+                        await asyncio.to_thread(cancel_binance_order, match_pos["symbol"], match_pos["tp1_order_id"])
+                    if TRADING_MODE in ("LIVE", "TESTNET"):
+                        close_qty = match_pos["executed_qty"] * match_pos["remaining_ratio"]
+                        if close_qty > 0:
+                            await asyncio.to_thread(emergency_binance_market_close, match_pos["symbol"], match_pos["action"], close_qty)
+
+                    net_leg_pnl = match_pos["pnl_pct"] - ROUND_TRIP_FEE_PCT
+                    final_pnl = round(match_pos["partial_realized_pnl"] + (match_pos["remaining_ratio"] * net_leg_pnl), 2)
+                    with get_db_connection() as conn:
+                        conn.execute("UPDATE watched_signals SET status = 'COMPLETED', realized_pnl = ?, remaining_ratio = 0.0, exit_reason = 'AI_DEFENSE_EXIT', movement_tag = '🎯 AI_DEFENSE_EXIT', last_updated = CURRENT_TIMESTAMP WHERE id = ?", (final_pnl, match_pos["id"]))
+
+                    log_event("INFO", "AI_DEFENSE", f"Position exited on {d_sym} ({d_verdict}): {final_pnl:+.2f}% net. Reason: {d_reason}")
+                    if chat_id and context:
+                        msg = (
+                            f"🛡️ <b>AI DEFENSE: POSITION EXIT ({d_verdict})</b>\n\n"
+                            f"• <b>Contract:</b> <code>{match_pos['symbol']}</code> ({match_pos['action']})\n"
+                            f"• <b>Exit Mark:</b> ${match_pos['curr_price']:.6f} (<code>{net_leg_pnl:+.2f}% net</code>)\n"
+                            f"• <b>Total Realized Trade PnL:</b> <code>{final_pnl:+.2f}%</code>\n"
+                            f"• <b>AI Diagnostic:</b> <i>{html.escape(d_reason)}</i>\n"
+                            f"🤖 <b>Closed immediately on Binance to defend capital.</b>"
+                        )
+                        try:
+                            await context.bot.send_message(chat_id=int(chat_id), text=msg, parse_mode="HTML")
+                        except Exception:
+                            pass
+
+            # REDUCE / TAKE_PARTIAL_PROFIT: Bank 50% partial profits and move stop to break-even
+            elif d_verdict in ("REDUCE", "TAKE_PARTIAL_PROFIT") and match_pos["pnl_pct"] >= 0.45 and match_pos["remaining_ratio"] > 0.50:
+                reduce_ratio = 0.50
+                reduce_qty = safe_amount_to_precision(match_pos["symbol"], match_pos["executed_qty"] * reduce_ratio)
+                if reduce_qty > 0 and TRADING_MODE in ("LIVE", "TESTNET"):
+                    await asyncio.to_thread(emergency_binance_market_close, match_pos["symbol"], match_pos["action"], reduce_qty)
+                
+                net_partial_pnl = match_pos["pnl_pct"] - ROUND_TRIP_FEE_PCT
+                accrued_pnl = round(match_pos["partial_realized_pnl"] + (reduce_ratio * net_partial_pnl), 2)
+                new_remaining = round(match_pos["remaining_ratio"] - reduce_ratio, 2)
+                
+                # Move stop to break-even on the remaining half
+                be_sl = round(match_pos["entry"] * 1.0015, 6) if match_pos["action"] == "LONG" else round(match_pos["entry"] * 0.9985, 6)
                 if match_pos["sl_order_id"]:
                     await asyncio.to_thread(cancel_binance_order, match_pos["symbol"], match_pos["sl_order_id"])
-                if match_pos.get("tp1_order_id"):
-                    await asyncio.to_thread(cancel_binance_order, match_pos["symbol"], match_pos["tp1_order_id"])
-                if TRADING_MODE in ("LIVE", "TESTNET"):
-                    await asyncio.to_thread(emergency_binance_market_close, match_pos["symbol"], match_pos["action"], match_pos["executed_qty"])
+                new_sl_id = ""
+                rem_qty = safe_amount_to_precision(match_pos["symbol"], match_pos["executed_qty"] * new_remaining)
+                if rem_qty > 0 and TRADING_MODE in ("LIVE", "TESTNET"):
+                    new_sl_id = await asyncio.to_thread(place_binance_stop_loss, match_pos["symbol"], match_pos["action"], rem_qty, be_sl)
 
-                net_leg_pnl = match_pos["pnl_pct"] - ROUND_TRIP_FEE_PCT
-                final_pnl = round(match_pos["partial_realized_pnl"] + (match_pos["remaining_ratio"] * net_leg_pnl), 2)
                 with get_db_connection() as conn:
-                    conn.execute("UPDATE watched_signals SET status = 'COMPLETED', realized_pnl = ?, remaining_ratio = 0.0, exit_reason = 'AI_REVERSAL_HARVEST', movement_tag = '🎯 AI_REVERSAL_HARVEST', last_updated = CURRENT_TIMESTAMP WHERE id = ?", (final_pnl, match_pos["id"]))
+                    conn.execute("""
+                        UPDATE watched_signals 
+                        SET remaining_ratio = ?, partial_realized_pnl = ?, current_sl = ?, binance_sl_order_id = ?, movement_tag = '💰 AI_PARTIAL_HARVEST', last_updated = CURRENT_TIMESTAMP 
+                        WHERE id = ? AND status = 'WATCHING'
+                    """, (new_remaining, accrued_pnl, be_sl, new_sl_id, match_pos["id"]))
 
-                log_event("INFO", "AI_REVERSAL", f"Emergency profit harvested on {d_sym}: {final_pnl:+.2f}% net. Reason: {d_reason}")
+                log_event("INFO", "AI_DEFENSE", f"Partial 50% harvested on {d_sym} ({d_verdict}): {net_partial_pnl:+.2f}%. Remaining: {new_remaining*100:.0f}%. Reason: {d_reason}")
                 if chat_id and context:
                     msg = (
-                        f"💰 <b>AI PROFIT HARVEST: REVERSAL DEFENSE</b>\n\n"
+                        f"💰 <b>AI PROFIT BANK: PARTIAL HARVEST ({d_verdict})</b>\n\n"
                         f"• <b>Contract:</b> <code>{match_pos['symbol']}</code> ({match_pos['action']})\n"
-                        f"• <b>Exit Mark:</b> ${match_pos['curr_price']:.6f} (<code>{net_leg_pnl:+.2f}% net</code>)\n"
-                        f"• <b>Total Realized Trade PnL:</b> <code>{final_pnl:+.2f}%</code>\n"
-                        f"• <b>AI Diagnostic:</b> <i>{html.escape(d_reason)}</i>\n"
-                        f"🤖 <b>Closed immediately on Binance to protect profit.</b>"
+                        f"• <b>Harvest PnL:</b> <code>{net_partial_pnl:+.2f}%</code> (Secured: <code>{accrued_pnl:+.2f}%</code>)\n"
+                        f"• <b>Remaining Size:</b> {new_remaining*100:.0f}% (SL moved to ${be_sl:.6f})\n"
+                        f"• <b>Reason:</b> <i>{html.escape(d_reason)}</i>"
                     )
                     try:
                         await context.bot.send_message(chat_id=int(chat_id), text=msg, parse_mode="HTML")
                     except Exception:
                         pass
 
-            elif d_verdict == "TIGHTEN_SL" and match_pos["pnl_pct"] >= 0.60:
-                # Tighten SL to Break-Even+Profit (+0.20%) once trade is at least +0.60% in profit
+            # MOVE_STOP / TIGHTEN_SL: Dynamic stop tightening to break-even + profit
+            elif d_verdict in ("MOVE_STOP", "TIGHTEN_SL") and match_pos["pnl_pct"] >= 0.55:
                 tighter_sl = round(match_pos["entry"] * 1.0020, 6) if match_pos["action"] == "LONG" else round(match_pos["entry"] * 0.9980, 6)
                 is_better = (tighter_sl > match_pos["current_sl"]) if match_pos["action"] == "LONG" else (tighter_sl < match_pos["current_sl"])
                 is_safe_side = (match_pos["curr_price"] >= tighter_sl * 1.0020) if match_pos["action"] == "LONG" else (match_pos["curr_price"] <= tighter_sl * 0.9980)
@@ -1225,13 +1333,14 @@ async def execute_unified_hourly_discovery_pipeline(context: ContextTypes.DEFAUL
                     if match_pos["sl_order_id"]:
                         await asyncio.to_thread(cancel_binance_order, match_pos["symbol"], match_pos["sl_order_id"])
                     new_sl_id = ""
-                    if TRADING_MODE in ("LIVE", "TESTNET"):
-                        new_sl_id = await asyncio.to_thread(place_binance_stop_loss, match_pos["symbol"], match_pos["action"], match_pos["executed_qty"], tighter_sl)
+                    rem_qty = safe_amount_to_precision(match_pos["symbol"], match_pos["executed_qty"] * match_pos["remaining_ratio"])
+                    if rem_qty > 0 and TRADING_MODE in ("LIVE", "TESTNET"):
+                        new_sl_id = await asyncio.to_thread(place_binance_stop_loss, match_pos["symbol"], match_pos["action"], rem_qty, tighter_sl)
 
                     with get_db_connection() as conn:
                         conn.execute("UPDATE watched_signals SET current_sl = ?, binance_sl_order_id = ?, movement_tag = '🛡️ AI_TIGHTENED_SL', last_updated = CURRENT_TIMESTAMP WHERE id = ? AND status = 'WATCHING'", (tighter_sl, new_sl_id, match_pos["id"]))
 
-                    log_event("INFO", "AI_REVERSAL", f"Stop-Loss tightened on {d_sym} to ${tighter_sl:.6f}. Reason: {d_reason}")
+                    log_event("INFO", "AI_DEFENSE", f"Stop-Loss tightened on {d_sym} ({d_verdict}) to ${tighter_sl:.6f}. Reason: {d_reason}")
 
         # 7. Profit Prioritization & Candidate Ranking Engine
         raw_candidates = []
