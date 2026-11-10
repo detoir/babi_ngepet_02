@@ -318,16 +318,16 @@ async def run_sentinel_cycle(session: aiohttp.ClientSession):
                 if is_scalp_trade:
                     speed_badge = "⚡ SCALP SNIPER"
                     tp_display = (
-                        f"   • TP1 (50% Size): <code>${t1:.6f}</code> (+1.0R) {'✅' if new_tp1_id else ''}\n"
-                        f"   • TP2 (25% Size): <code>${t2:.6f}</code> (+2.0R) {'✅' if new_tp2_id else ''}\n"
-                        f"   • TP3 (25% Size): <code>${t3:.6f}</code> (+3.2R) {'✅' if new_tp3_id else ''}"
+                        f"   • TP1 (30% Size): <code>${t1:.6f}</code> (+1.2R) {'✅' if new_tp1_id else ''}\n"
+                        f"   • TP2 (35% Size): <code>${t2:.6f}</code> (+2.2R) {'✅' if new_tp2_id else ''}\n"
+                        f"   • TP3 (35% Size): <code>${t3:.6f}</code> (+3.5R) {'✅' if new_tp3_id else ''}"
                     )
                 else:
                     speed_badge = "🚀 FAST TRADE" if speed_tag == "FAST TRADE" else "⏳ SLOW TRADE"
                     tp_display = (
-                        f"   • TP1 (50% Size): <code>${t1:.6f}</code> (+1.2R) {'✅' if new_tp1_id else ''}\n"
-                        f"   • TP2 (25% Size): <code>${t2:.6f}</code> (+2.0R) {'✅' if new_tp2_id else ''}\n"
-                        f"   • TP3 (25% Size): <code>${t3:.6f}</code> (+3.2R) {'✅' if new_tp3_id else ''}"
+                        f"   • TP1 (30% Size): <code>${t1:.6f}</code> (+1.3R) {'✅' if new_tp1_id else ''}\n"
+                        f"   • TP2 (35% Size): <code>${t2:.6f}</code> (+2.2R) {'✅' if new_tp2_id else ''}\n"
+                        f"   • TP3 (35% Size): <code>${t3:.6f}</code> (+3.5R) {'✅' if new_tp3_id else ''}"
                     )
 
                 exec_mode_tag = f"🤖 [AUTO-{TRADING_MODE}]" if TRADING_MODE in ("LIVE", "TESTNET") else "📋 [SIMULATION]"
@@ -511,28 +511,28 @@ async def run_sentinel_cycle(session: aiohttp.ClientSession):
 
             if is_scalp_trade:
                 regime_label = "⚡ HIGH-SPEED SCALP SNIPER"
-                reversal_min_gain = 0.85      # Protect early scalp winners once +0.85% gain is achieved
-                reversal_pullback_threshold = 0.45  # Harvest if pullback exceeds 0.45% from peak
+                reversal_min_gain = 1.35      # Allow trade to reach TP1 (+1.2R) before reversal harvest engages
+                reversal_pullback_threshold = 0.55  # Harvest if pullback exceeds 0.55% from peak
                 stagnation_limit_mins = 120.0
             elif is_weekend:
                 regime_label = "WEEKEND ANOMALY"
-                reversal_min_gain = 1.05
-                reversal_pullback_threshold = 0.50
+                reversal_min_gain = 1.25
+                reversal_pullback_threshold = 0.55
                 stagnation_limit_mins = 90.0
             elif is_sideways:
                 regime_label = "SIDEWAYS CHOP"
-                reversal_min_gain = 1.10
-                reversal_pullback_threshold = 0.55
+                reversal_min_gain = 1.30
+                reversal_pullback_threshold = 0.60
                 stagnation_limit_mins = 120.0
             else:
                 regime_label = "TRENDING MOMENTUM"
-                reversal_min_gain = 1.35
-                reversal_pullback_threshold = 0.65
+                reversal_min_gain = 1.50
+                reversal_pullback_threshold = 0.70
                 stagnation_limit_mins = STAGNATION_MINS  # 180.0
 
             # ------------------------------------------------------------------
             # STEP 3.1: TAKE-PROFIT EXECUTION (Check Resting Binance TP Orders & Targets FIRST)
-            # Scale out: 50% at TP1 -> 25% at TP2 -> 25% at TP3 (or 100% at TP1 if position is minimum lot)
+            # Scale out: 30% at TP1 -> 35% at TP2 -> 35% at TP3 (or 100% at TP1 if position is minimum lot)
             # ------------------------------------------------------------------
             if stage == 1:
                 tp1_order_filled = False
@@ -549,7 +549,7 @@ async def run_sentinel_cycle(session: aiohttp.ClientSession):
                     min_lot = get_symbol_min_qty(sym)
                     tp1_q_est, tp2_q_est, _ = split_tp_quantities(sym, executed_qty)
                     is_single_min_lot = (executed_qty > 0 and tp2_q_est <= 0.0)
-                    tp1_close_ratio = 1.0 if is_single_min_lot else 0.50
+                    tp1_close_ratio = 1.0 if is_single_min_lot else 0.30
 
                     raw_leg_pnl = ((tp1_fill_price - entry) / entry * 100.0) if act == "LONG" else ((entry - tp1_fill_price) / entry * 100.0)
                     net_leg_pnl = raw_leg_pnl - ROUND_TRIP_FEE_PCT
@@ -622,14 +622,14 @@ async def run_sentinel_cycle(session: aiohttp.ClientSession):
                     sl_order_id = new_sl_id
                     tp1_order_id = ""
                     tp2_order_id = new_tp2_id
-                    tp1_badge = "(+1.0R SCALP TP1)" if is_scalp_trade else "(+1.2R)"
+                    tp1_badge = "(+1.2R SCALP TP1)" if is_scalp_trade else "(+1.3R)"
                     msg = (
-                        f"🎯 <b>TP 1 HIT {tp1_badge} — 50% POSITION BANKED</b>\n\n"
+                        f"🎯 <b>TP 1 HIT {tp1_badge} — 30% POSITION BANKED</b>\n\n"
                         f"• <b>Contract:</b> <code>{sym}</code> ({act})\n"
                         f"• <b>Fill Price:</b> ${tp1_fill_price:.6f} (<code>{net_leg_pnl:+.2f}% net</code>)\n"
                         f"• <b>Banked on Leg:</b> <code>+{tp1_gain:.2f}%</code>\n\n"
                         f"🤖 <b>AUTOMATED ACTIONS EXECUTED:</b>\n"
-                        f"1. <b>Closed 50% of position</b> on Binance.\n"
+                        f"1. <b>Closed 30% of position</b> on Binance.\n"
                         f"2. <b>Locked Stop-Loss at: ${current_sl:.6f}</b>.\n"
                         f"3. <b>Active Limit TP2 at: ${t2:.6f}</b>."
                     )
@@ -719,7 +719,7 @@ async def run_sentinel_cycle(session: aiohttp.ClientSession):
                     tp2_order_id = ""
                     tp3_order_id = new_tp3_id
                     msg = (
-                        f"🎯🎯 <b>TP 2 HIT (+2.0R) — 75% TOTAL POSITION BANKED</b>\n\n"
+                        f"🎯🎯 <b>TP 2 HIT (+2.2R) — 65% TOTAL POSITION BANKED</b>\n\n"
                         f"• <b>Contract:</b> <code>{sym}</code> ({act})\n"
                         f"• <b>Fill Price:</b> ${tp2_fill_price:.6f} (<code>{net_leg_pnl:+.2f}% net</code>)\n"
                         f"• <b>Banked on Leg:</b> <code>+{tp2_gain:.2f}%</code>\n\n"
@@ -760,7 +760,7 @@ async def run_sentinel_cycle(session: aiohttp.ClientSession):
                             WHERE id = ?
                         """, (final_pnl, w_id))
                     msg = (
-                        f"🏆 <b>FULL TAKE-PROFIT ACHIEVED (+3.2R)!</b>\n\n"
+                        f"🏆 <b>FULL TAKE-PROFIT ACHIEVED (+3.5R)!</b>\n\n"
                         f"• <b>Contract:</b> <code>{sym}</code> ({act})\n"
                         f"• <b>Final Fill:</b> ${tp3_fill_price:.6f}\n"
                         f"• <b>Total Net Trade Return:</b> <code>{final_pnl:+.2f}%</code>\n\n"
@@ -778,16 +778,16 @@ async def run_sentinel_cycle(session: aiohttp.ClientSession):
             floor_label = None
 
             if is_scalp_trade:
-                if peak_gain_pct >= 2.00 and pnl_approx >= 1.55:
-                    target_floor_sl = round(entry * 1.0135, 6) if act == "LONG" else round(entry * 0.9865, 6)
-                    floor_label = "🔒 SCALP_FLOOR_+1.35%"
-                elif peak_gain_pct >= 1.45 and pnl_approx >= 1.10:
-                    target_floor_sl = round(entry * 1.0080, 6) if act == "LONG" else round(entry * 0.9920, 6)
-                    floor_label = "🔒 SCALP_FLOOR_+0.80%"
-                elif peak_gain_pct >= 0.95 and pnl_approx >= 0.65:
-                    # Give trade room to reach TP1 (+1.0R); only ratchet once solid green (+0.95% peak)
-                    target_floor_sl = round(entry * 1.0035, 6) if act == "LONG" else round(entry * 0.9965, 6)
-                    floor_label = "🛡️ SCALP_PROFIT_SHIELD_+0.35%"
+                if peak_gain_pct >= 2.40 and pnl_approx >= 1.85:
+                    target_floor_sl = round(entry * 1.0145, 6) if act == "LONG" else round(entry * 0.9855, 6)
+                    floor_label = "🔒 SCALP_FLOOR_+1.45%"
+                elif peak_gain_pct >= 1.75 and pnl_approx >= 1.30:
+                    target_floor_sl = round(entry * 1.0090, 6) if act == "LONG" else round(entry * 0.9910, 6)
+                    floor_label = "🔒 SCALP_FLOOR_+0.90%"
+                elif peak_gain_pct >= 1.25 and pnl_approx >= 0.85:
+                    # Give trade full room to hit TP1 (+1.2R); only ratchet once solidly past +1.25% peak
+                    target_floor_sl = round(entry * 1.0040, 6) if act == "LONG" else round(entry * 0.9960, 6)
+                    floor_label = "🛡️ SCALP_PROFIT_SHIELD_+0.40%"
             else:
                 if peak_gain_pct >= 2.40 and pnl_approx >= 1.90:
                     target_floor_sl = round(entry * 1.0155, 6) if act == "LONG" else round(entry * 0.9845, 6)
@@ -829,7 +829,7 @@ async def run_sentinel_cycle(session: aiohttp.ClientSession):
             # ------------------------------------------------------------------
             # STEP 3.3: ADAPTIVE SUDDEN REVERSAL & PROFIT HARVEST DEFENSE
             # ------------------------------------------------------------------
-            min_harvest_pnl = 0.30 if is_scalp_trade else 0.40
+            min_harvest_pnl = 0.55 if is_scalp_trade else 0.55
             is_sudden_reversal = (peak_gain_pct >= reversal_min_gain and pullback_from_peak >= reversal_pullback_threshold and pnl_approx >= min_harvest_pnl)
             is_peak_giveback = (peak_gain_pct >= 2.0 and pullback_from_peak >= 0.90 and pnl_approx >= 0.55)
 

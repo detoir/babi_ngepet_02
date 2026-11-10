@@ -198,16 +198,16 @@ def calculate_deterministic_trade_levels(price: float, atr_1h: float, direction:
     is_sweep = (strat_mode == "SWEEP_REVERSION" or is_weekend)
 
     if is_scalp or strat_mode == "SCALP":
-        # Professional Scalp Sniper:
-        # Tightened risk distance (0.80% min to avoid 5m wick noise, 0.95% max to strictly cap single loss at ~1.05% net)
-        raw_risk = atr_1h * 0.70
-        risk_dist = max(raw_risk, price * 0.0080)
-        risk_dist = min(risk_dist, price * 0.0095)
+        # Calibrated Scalp Sniper:
+        # Wide enough (1.00% min - 1.35% max) to survive normal 15m/1h ATR noise without getting wicked out
+        raw_risk = atr_1h * 0.85
+        risk_dist = max(raw_risk, price * 0.0100)
+        risk_dist = min(risk_dist, price * 0.0135)
 
-        # High-Hit-Rate Asymmetric Scalp Targets: Bank 50% early at 1.0R, expand runners to 2.0R and 3.2R!
-        tp1_mult = 1.0
-        tp2_mult = 2.0
-        tp3_mult = 3.2
+        # Positive-Expectancy Scale-Out Targets: 30% at +1.2R, 35% at +2.2R, 35% at +3.5R
+        tp1_mult = 1.2
+        tp2_mult = 2.2
+        tp3_mult = 3.5
 
         # If MARKET mode is active (default), use mark price so entry + SL + TP execute immediately
         if SCALP_ENTRY_TYPE == "MARKET":
@@ -243,20 +243,20 @@ def calculate_deterministic_trade_levels(price: float, atr_1h: float, direction:
             "risk_pct": round((risk_dist / entry) * 100.0, 2) if entry > 0 else 0.95
         }
 
-    # Dynamic risk distance for Fast/Swing trades: Cap strictly at 1.15% to eliminate large stop-outs
-    raw_risk = atr_1h * 0.95
-    risk_dist = max(raw_risk, price * 0.0090)
-    risk_dist = min(risk_dist, price * 0.0115)
+    # Dynamic risk distance for Fast/Swing trades: 1.10% - 1.50% to avoid premature noise stop-outs
+    raw_risk = atr_1h * 1.00
+    risk_dist = max(raw_risk, price * 0.0110)
+    risk_dist = min(risk_dist, price * 0.0150)
 
-    # Adaptive reward multipliers: Bank 50% early at 1.2R, let runners hit 2.0R and 3.2R
+    # Adaptive reward multipliers: Bank 30% at TP1, let 70% run to TP2 & TP3
     if is_sweep:
-        tp1_mult = 1.1
-        tp2_mult = 1.9
-        tp3_mult = 2.8
-    else:
         tp1_mult = 1.2
         tp2_mult = 2.0
-        tp3_mult = 3.2
+        tp3_mult = 3.0
+    else:
+        tp1_mult = 1.3
+        tp2_mult = 2.2
+        tp3_mult = 3.5
 
     if TRADE_ENTRY_TYPE == "MARKET":
         entry = round(price, 6)
@@ -303,39 +303,49 @@ def calculate_deterministic_trade_levels(price: float, atr_1h: float, direction:
         "risk_pct": round((risk_dist / entry) * 100.0, 2) if entry > 0 else 1.4
     }
 
-def calculate_objective_quant_score(direction: str, rsi_1h: float, rsi_4h: float, btc_regime: str, vol_m: float, funding_rate: float, change_24h: float, btc_24h_pct: float, book_ratio: float = 1.0) -> float:
+TRADFI_PERP_BASES = {
+    "NVDA", "TSLA", "AAPL", "MSFT", "META", "AMZN", "GOOGL", "AMD", "INTC", "MU",
+    "SNDK", "SPCX", "SKHY", "SOXL", "COIN", "MSTR", "PLTR", "HOOD", "SPY", "QQQ",
+    "XAU", "XAG", "CL", "WTI", "BRENT", "NG", "EUR", "GBP", "JPY"
+}
+
+def is_tradfi_symbol(symbol: str) -> bool:
+    base = bridge_symbol_formats(symbol).get("base", "").upper()
+    return base in TRADFI_PERP_BASES
+
+def calculate_objective_quant_score(direction: str, rsi_1h: float, rsi_4h: float, btc_regime: str, vol_m: float, funding_rate: float, change_24h: float, btc_24h_pct: float, book_ratio: float = 1.0, is_tradfi: bool = False) -> float:
     # Hard Disqualification Gates: Never buy overbought tops / falling knives or short oversold capitulation bottoms
     if direction == "LONG":
-        if btc_24h_pct < -1.5:
+        if not is_tradfi and btc_24h_pct < -1.5:
             return 0.10
-        if rsi_1h > 66.0 or rsi_1h < 38.0:
+        if rsi_1h > 65.0 or rsi_1h < 42.0:
             return 0.10
-        if change_24h >= 9.0 or funding_rate >= 0.030 or book_ratio < 0.78:
+        if change_24h >= 9.0 or funding_rate >= 0.030 or book_ratio < 0.90:
             return 0.10
     else:  # SHORT
-        if btc_24h_pct > 2.2:
+        if not is_tradfi and btc_24h_pct > 2.2:
             return 0.10
-        if rsi_1h < 41.0 or rsi_1h > 60.0:  # Hard Gate: Never short into oversold bottoms (<41.0)
+        if rsi_1h < 41.0 or rsi_1h > 59.0:  # Hard Gate: Never short into oversold bottoms (<41.0)
             return 0.10
-        if change_24h <= -8.0 or funding_rate <= -0.035 or book_ratio > 1.25:
+        if change_24h <= -8.0 or funding_rate <= -0.035 or book_ratio > 1.15:
             return 0.10
 
     score = 0.62
     
     if direction == "LONG":
-        if btc_24h_pct >= 0.2: score += 0.10
-        if 0.2 <= (change_24h - btc_24h_pct) <= 6.0: score += 0.10
-        if 44.0 <= rsi_1h <= 62.0: score += 0.10
+        if is_tradfi or btc_24h_pct >= 0.2: score += 0.08
+        if (0.2 <= change_24h <= 6.0) if is_tradfi else (0.2 <= (change_24h - btc_24h_pct) <= 6.0): score += 0.10
+        if 45.0 <= rsi_1h <= 61.0: score += 0.10
         if 44.0 <= rsi_4h <= 64.0: score += 0.08
         if funding_rate <= 0.012: score += 0.06
-        if book_ratio >= 1.10: score += 0.08
+        if book_ratio >= 1.15: score += 0.08
     else:  # SHORT
-        if btc_24h_pct <= -0.3: score += 0.12
-        if -6.5 <= (change_24h - btc_24h_pct) <= -0.3: score += 0.10
-        if 42.0 <= rsi_1h <= 55.0: score += 0.12  # Prime swing rollover zone (like SKHYNIX 49.1 / SKHY 51.6)
+        if is_tradfi or btc_24h_pct <= -0.3: score += 0.10
+        if (-6.5 <= change_24h <= -0.3) if is_tradfi else (-6.5 <= (change_24h - btc_24h_pct) <= -0.3): score += 0.10
+        if 42.0 <= rsi_1h <= 55.0: score += 0.12  # Prime swing rollover zone
         if 42.0 <= rsi_4h <= 58.0: score += 0.08
         if -0.025 <= funding_rate <= 0.015: score += 0.06
-        if book_ratio <= 0.90: score += 0.08
+        if book_ratio <= 0.85: score += 0.08
 
     if vol_m >= 35.0: score += 0.06
     elif vol_m >= 10.0: score += 0.04
@@ -517,63 +527,59 @@ def compute_realtime_candle_telemetry(klines_15m: list, klines_5m: list, book_ra
     except Exception:
         return default_out
 
+async def _fetch_json_safe(session: aiohttp.ClientSession, url: str, default=None):
+    try:
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=3.0)) as resp:
+            if resp.status == 200:
+                return await resp.json()
+    except Exception:
+        pass
+    return default
+
 async def fetch_microstructure_data_async(session: aiohttp.ClientSession, symbol_clean: str) -> dict:
     oi_url = f"https://fapi.binance.com/fapi/v1/openInterest?symbol={symbol_clean}"
     depth_url = f"https://fapi.binance.com/fapi/v1/depth?symbol={symbol_clean}&limit=20"
     ls_ratio_url = f"https://fapi.binance.com/futures/data/topLongShortAccountRatio?symbol={symbol_clean}&period=5m&limit=1"
     k15m_url = f"https://fapi.binance.com/fapi/v1/klines?symbol={symbol_clean}&interval=15m&limit=25"
     k5m_url = f"https://fapi.binance.com/fapi/v1/klines?symbol={symbol_clean}&interval=5m&limit=6"
-    
-    oi_val = 0.0
+    k1h_url = f"https://fapi.binance.com/fapi/v1/klines?symbol={symbol_clean}&interval=1h&limit=30"
+
+    oi_data, depth_data, ls_data, klines_15m, klines_5m, klines_1h = await asyncio.gather(
+        _fetch_json_safe(session, oi_url, {}),
+        _fetch_json_safe(session, depth_url, {}),
+        _fetch_json_safe(session, ls_ratio_url, []),
+        _fetch_json_safe(session, k15m_url, []),
+        _fetch_json_safe(session, k5m_url, []),
+        _fetch_json_safe(session, k1h_url, []),
+    )
+
+    oi_val = float(oi_data.get("openInterest") or 0.0) if isinstance(oi_data, dict) else 0.0
     book_ratio = 1.0
+    if isinstance(depth_data, dict):
+        bids = sum(float(b[1]) for b in depth_data.get("bids", []))
+        asks = sum(float(a[1]) for a in depth_data.get("asks", []))
+        if asks > 0:
+            book_ratio = round(bids / asks, 2)
+
     whale_ls_ratio = 1.0
-    klines_15m = []
-    klines_5m = []
-    
-    try:
-        async with session.get(oi_url, timeout=aiohttp.ClientTimeout(total=3.0)) as resp:
-            if resp.status == 200:
-                data = await resp.json()
-                oi_val = float(data.get("openInterest") or 0.0)
-    except Exception:
-        pass
+    if isinstance(ls_data, list) and ls_data:
+        whale_ls_ratio = round(float(ls_data[0].get("longShortRatio") or 1.0), 2)
 
-    try:
-        async with session.get(depth_url, timeout=aiohttp.ClientTimeout(total=3.0)) as resp:
-            if resp.status == 200:
-                data = await resp.json()
-                bids = sum(float(b[1]) for b in data.get("bids", []))
-                asks = sum(float(a[1]) for a in data.get("asks", []))
-                if asks > 0:
-                    book_ratio = round(bids / asks, 2)
-    except Exception:
-        pass
+    rsi_1h = 50.0
+    ema21_1h = 0.0
+    if isinstance(klines_1h, list) and len(klines_1h) >= 22:
+        closes_1h = [float(k[4]) for k in klines_1h[:-1]]
+        rsi_1h = calculate_rsi(closes_1h)
+        ema21_1h = round(calculate_ema(closes_1h, 21), 6)
 
-    try:
-        async with session.get(ls_ratio_url, timeout=aiohttp.ClientTimeout(total=3.0)) as resp:
-            if resp.status == 200:
-                data = await resp.json()
-                if data and isinstance(data, list):
-                    whale_ls_ratio = round(float(data[0].get("longShortRatio") or 1.0), 2)
-    except Exception:
-        pass
-
-    try:
-        async with session.get(k15m_url, timeout=aiohttp.ClientTimeout(total=3.0)) as resp:
-            if resp.status == 200:
-                klines_15m = await resp.json()
-    except Exception:
-        pass
-
-    try:
-        async with session.get(k5m_url, timeout=aiohttp.ClientTimeout(total=3.0)) as resp:
-            if resp.status == 200:
-                klines_5m = await resp.json()
-    except Exception:
-        pass
-
-    candle_tel = compute_realtime_candle_telemetry(klines_15m, klines_5m, book_ratio=book_ratio)
-    out = {"oi": oi_val, "book_ratio": book_ratio, "whale_ls_ratio": whale_ls_ratio}
+    candle_tel = compute_realtime_candle_telemetry(klines_15m or [], klines_5m or [], book_ratio=book_ratio)
+    out = {
+        "oi": oi_val,
+        "book_ratio": book_ratio,
+        "whale_ls_ratio": whale_ls_ratio,
+        "rsi_1h": rsi_1h,
+        "ema21_1h": ema21_1h,
+    }
     out.update(candle_tel)
     return out
 
@@ -750,6 +756,11 @@ async def fetch_full_market_universe_tickers() -> list:
             cand["oi_m"] = round((oi_contracts * cand["p"]) / 1_000_000.0, 1)
         else:
             cand["oi_m"] = round(cand["v_m"] * 0.15, 1)
+        cand["rsi_1h"] = res.get("rsi_1h", 50.0)
+        ema21_1h = float(res.get("ema21_1h") or 0.0)
+        cand["ema21_1h"] = ema21_1h
+        cand["ema21_dist_pct"] = round(((cand["p"] - ema21_1h) / ema21_1h) * 100.0, 2) if ema21_1h > 0 else 0.0
+        cand["asset_class"] = "TRADFI" if is_tradfi_symbol(cand["s"]) else "CRYPTO"
         for k_tel in (
             "vwap", "ema9", "ema20", "ema50", "chg_5m_pct", "chg_15m_pct", "chg_1h_pct",
             "rel_vol", "body_pct", "u_wick_pct", "l_wick_pct", "swing_hi", "swing_lo",
@@ -819,7 +830,8 @@ def analyze_macro_universe_with_ai(market_universe: list, live_news: str, btc_re
        For each candidate, evaluate:
        - Where `p` (current_price) and `mark_price` sit relative to `prev_close`, `vwap`, `ema9`, `ema20`, `ema50`, `swing_hi`, and `swing_lo`.
        - Multi-horizon price velocity: `chg_5m_pct`, `chg_15m_pct`, `chg_1h_pct`, and `c` (24h %).
-       - Candle anatomy: `body_pct`, `u_wick_pct`, `l_wick_pct`, `rel_vol` (relative volume), `cvd_bias` (taker volume delta: BULLISH_CVD / BEARISH_CVD / NEUTRAL), `completed_candle_sig`, and `live_candle_sig`.
+       - Candle anatomy: `body_pct`, `u_wick_pct`, `l_wick_pct`, `rel_vol` (relative volume), `cvd_bias` (taker volume delta: POSITIVE / NEGATIVE / NEUTRAL), `completed_candle_sig`, and `live_candle_sig`.
+       - 1H Quant Alignment: Check `rsi_1h`, `ema21_1h`, `ema21_dist_pct`, and `asset_class` (`CRYPTO` vs `TRADFI`). NEVER propose a LONG if `rsi_1h < 44` or `rsi_1h > 63` or `ema21_dist_pct < -0.8`. NEVER propose a SHORT if `rsi_1h < 41` or `rsi_1h > 57` or `ema21_dist_pct > 0.8`.
        - A large real-time price movement against the previous thesis must NOT automatically be considered a retracement.
 
     2. ANTI-ANCHORING RULE:
@@ -833,8 +845,8 @@ def analyze_macro_universe_with_ai(market_universe: list, live_news: str, btc_re
        Likewise, if `previous_regime` was TREND_UP and current price becomes strongly bearish, apply the equivalent LONG restrictions.
 
     3. FAST REVERSAL DETECTION:
-       Immediately flag `POSSIBLE_BULLISH_REVERSAL` when multiple supplied conditions indicate a bullish transition (`fast_bull_rev`=true, price reclaiming `vwap` & `ema9`/`ema20`, `completed_candle_sig` in BULLISH_ACCELERATION/BULLISH_CONTINUATION, `failed_breakdown`=true, `book_ratio` > 1.15, `cvd_bias`="BULLISH_CVD").
-       Immediately flag `POSSIBLE_BEARISH_REVERSAL` using the inverse conditions (`fast_bear_rev`=true, losing `vwap`/`ema9`, `failed_breakout`=true, `cvd_bias`="BEARISH_CVD").
+       Immediately flag `POSSIBLE_BULLISH_REVERSAL` when multiple supplied conditions indicate a bullish transition (`fast_bull_rev`=true, price reclaiming `vwap` & `ema9`/`ema20`, `completed_candle_sig` in BULLISH_ACCELERATION/BULLISH_CONTINUATION, `failed_breakdown`=true, `book_ratio` > 1.15, `cvd_bias`="POSITIVE").
+       Immediately flag `POSSIBLE_BEARISH_REVERSAL` using the inverse conditions (`fast_bear_rev`=true, losing `vwap`/`ema9`, `failed_breakout`=true, `cvd_bias`="NEGATIVE").
 
     4. CANDLE CONFLICT RULE:
        Evaluate timeframes independently. Distinguish `higher_timeframe_bias` from `immediate_momentum` — they are NOT the same thing.
@@ -864,7 +876,7 @@ def analyze_macro_universe_with_ai(market_universe: list, live_news: str, btc_re
        9. Volatility/liquidity
        10. Higher-timeframe trend
        11. Macro/news
-       12. New trade opportunity (select 4 to 5 high-conviction +EV setups that align with real-time price & candle momentum)
+       12. New trade opportunity: Select ONLY genuine A+ setups (0 to 2 max, NEVER force trades in chop or sideways low-ADX conditions). If no setup cleanly passes 1H RSI, EMA21, order flow (`cvd_bias`), and candle momentum alignment, return `"action": "HOLD"` and `"selected_setups": []`. Note: For `asset_class`=="TRADFI" (stocks/commodities), evaluate the asset's own price/order flow rather than `btc_24h_pct`.
        A previous directional thesis may NEVER override a current hard invalidation condition.
 
     [CURRENT ACCOUNT CAPITAL & MARGIN CAPACITY]
@@ -888,7 +900,7 @@ def analyze_macro_universe_with_ai(market_universe: list, live_news: str, btc_re
     {pending_watch_section}
 
     [REAL-TIME PRICE, CANDLE & MICROSTRUCTURE UNIVERSE (Top 35 Liquid Perps)]
-    Fields: s (symbol), p (current_price), mark_price, bid, ask, spread_pct, prev_close, c (24h%), chg_5m_pct, chg_15m_pct, chg_1h_pct, vwap, ema9, ema20, ema50, swing_hi, swing_lo, v_m (vol M$), rel_vol, body_pct, u_wick_pct, l_wick_pct, cvd_bias, completed_candle_sig, live_candle_sig, failed_breakdown, failed_breakout, fast_bull_rev, fast_bear_rev, fr (funding%), oi_m (OI M$), book_ratio, whale_ls_ratio, hi (24h high), lo (24h low)
+    Fields: s (symbol), asset_class (CRYPTO|TRADFI), p (current_price), mark_price, bid, ask, spread_pct, prev_close, c (24h%), rsi_1h, ema21_1h, ema21_dist_pct, chg_5m_pct, chg_15m_pct, chg_1h_pct, vwap, ema9, ema20, ema50, swing_hi, swing_lo, v_m (vol M$), rel_vol, body_pct, u_wick_pct, l_wick_pct, cvd_bias (POSITIVE|NEGATIVE|NEUTRAL), completed_candle_sig, live_candle_sig, failed_breakdown, failed_breakout, fast_bull_rev, fast_bear_rev, fr (funding%), oi_m (OI M$), book_ratio, whale_ls_ratio, hi (24h high), lo (24h low)
     {json.dumps(top_candidates)}
 
     [USER DIRECTIVES]
@@ -1089,48 +1101,50 @@ def analyze_scalp_opportunities_with_ai(market_universe: list, btc_regime: dict,
     prompt = f"""
     You are the Chief High-Speed Scalp Sniper Specialist for {BOT_NAME}.
     PRIMARY OBJECTIVE:
-    Identify ultra-fast, high-probability SCALP opportunities (5m-15m micro-swings) with MAXIMAL EXPECTED PROFIT (+EV).
-    This evaluation runs strictly on the HOURLY discovery cycle to capture the highest-velocity, highest-profit scalp setups for the upcoming hour.
+    Identify ONLY ultra-selective, high-probability SCALP opportunities (5m-15m micro-swings) with POSITIVE EXPECTED VALUE (+EV).
+    This evaluation runs on the 15-minute discovery cycle. Preserving capital by standing aside in chop is ALWAYS better than forcing low-edge scalps.
 
     [SCALP PROFIT PRIORITIZATION DIRECTIVE]
-    - PRIORITIZE MAXIMUM DOLLAR PROFIT: Focus exclusively on tokens where high order flow momentum, depth imbalance, and volatility provide the largest DOLLAR GAIN potential.
-    - DISQUALIFY DEAD CHOP: Reject low-volatility, low-profit ranging assets where slippage or fees erode edge.
-    - HIGH CONVICTION ONLY: Require clear institutional order book backing (bid/ask depth skew >= 1.30 for LONG, <= 0.70 for SHORT).
+    - SELECTIVE QUALITY OVER QUANTITY: If the market is choppy or no candidate passes ALL technical + order flow checks, return `"action": "HOLD"` and `"scalp_setups": []`. NEVER force trades just to fill slots.
+    - DISQUALIFY DEAD CHOP & OVER-EXTENDED CHASES: Reject low-volatility chop and reject LONGs already within 0.7% of 24h high when `c >= 2.5%` (or SHORTs within 1.2% of 24h low).
+    - STRICT ORDERBOOK + CVD CONFLUENCE: Require BOTH orderbook skew AND matching taker CVD (`book_ratio >= 1.20` AND `cvd_bias == "POSITIVE"` for LONG; `book_ratio <= 0.85` AND `cvd_bias == "NEGATIVE"` for SHORT). Never rely on `book_ratio` alone (L2 bid/ask walls can be spoofed).
 
     [SCALP TRADING SPECIFICATIONS]
     - Horizon: High-velocity turnover (< 45 minutes pending, rapid fills).
-    - Profit Targets: TP1 (+1.0R, ~+0.8% to +1.3%), TP2 (+1.8R), TP3 (+2.6R).
-    - Stop-Loss: Tight micro-stop (0.8% to 1.3% risk distance).
-    - Capital Efficiency: 2.0x-2.5x larger position size with 50% early cash banking at +0.5R milestone.
+    - Profit Targets: TP1 (+1.2R, 30% close), TP2 (+2.2R, 35% close), TP3 (+3.5R, 35% close).
+    - Stop-Loss: ATR-calibrated stop (1.00% to 1.35% risk distance).
+    - Direction Diversification: Respect max 2 correlated positions per side; avoid loading all slots on the same direction.
 
     [PORTFOLIO CAPITAL ANCHOR]
     • Total Balance: ${cap_total:.2f} USD | Free Margin: ${cap_free:.2f} USD
 
-    [BTC HOURLY MACRO ANCHOR]
+    [BTC MACRO ANCHOR]
     Regime: {btc_regime.get('regime')} | ADX: {btc_regime.get('adx')} | BTC 24h Change: {btc_24h_pct:+.2f}%
     {btc_market_bias}
 
-    [TOP LIQUID PERPETUALS FOR SCALPING (WITH REAL-TIME PRICE & CANDLE TELEMETRY)]
-    Fields: s (symbol), p (current_price), mark_price, bid, ask, spread_pct, prev_close, c (24h%), chg_5m_pct, chg_15m_pct, chg_1h_pct, vwap, ema9, ema20, ema50, swing_hi, swing_lo, v_m (vol M$), rel_vol, body_pct, u_wick_pct, l_wick_pct, cvd_bias, completed_candle_sig, live_candle_sig, failed_breakdown, failed_breakout, fast_bull_rev, fast_bear_rev, fr (funding%), oi_m (OI M$), book_ratio, whale_ls_ratio, hi (24h high), lo (24h low)
+    [TOP LIQUID PERPETUALS FOR SCALPING (WITH REAL-TIME PRICE, 1H QUANT & CANDLE TELEMETRY)]
+    Fields: s (symbol), asset_class (CRYPTO|TRADFI), p (current_price), mark_price, bid, ask, spread_pct, prev_close, c (24h%), rsi_1h, ema21_1h, ema21_dist_pct, chg_5m_pct, chg_15m_pct, chg_1h_pct, vwap, ema9, ema20, ema50, swing_hi, swing_lo, v_m (vol M$), rel_vol, body_pct, u_wick_pct, l_wick_pct, cvd_bias (POSITIVE|NEGATIVE|NEUTRAL), completed_candle_sig, live_candle_sig, failed_breakdown, failed_breakout, fast_bull_rev, fast_bear_rev, fr (funding%), oi_m (OI M$), book_ratio, whale_ls_ratio, hi (24h high), lo (24h low)
     {json.dumps(top_scalp_candidates)}
 
     SCALP SNIPER & REAL-TIME CANDLE CRITERIA:
-    1. REAL-TIME PRICE & CANDLE PRIORITY:
-       - Evaluate `p` vs `vwap`, `ema9`, `ema20`, `chg_5m_pct`, `chg_15m_pct`, `completed_candle_sig`, and `live_candle_sig` FIRST.
+    1. REAL-TIME PRICE, 1H QUANT & CANDLE PRIORITY:
+       - Evaluate `p` vs `vwap`, `ema9`, `ema20`, `rsi_1h`, `ema21_dist_pct`, `chg_5m_pct`, `chg_15m_pct`, `completed_candle_sig`, and `live_candle_sig` FIRST.
+       - Hard 1H Quant Gates (DO NOT propose setups that violate these):
+         * LONG requires `44.0 <= rsi_1h <= 63.0` and `ema21_dist_pct >= -0.8`.
+         * SHORT requires `41.0 <= rsi_1h <= 57.0`, `ema21_dist_pct <= 0.8`, and `whale_ls_ratio < 2.5`.
        - Never propose a SHORT scalp if `failed_breakdown` is true, `fast_bull_rev` is true, or `live_candle_sig` == "LIVE_BULLISH_EXPANSION".
        - Never propose a LONG scalp if `failed_breakout` is true, `fast_bear_rev` is true, or `live_candle_sig` == "LIVE_BEARISH_EXPANSION".
-       - Distinguish `completed_candle_sig` (confirmed 15m candle close) from `live_candle_sig` (forming candle).
-    2. ORDERBOOK & CVD IMBALANCE:
-       - book_ratio >= 1.30 with `cvd_bias` == "BULLISH_CVD" and price above `vwap`/`ema9` -> High-conviction LONG scalp.
-       - book_ratio <= 0.70 with `cvd_bias` == "BEARISH_CVD" and price below `vwap`/`ema9` -> High-conviction SHORT scalp.
-    3. LIQUIDITY SWEEP & FAILED BREAKDOWN/BREAKOUT:
-       - Asset swept `swing_lo` (`failed_breakdown`=true) or `swing_hi` (`failed_breakout`=true) with strong candle rejection -> Fast reversal scalp.
+    2. ORDERBOOK & CVD IMBALANCE (BOTH REQUIRED):
+       - LONG: `book_ratio >= 1.20` AND `cvd_bias == "POSITIVE"` (NEVER `"NEGATIVE"`) with price above `vwap`/`ema9`.
+       - SHORT: `book_ratio <= 0.85` AND `cvd_bias == "NEGATIVE"` (NEVER `"POSITIVE"`) with price below `vwap`/`ema9`.
+    3. ASSET CLASS AWARENESS:
+       - For `asset_class == "TRADFI"` (equities/commodities), evaluate the ticker's own 1H trend, orderbook, and CVD rather than assuming BTC correlation.
     4. NO EXTENDED CHASE:
-       - Disqualify assets already up > +10% or down < -10% in 24h (capitulation/exhaustion danger).
+       - Disqualify assets already up > +9% or down < -8% in 24h (capitulation/exhaustion danger).
 
     SCALPING PROBABILITY ASSESSMENT:
-    For each setup, compute an explicit "scalp_probability" integer between 70 and 95 based on technical edge confluence, book depth skew, and market alignment.
-    Select 4 to 5 distinct top setups with scalp_probability >= 72 so all 4 concurrent scalp slots can be populated.
+    For each qualifying setup, compute an honest "scalp_probability" integer between 70 and 95 based on technical edge confluence, CVD + book confirmation, and market alignment.
+    Select 0 to 2 highest-conviction setups ONLY (`scalp_probability >= 75`). If fewer than 1 clean setup exists, return `"action": "HOLD"` and `"scalp_setups": []`.
 
     Respond ONLY in strict JSON:
     {{
@@ -1676,7 +1690,8 @@ async def execute_unified_hourly_discovery_pipeline(context: ContextTypes.DEFAUL
             live_candle_sig = str(cand_info.get("live_candle_sig", "FORMING_NEUTRAL")) if cand_info else "FORMING_NEUTRAL"
             cvd_bias = str(cand_info.get("cvd_bias", "NEUTRAL")) if cand_info else "NEUTRAL"
 
-            quant_score = calculate_objective_quant_score(act, rsi_1h, rsi_4h, btc_regime["regime"], vol_m, funding, chg, btc_24h_pct, book_ratio)
+            tradfi_asset = is_tradfi_symbol(bridge["ccxt"])
+            quant_score = calculate_objective_quant_score(act, rsi_1h, rsi_4h, btc_regime["regime"], vol_m, funding, chg, btc_24h_pct, book_ratio, is_tradfi=tradfi_asset)
             # Hard Quantitative Safety Veto: Never allow AI confidence to override a failed quant safety check (< 0.50)
             if quant_score < 0.50:
                 log_event("INFO", "QUANT_VETO", f"Rejected {act} on {sym}: Objective quant score {quant_score:.2f} failed safety gate (RSI 1H: {rsi_1h:.1f}, BTC 24h: {btc_24h_pct:+.2f}%, Book: {book_ratio}x).")
@@ -1690,24 +1705,30 @@ async def execute_unified_hourly_discovery_pipeline(context: ContextTypes.DEFAUL
 
             is_scalp = (cand.get("trade_speed") == "SCALP TRADE" or cand.get("strategy_mode") == "SCALP")
 
-            # Strict Trend, Orderbook, 24h Range Room & Real-Time Candle Protection Gate (Enforced on ALL trades):
+            # Strict Trend, Orderbook, CVD, 24h Range Room & Real-Time Candle Protection Gate (Enforced on ALL trades):
             if act == "LONG":
-                near_24h_top = (chg >= 3.5 and hi_24h > 0 and curr_price >= hi_24h * 0.993)
+                min_book_long = 1.15 if is_scalp else 0.95
+                cvd_veto_long = (is_scalp and cvd_bias == "NEGATIVE")
+                near_24h_top = (chg >= 2.5 and hi_24h > 0 and curr_price >= hi_24h * 0.993)
+                btc_veto_long = (not tradfi_asset and btc_24h_pct < -1.20)
                 candle_veto_long = (failed_breakout or fast_bear_rev or live_candle_sig == "LIVE_BEARISH_EXPANSION" or not new_long_allowed)
-                if curr_price < (ema21_1h * 0.992) or rsi_1h < 40.0 or rsi_1h > 65.0 or book_ratio < 0.82 or btc_24h_pct < -1.20 or near_24h_top or candle_veto_long:
-                    l_reason = "Failed Breakout / Live Bearish Reversal" if candle_veto_long else "Failed alignment"
-                    log_event("INFO", "ALIGNMENT_GATE", f"Filtered LONG on {sym}: {l_reason} (Price ${curr_price:.4f} vs EMA21 ${ema21_1h:.4f}, 24h High ${hi_24h:.4f}, RSI {rsi_1h:.1f}, Book {book_ratio}x, Candle {completed_candle_sig}/{live_candle_sig}).")
+                if curr_price < (ema21_1h * 0.992) or rsi_1h < 44.0 or rsi_1h > 63.0 or book_ratio < min_book_long or cvd_veto_long or btc_veto_long or near_24h_top or candle_veto_long:
+                    l_reason = "Failed Breakout / Live Bearish Reversal" if candle_veto_long else ("Negative CVD on Scalp" if cvd_veto_long else "Failed alignment")
+                    log_event("INFO", "ALIGNMENT_GATE", f"Filtered LONG on {sym}: {l_reason} (Price ${curr_price:.4f} vs EMA21 ${ema21_1h:.4f}, 24h High ${hi_24h:.4f}, RSI {rsi_1h:.1f}, Book {book_ratio}x, CVD {cvd_bias}, Candle {completed_candle_sig}/{live_candle_sig}).")
                     continue
             elif act == "SHORT":
+                max_book_short = 0.88 if is_scalp else 1.05
+                cvd_veto_short = (is_scalp and cvd_bias == "POSITIVE")
                 near_24h_bottom = (lo_24h > 0 and curr_price <= lo_24h * 1.012)
                 whale_long_wall = (whale_ls >= 2.5)
+                btc_veto_short = (not tradfi_asset and btc_24h_pct > 1.80)
                 candle_veto_short = (failed_breakdown or fast_bull_rev or live_candle_sig == "LIVE_BULLISH_EXPANSION" or not new_short_allowed)
-                if curr_price > (ema21_1h * 1.008) or rsi_1h > 58.0 or rsi_1h < 41.0 or book_ratio > 1.20 or btc_24h_pct > 1.80 or near_24h_bottom or whale_long_wall or candle_veto_short:
+                if curr_price > (ema21_1h * 1.008) or rsi_1h > 57.0 or rsi_1h < 41.0 or book_ratio > max_book_short or cvd_veto_short or btc_veto_short or near_24h_bottom or whale_long_wall or candle_veto_short:
                     reason = (
                         "Failed Breakdown / Fast Bullish Reversal" if candle_veto_short
-                        else ("Whale Long Defense (L/S >= 2.5)" if whale_long_wall else ("Near 24h Low (<1.2%)" if near_24h_bottom else "Failed Alignment"))
+                        else ("Positive CVD on Scalp" if cvd_veto_short else ("Whale Long Defense (L/S >= 2.5)" if whale_long_wall else ("Near 24h Low (<1.2%)" if near_24h_bottom else "Failed Alignment")))
                     )
-                    log_event("INFO", "ALIGNMENT_GATE", f"Filtered SHORT on {sym}: {reason} (Price ${curr_price:.4f} vs 24h Low ${lo_24h:.4f}, RSI {rsi_1h:.1f}, Whale L/S {whale_ls:.2f}x, Book {book_ratio}x, Candle {completed_candle_sig}/{live_candle_sig}).")
+                    log_event("INFO", "ALIGNMENT_GATE", f"Filtered SHORT on {sym}: {reason} (Price ${curr_price:.4f} vs 24h Low ${lo_24h:.4f}, RSI {rsi_1h:.1f}, Whale L/S {whale_ls:.2f}x, Book {book_ratio}x, CVD {cvd_bias}, Candle {completed_candle_sig}/{live_candle_sig}).")
                     continue
 
             levels = calculate_deterministic_trade_levels(curr_price, atr_1h, act, ema21_1h, cand["strategy_mode"], change_24h=chg, is_scalp=is_scalp)
@@ -1740,9 +1761,9 @@ async def execute_unified_hourly_discovery_pipeline(context: ContextTypes.DEFAUL
                 profit_index += 6.0
 
             # Real-Time Completed Candle & CVD Momentum Bonus
-            if act == "LONG" and completed_candle_sig in ("BULLISH_ACCELERATION", "BULLISH_CONTINUATION") and cvd_bias == "BULLISH_CVD":
+            if act == "LONG" and completed_candle_sig in ("BULLISH_ACCELERATION", "BULLISH_CONTINUATION") and cvd_bias == "POSITIVE":
                 profit_index += 7.0
-            elif act == "SHORT" and completed_candle_sig in ("BEARISH_ACCELERATION", "BEARISH_CONTINUATION") and cvd_bias == "BEARISH_CVD":
+            elif act == "SHORT" and completed_candle_sig in ("BEARISH_ACCELERATION", "BEARISH_CONTINUATION") and cvd_bias == "NEGATIVE":
                 profit_index += 7.0
 
             # Sweet-Spot Rollover / Pullback Confluence (+10.0 bonus like SKHYNIX 49.1 / SKHY 51.6):
@@ -1846,9 +1867,9 @@ async def execute_unified_hourly_discovery_pipeline(context: ContextTypes.DEFAUL
 
                 # Recalculate SL/TP brackets relative to actual_fill_price so slippage never distorts risk/reward
                 fill_risk_dist = actual_fill_price * (levels["risk_pct"] / 100.0)
-                tp1_m = levels.get("tp1_mult", 1.0 if is_scalp else 1.2)
-                tp2_m = levels.get("tp2_mult", 1.8 if is_scalp else 2.0)
-                tp3_m = levels.get("tp3_mult", 2.8 if is_scalp else 3.0)
+                tp1_m = levels.get("tp1_mult", 1.2 if is_scalp else 1.3)
+                tp2_m = levels.get("tp2_mult", 2.2)
+                tp3_m = levels.get("tp3_mult", 3.5)
                 if act == "LONG":
                     levels["sl"] = round(actual_fill_price - fill_risk_dist, 6)
                     levels["t1"] = round(actual_fill_price + (tp1_m * fill_risk_dist), 6)
@@ -1925,18 +1946,11 @@ async def execute_unified_hourly_discovery_pipeline(context: ContextTypes.DEFAUL
                 source_badge = "🌐 MACRO FLOW"
             exec_badge = f"🤖 [AUTO-{TRADING_MODE}]" if TRADING_MODE in ("LIVE", "TESTNET") else "📋 [SIMULATION]"
 
-            if is_scalp:
-                tp_desc = (
-                    f"• TP1 (50% Qty): <code>${levels['t1']:.6f}</code> (+1.0R) {'✅' if binance_tp1_id else ''}\n"
-                    f"• TP2 (25% Qty): <code>${levels['t2']:.6f}</code> (+1.8R) {'✅' if binance_tp2_id else ''}\n"
-                    f"• TP3 (25% Qty): <code>${levels['t3']:.6f}</code> (+2.8R) {'✅' if binance_tp3_id else ''}"
-                )
-            else:
-                tp_desc = (
-                    f"• TP1 (50% Qty): <code>${levels['t1']:.6f}</code> (+1.2R) {'✅' if binance_tp1_id else ''}\n"
-                    f"• TP2 (25% Qty): <code>${levels['t2']:.6f}</code> (+2.0R) {'✅' if binance_tp2_id else ''}\n"
-                    f"• TP3 (25% Qty): <code>${levels['t3']:.6f}</code> (+3.0R) {'✅' if binance_tp3_id else ''}"
-                )
+            tp_desc = (
+                f"• TP1 (30% Qty): <code>${levels['t1']:.6f}</code> (+{levels.get('tp1_mult', 1.2)}R) {'✅' if binance_tp1_id else ''}\n"
+                f"• TP2 (35% Qty): <code>${levels['t2']:.6f}</code> (+{levels.get('tp2_mult', 2.2)}R) {'✅' if binance_tp2_id else ''}\n"
+                f"• TP3 (35% Qty): <code>${levels['t3']:.6f}</code> (+{levels.get('tp3_mult', 3.5)}R) {'✅' if binance_tp3_id else ''}"
+            )
 
             prob_line = f" | Scalp Prob: <b>{cand.get('scalp_probability', 80):.0f}%</b>" if is_scalp else ""
             cash_ev_line = f" (${item.get('expected_cash_profit', 0):+.2f} Cash EV)"

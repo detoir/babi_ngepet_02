@@ -70,9 +70,9 @@ DEFAULT_LEVERAGE = max(get_env_int("DEFAULT_LEVERAGE", 12), 10)  # 12x leverage 
 SCALP_LEVERAGE = max(get_env_int("SCALP_LEVERAGE", 12), 12)    # 12x leverage for scalps so 3-4 trades fit in $19 margin
 SCALP_ENTRY_TYPE = get_env_str("SCALP_ENTRY_TYPE", "MARKET").upper()  # MARKET by default so SL and TP brackets attach immediately on trade send
 TRADE_ENTRY_TYPE = get_env_str("TRADE_ENTRY_TYPE", "MARKET").upper()  # MARKET by default so SL and TP brackets attach immediately on trade send
-MAX_CORRELATED_POSITIONS_PER_SIDE = max(get_env_int("MAX_CORRELATED_POSITIONS_PER_SIDE", 4), 4)  # Allow all 4 slots to trade in trend direction
-MAX_CORRELATED_SCALPS_PER_SIDE = max(get_env_int("MAX_CORRELATED_SCALPS_PER_SIDE", 4), 4)  # Allow all 4 slots to trade in trend direction
-MAX_CONCURRENT_SAME_DIRECTION = max(get_env_int("MAX_CONCURRENT_SAME_DIRECTION", 4), 4)
+MAX_CORRELATED_POSITIONS_PER_SIDE = max(get_env_int("MAX_CORRELATED_POSITIONS_PER_SIDE", 2), 1)  # Cap same-direction exposure to 2 slots to avoid correlated wipeouts
+MAX_CORRELATED_SCALPS_PER_SIDE = max(get_env_int("MAX_CORRELATED_SCALPS_PER_SIDE", 2), 1)  # Cap same-direction scalps to 2 slots
+MAX_CONCURRENT_SAME_DIRECTION = max(get_env_int("MAX_CONCURRENT_SAME_DIRECTION", 2), 1)
 
 # Risk & Gate Parameters
 MIN_RRR = get_env_float("MIN_RRR", 1.8)
@@ -859,7 +859,7 @@ def place_binance_take_profit(symbol: str, side: str, qty_contracts: float, tp_p
         return ""
 
 def split_tp_quantities(symbol: str, total_qty: float) -> tuple:
-    """Split total_qty cleanly into (tp1_qty, tp2_qty, tp3_qty) respecting min lot and never exceeding total_qty."""
+    """Split total_qty cleanly into (tp1_qty, tp2_qty, tp3_qty) at 30%/35%/35% respecting min lot and never exceeding total_qty."""
     bridge = bridge_symbol_formats(symbol)
     target_sym = bridge["ccxt"]
     min_qty = get_symbol_min_qty(target_sym)
@@ -867,7 +867,7 @@ def split_tp_quantities(symbol: str, total_qty: float) -> tuple:
     if total_clamped < (min_qty * 2.0):
         return (total_clamped, 0.0, 0.0)
     if total_clamped < (min_qty * 4.0):
-        tp1_q = safe_amount_to_precision(target_sym, total_clamped * 0.50)
+        tp1_q = safe_amount_to_precision(target_sym, total_clamped * 0.40)
         rem = round(total_clamped - tp1_q, 8)
         if rem < min_qty:
             return (total_clamped, 0.0, 0.0)
@@ -876,8 +876,8 @@ def split_tp_quantities(symbol: str, total_qty: float) -> tuple:
             tp2_q = max(0.0, round(total_clamped - tp1_q, 8))
         return (tp1_q, tp2_q, 0.0)
 
-    tp1_q = safe_amount_to_precision(target_sym, total_clamped * 0.50)
-    tp2_q = safe_amount_to_precision(target_sym, total_clamped * 0.25)
+    tp1_q = safe_amount_to_precision(target_sym, total_clamped * 0.30)
+    tp2_q = safe_amount_to_precision(target_sym, total_clamped * 0.35)
     rem3 = round(total_clamped - tp1_q - tp2_q, 8)
     if rem3 < min_qty:
         rem2 = round(total_clamped - tp1_q, 8)
@@ -903,9 +903,9 @@ def place_binance_tp_sl_brackets(
             "tp1_id": "SIMULATED_TP1" if t1_price > 0 else "",
             "tp2_id": "SIMULATED_TP2" if t2_price > 0 else "",
             "tp3_id": "SIMULATED_TP3" if t3_price > 0 else "",
-            "tp1_qty": qty_contracts * 0.50,
-            "tp2_qty": qty_contracts * 0.25,
-            "tp3_qty": qty_contracts * 0.25,
+            "tp1_qty": qty_contracts * 0.30,
+            "tp2_qty": qty_contracts * 0.35,
+            "tp3_qty": qty_contracts * 0.35,
         }
     tp1_q, tp2_q, tp3_q = split_tp_quantities(symbol, qty_contracts)
     sl_id = place_binance_stop_loss(symbol, side, qty_contracts, sl_price) if sl_price > 0 else ""
@@ -1215,8 +1215,8 @@ def generate_monthly_performance_report() -> dict:
         c.execute("""
             SELECT COUNT(*) as scan_count 
             FROM system_logs 
-            WHERE component IN ('AI_SCANNER', 'WHALE_SCANNER') 
-            AND message LIKE '%complete%' 
+            WHERE component IN ('AI_SCANNER', 'WHALE_SCANNER', 'PROFIT_ENGINE') 
+            AND (message LIKE '%complete%' OR message LIKE '%completed%') 
             AND timestamp >= ?
         """, (start_of_month,))
         total_scans = c.fetchone()["scan_count"] or 0
@@ -1234,7 +1234,7 @@ def generate_monthly_performance_report() -> dict:
         closed_trades = c.fetchall()
         
         wins = [t for t in closed_trades if float(t["realized_pnl"] or 0) > 0]
-        losses = [t for t in closed_trades if float(t["realized_pnl"] or 0) <= 0]
+        losses = [t for t in closed_trades if float(t["realized_pnl"] or 0) < 0]
         
         win_count = len(wins)
         loss_count = len(losses)
