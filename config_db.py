@@ -65,7 +65,7 @@ _raw_mode = get_env_str("TRADING_MODE", "") or get_env_str("MODE", "") or get_en
 TRADING_MODE = _raw_mode.upper()
 if TRADING_MODE not in ("LIVE", "TESTNET", "SIMULATION"):
     TRADING_MODE = "LIVE"
-POSITION_SIZE_MULTIPLIER = get_env_float("POSITION_SIZE_MULTIPLIER", 10.0)  # 10x multiplier (2x bigger margin per trade)
+POSITION_SIZE_MULTIPLIER = get_env_float("POSITION_SIZE_MULTIPLIER", 5.0)  # Halved margin multiplier (20% margin per slot)
 DEFAULT_LEVERAGE = max(get_env_int("DEFAULT_LEVERAGE", 12), 10)  # 12x leverage so 3-4 trades fit comfortably in $19 margin
 SCALP_LEVERAGE = max(get_env_int("SCALP_LEVERAGE", 12), 12)    # 12x leverage for scalps so 3-4 trades fit in $19 margin
 SCALP_ENTRY_TYPE = get_env_str("SCALP_ENTRY_TYPE", "MARKET").upper()  # MARKET by default so SL and TP brackets attach immediately on trade send
