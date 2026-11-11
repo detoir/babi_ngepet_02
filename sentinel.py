@@ -318,9 +318,9 @@ async def run_sentinel_cycle(session: aiohttp.ClientSession):
                 if is_scalp_trade:
                     speed_badge = "⚡ SCALP SNIPER"
                     tp_display = (
-                        f"   • TP1 (30% Size): <code>${t1:.6f}</code> (+1.2R) {'✅' if new_tp1_id else ''}\n"
-                        f"   • TP2 (35% Size): <code>${t2:.6f}</code> (+2.2R) {'✅' if new_tp2_id else ''}\n"
-                        f"   • TP3 (35% Size): <code>${t3:.6f}</code> (+3.5R) {'✅' if new_tp3_id else ''}"
+                        f"   • TP1 (30% Size): <code>${t1:.6f}</code> (+1.1R) {'✅' if new_tp1_id else ''}\n"
+                        f"   • TP2 (35% Size): <code>${t2:.6f}</code> (+2.0R) {'✅' if new_tp2_id else ''}\n"
+                        f"   • TP3 (35% Size): <code>${t3:.6f}</code> (+3.2R) {'✅' if new_tp3_id else ''}"
                     )
                 else:
                     speed_badge = "🚀 FAST TRADE" if speed_tag == "FAST TRADE" else "⏳ SLOW TRADE"
@@ -511,8 +511,8 @@ async def run_sentinel_cycle(session: aiohttp.ClientSession):
 
             if is_scalp_trade:
                 regime_label = "⚡ HIGH-SPEED SCALP SNIPER"
-                reversal_min_gain = 1.35      # Allow trade to reach TP1 (+1.2R) before reversal harvest engages
-                reversal_pullback_threshold = 0.55  # Harvest if pullback exceeds 0.55% from peak
+                reversal_min_gain = 1.20      # Allow trade to reach TP1 (+1.1R) before reversal harvest engages
+                reversal_pullback_threshold = 0.50  # Harvest if pullback exceeds 0.50% from peak
                 stagnation_limit_mins = 120.0
             elif is_weekend:
                 regime_label = "WEEKEND ANOMALY"
@@ -622,7 +622,7 @@ async def run_sentinel_cycle(session: aiohttp.ClientSession):
                     sl_order_id = new_sl_id
                     tp1_order_id = ""
                     tp2_order_id = new_tp2_id
-                    tp1_badge = "(+1.2R SCALP TP1)" if is_scalp_trade else "(+1.3R)"
+                    tp1_badge = "(+1.1R SCALP TP1)" if is_scalp_trade else "(+1.3R)"
                     msg = (
                         f"🎯 <b>TP 1 HIT {tp1_badge} — 30% POSITION BANKED</b>\n\n"
                         f"• <b>Contract:</b> <code>{sym}</code> ({act})\n"
@@ -778,16 +778,16 @@ async def run_sentinel_cycle(session: aiohttp.ClientSession):
             floor_label = None
 
             if is_scalp_trade:
-                if peak_gain_pct >= 2.40 and pnl_approx >= 1.85:
-                    target_floor_sl = round(entry * 1.0145, 6) if act == "LONG" else round(entry * 0.9855, 6)
-                    floor_label = "🔒 SCALP_FLOOR_+1.45%"
-                elif peak_gain_pct >= 1.75 and pnl_approx >= 1.30:
-                    target_floor_sl = round(entry * 1.0090, 6) if act == "LONG" else round(entry * 0.9910, 6)
-                    floor_label = "🔒 SCALP_FLOOR_+0.90%"
-                elif peak_gain_pct >= 1.25 and pnl_approx >= 0.85:
-                    # Give trade full room to hit TP1 (+1.2R); only ratchet once solidly past +1.25% peak
-                    target_floor_sl = round(entry * 1.0040, 6) if act == "LONG" else round(entry * 0.9960, 6)
-                    floor_label = "🛡️ SCALP_PROFIT_SHIELD_+0.40%"
+                if peak_gain_pct >= 2.20 and pnl_approx >= 1.70:
+                    target_floor_sl = round(entry * 1.0135, 6) if act == "LONG" else round(entry * 0.9865, 6)
+                    floor_label = "🔒 SCALP_FLOOR_+1.35%"
+                elif peak_gain_pct >= 1.60 and pnl_approx >= 1.15:
+                    target_floor_sl = round(entry * 1.0080, 6) if act == "LONG" else round(entry * 0.9920, 6)
+                    floor_label = "🔒 SCALP_FLOOR_+0.80%"
+                elif peak_gain_pct >= 1.15 and pnl_approx >= 0.80:
+                    # Give trade room to hit TP1 (+1.1R); ratchet once solidly past +1.15% peak
+                    target_floor_sl = round(entry * 1.0035, 6) if act == "LONG" else round(entry * 0.9965, 6)
+                    floor_label = "🛡️ SCALP_PROFIT_SHIELD_+0.35%"
             else:
                 if peak_gain_pct >= 2.40 and pnl_approx >= 1.90:
                     target_floor_sl = round(entry * 1.0155, 6) if act == "LONG" else round(entry * 0.9845, 6)
@@ -829,7 +829,7 @@ async def run_sentinel_cycle(session: aiohttp.ClientSession):
             # ------------------------------------------------------------------
             # STEP 3.3: ADAPTIVE SUDDEN REVERSAL & PROFIT HARVEST DEFENSE
             # ------------------------------------------------------------------
-            min_harvest_pnl = 0.55 if is_scalp_trade else 0.55
+            min_harvest_pnl = 0.45 if is_scalp_trade else 0.55
             is_sudden_reversal = (peak_gain_pct >= reversal_min_gain and pullback_from_peak >= reversal_pullback_threshold and pnl_approx >= min_harvest_pnl)
             is_peak_giveback = (peak_gain_pct >= 2.0 and pullback_from_peak >= 0.90 and pnl_approx >= 0.55)
 

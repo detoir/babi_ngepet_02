@@ -65,7 +65,7 @@ _raw_mode = get_env_str("TRADING_MODE", "") or get_env_str("MODE", "") or get_en
 TRADING_MODE = _raw_mode.upper()
 if TRADING_MODE not in ("LIVE", "TESTNET", "SIMULATION"):
     TRADING_MODE = "LIVE"
-POSITION_SIZE_MULTIPLIER = get_env_float("POSITION_SIZE_MULTIPLIER", 5.0)  # Halved margin multiplier (20% margin per slot)
+POSITION_SIZE_MULTIPLIER = get_env_float("POSITION_SIZE_MULTIPLIER", 2.5)  # Halved margin multiplier (10% margin per slot)
 DEFAULT_LEVERAGE = max(get_env_int("DEFAULT_LEVERAGE", 12), 10)  # 12x leverage so 3-4 trades fit comfortably in $19 margin
 SCALP_LEVERAGE = max(get_env_int("SCALP_LEVERAGE", 12), 12)    # 12x leverage for scalps so 3-4 trades fit in $19 margin
 SCALP_ENTRY_TYPE = get_env_str("SCALP_ENTRY_TYPE", "MARKET").upper()  # MARKET by default so SL and TP brackets attach immediately on trade send
@@ -674,7 +674,7 @@ def place_binance_market_entry(symbol: str, side: str, qty_usd: float, leverage:
                 set_symbol_leverage_and_margin(target_sym, boost_lev)
                 cap = fetch_current_account_capital()
                 free_usd = float(cap.get("free", 0.0))
-                safe_qty_usd = min(qty_usd, free_usd * boost_lev * 0.75) if free_usd > 0.5 else 15.0
+                safe_qty_usd = min(qty_usd, free_usd * boost_lev * 0.40) if free_usd > 0.5 else 10.0
                 safe_qty_usd = max(safe_qty_usd, 6.0)
                 formatted_qty = format_order_quantity(target_sym, safe_qty_usd, price)
                 try:
@@ -726,7 +726,7 @@ def place_binance_entry_limit(symbol: str, side: str, qty_usd: float, price: flo
                 set_symbol_leverage_and_margin(target_sym, boost_lev)
                 cap = fetch_current_account_capital()
                 free_usd = float(cap.get("free", 0.0))
-                safe_qty_usd = min(qty_usd, free_usd * boost_lev * 0.85) if free_usd > 0 else (qty_usd * 0.6)
+                safe_qty_usd = min(qty_usd, free_usd * boost_lev * 0.45) if free_usd > 0 else (qty_usd * 0.5)
                 formatted_qty = format_order_quantity(target_sym, safe_qty_usd, price)
                 order = exchange.create_order(target_sym, "LIMIT", order_side, formatted_qty, formatted_price, {
                     "timeInForce": "GTC"
