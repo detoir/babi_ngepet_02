@@ -184,11 +184,11 @@ def calculate_adx_regime(candles: list, period=14) -> dict:
         minus_dm.append(l_diff if (l_diff > h_diff and l_diff > 0) else 0.0)
         tr = max(candles[i]["high"] - candles[i]["low"], abs(candles[i]["high"] - candles[i-1]["close"]), abs(candles[i]["low"] - candles[i-1]["close"]))
         tr_list.append(tr)
-    tr14 = sum(tr_list[:period])
+    tr14 = sum(tr_list[-period:])
     if tr14 == 0:
         return {"regime": "RANGING", "adx": 15.0}
-    plus_di = (sum(plus_dm[:period]) / tr14) * 100.0
-    minus_di = (sum(minus_dm[:period]) / tr14) * 100.0
+    plus_di = (sum(plus_dm[-period:]) / tr14) * 100.0
+    minus_di = (sum(minus_dm[-period:]) / tr14) * 100.0
     denom = plus_di + minus_di
     dx = (abs(plus_di - minus_di) / denom * 100.0) if denom > 0 else 0.0
     return {"regime": "TRENDING" if dx >= 25.0 else "RANGING", "adx": round(dx, 1)}
@@ -801,7 +801,8 @@ ANTI_FAKE_SYSTEM_PROMPT = (
     "You are a strict quantitative trading analyst. Base EVERY statement solely on exact numeric values and flags "
     "present in the user's JSON payload. NEVER invent or assume levels, candles, volume, or indicators not provided. "
     "NEVER rationalize a contradicting metric (for example, never write 'despite negative CVD' for a LONG or "
-    "'despite bullish book' for a SHORT). If a required condition fails or signals conflict, DISQUALIFY the symbol. "
+    "'despite bullish book' for a SHORT). NEVER make concessions in your thesis with phrasing like 'though', 'although', "
+    "'despite', 'even though', or 'below the ... gate'. If any required condition fails or signals conflict, DISQUALIFY the symbol. "
     "Returning action='HOLD' with an empty setup list [] is always better than forcing a low-quality trade."
 )
 
@@ -884,17 +885,18 @@ def analyze_macro_universe_with_ai(market_universe: list, live_news: str, btc_re
     1. HIGHER-TIMEFRAME SWING GATES (HARD REQUIREMENTS):
        - For `LONG` Swing:
          * `44.0 <= rsi_1h <= 62.0` AND `rsi_4h >= 44.0`
-         * `ema21_dist_pct >= -0.8` (price holding near or above 1H EMA21)
+         * `-0.8 <= ema21_dist_pct <= 1.2` (price holding near 1H EMA21, NEVER chase overextended > +1.2%)
          * `book_ratio >= 0.95` AND `cvd_bias != "NEGATIVE"`
+         * `whale_ls_ratio <= 2.8` (never buy into extreme crowded retail/long liquidation traps)
          * `failed_breakout == false` AND `live_candle_sig != "LIVE_BEARISH_EXPANSION"`
-         * Not extended near 24h top (`c >= 2.5` and `p >= hi * 0.993`)
+         * Not extended near 24h top (`p >= hi * 0.992` or less than 1.0% clearance to 24h high)
        - For `SHORT` Swing:
          * `41.0 <= rsi_1h <= 57.0` AND `rsi_4h <= 58.0`
-         * `ema21_dist_pct <= 0.8` (price holding near or below 1H EMA21)
+         * `-1.2 <= ema21_dist_pct <= 0.8` (price holding near 1H EMA21, NEVER chase overextended < -1.2%)
          * `book_ratio <= 1.05` AND `cvd_bias != "POSITIVE"`
          * `whale_ls_ratio < 2.5` (never short into whale long defense)
          * `failed_breakdown == false` AND `live_candle_sig != "LIVE_BULLISH_EXPANSION"`
-         * Not extended near 24h bottom (`p <= lo * 1.012`)
+         * Not extended near 24h bottom (`p <= lo * 1.010` or less than 1.0% clearance to 24h low)
 
     2. ANTI-ANCHORING & REVERSAL DEFENSE:
        The previous market regime (`previous_regime` = "{previous_regime}") is historical context only.
@@ -1125,9 +1127,11 @@ def analyze_scalp_opportunities_with_ai(market_universe: list, btc_regime: dict,
         "failed_breakdown", "failed_breakout", "fast_bull_rev", "fast_bear_rev",
         "book_ratio", "whale_ls_ratio", "rsi_1h", "ema21_dist_pct", "atr_1h_pct", "hi", "lo"
     )
-    filtered_scalps = [m for m in market_universe if m.get("v_m", 0) >= 10.0][:20]
-    if not filtered_scalps:
-        filtered_scalps = market_universe[:15]
+    valid_scalps = [
+        m for m in market_universe
+        if m.get("v_m", 0) >= 10.0 and float(m.get("rel_vol", 1.0) or 1.0) >= 0.75 and float(m.get("atr_1h_pct", 1.0) or 1.0) >= 0.45
+    ]
+    filtered_scalps = valid_scalps[:20] if valid_scalps else [m for m in market_universe if m.get("v_m", 0) >= 10.0][:15]
     top_scalp_candidates = [
         {k: m[k] for k in scalp_fields if k in m}
         for m in filtered_scalps
@@ -1190,15 +1194,18 @@ def analyze_scalp_opportunities_with_ai(market_universe: list, btc_regime: dict,
     2. LONG SCALP (ALL REQUIRED):
        - `book_ratio >= 1.15` AND `cvd_bias != "NEGATIVE"` (prefer `"POSITIVE"`)
        - `p > vwap` or `p > ema9` or `fast_bull_rev == true`
-       - `44.0 <= rsi_1h <= 63.0` AND `ema21_dist_pct >= -0.8`
+       - `44.0 <= rsi_1h <= 63.0` AND `-0.8 <= ema21_dist_pct <= 1.0`
+       - `chg_15m_pct <= 0.85` (NEVER chase a vertical 15m pump)
+       - `whale_ls_ratio <= 2.8` (never buy into crowded long liquidity traps)
        - `failed_breakout == false` AND `fast_bear_rev == false` AND `live_candle_sig != "LIVE_BEARISH_EXPANSION"`
-       - Not chasing within 0.7% of 24h high (`c >= 2.5` and `p >= hi * 0.993`)
+       - Not chasing within 0.8% of 24h high (`p >= hi * 0.992`)
     3. SHORT SCALP (ALL REQUIRED):
        - `book_ratio <= 0.88` AND `cvd_bias != "POSITIVE"` (prefer `"NEGATIVE"`)
        - `p < vwap` or `p < ema9` or `fast_bear_rev == true`
-       - `41.0 <= rsi_1h <= 57.0` AND `ema21_dist_pct <= 0.8` AND `whale_ls_ratio < 2.5`
+       - `41.0 <= rsi_1h <= 57.0` AND `-1.0 <= ema21_dist_pct <= 0.8` AND `whale_ls_ratio < 2.5`
+       - `chg_15m_pct >= -0.85` (NEVER chase a vertical 15m dump)
        - `failed_breakdown == false` AND `fast_bull_rev == false` AND `live_candle_sig != "LIVE_BULLISH_EXPANSION"`
-       - Not chasing within 1.2% of 24h low (`p <= lo * 1.012`)
+       - Not chasing within 1.0% of 24h low (`p <= lo * 1.010`)
     4. ASSET CLASS AWARENESS:
        - If `asset_class == "TRADFI"`, judge purely by its own microstructure, `cvd_bias`, `book_ratio`, and `rsi_1h` rather than BTC direction.
 
@@ -1746,9 +1753,17 @@ async def execute_unified_hourly_discovery_pipeline(context: ContextTypes.DEFAUL
             thesis_txt = str(cand.get("thesis") or "").strip()
             if not sym or act not in ["LONG", "SHORT"]:
                 continue
-            # Anti-Fake Guard: reject setups without concrete numeric thesis grounding
+            # Anti-Fake Guard: reject setups without concrete numeric thesis grounding or with concession phrasing
             if len(thesis_txt) < 15 or not re.search(r"\d", thesis_txt):
                 log_event("INFO", "ANTI_FAKE_GATE", f"Rejected {act} on {sym} ({cand['source']}): Thesis lacked concrete numeric evidence.")
+                continue
+
+            concession_patterns = [
+                r"\bthough\b", r"\balthough\b", r"\bdespite\b", r"\beven though\b",
+                r"\bbelow the\b.*\bgate\b", r"\babove the\b.*\bgate\b", r"\bfails?\b.*\bgate\b"
+            ]
+            if any(re.search(pat, thesis_txt, re.IGNORECASE) for pat in concession_patterns):
+                log_event("INFO", "ANTI_FAKE_GATE", f"Rejected {act} on {sym} ({cand['source']}): Thesis contained concession / gate-bypass phrasing: '{thesis_txt}'")
                 continue
 
             bridge = bridge_symbol_formats(sym)
@@ -1794,30 +1809,92 @@ async def execute_unified_hourly_discovery_pipeline(context: ContextTypes.DEFAUL
                 continue
 
             is_scalp = (cand["source"] == "AI_SCALP")
+            rel_vol = float(cand_info.get("rel_vol", 1.0) if cand_info else 1.0)
+            chg_15m = float(cand_info.get("chg_15m_pct", 0.0) if cand_info else 0.0)
+            atr_pct = float(cand_info.get("atr_1h_pct", 1.5) if cand_info else 1.5)
+            vwap_val = float(cand_info.get("vwap", curr_price) if cand_info else curr_price)
 
             # Strict Trend, Orderbook, CVD, 24h Range Room & Real-Time Candle Protection Gate (Enforced on ALL trades):
             if act == "LONG":
                 min_book_long = 1.15 if is_scalp else 0.95
                 cvd_veto_long = (cvd_bias == "NEGATIVE")
-                near_24h_top = (chg >= 2.5 and hi_24h > 0 and curr_price >= hi_24h * 0.993)
+                near_24h_top = bool(hi_24h > 0 and curr_price >= hi_24h * 0.992)
+                ema_overextended_long = bool(curr_price > (ema21_1h * 1.012))
+                scalp_chasing_long = bool(is_scalp and (chg_15m > 0.85 or (vwap_val > 0 and curr_price > vwap_val * 1.008)))
+                chop_filter = bool(is_scalp and (rel_vol < 0.75 or atr_pct < 0.45))
+                htf_rsi_fail_long = bool(not is_scalp and rsi_4h < 44.0)
+                whale_crowded_long = bool(not tradfi_asset and whale_ls > 2.8 and btc_24h_pct < 0.5)
+                adx_range_veto = bool(is_scalp and float(btc_regime.get("adx") or 18.0) < 12.0 and btc_24h_pct < 0.0 and not failed_breakdown)
                 btc_veto_long = (not tradfi_asset and btc_24h_pct < -1.20)
                 candle_veto_long = (failed_breakout or fast_bear_rev or live_candle_sig == "LIVE_BEARISH_EXPANSION" or not new_long_allowed)
-                if curr_price < (ema21_1h * 0.992) or rsi_1h < 44.0 or rsi_1h > 63.0 or book_ratio < min_book_long or cvd_veto_long or btc_veto_long or near_24h_top or candle_veto_long:
-                    l_reason = "Failed Breakout / Live Bearish Reversal" if candle_veto_long else ("Negative CVD Conflict" if cvd_veto_long else "Failed alignment")
+
+                if (curr_price < (ema21_1h * 0.992) or rsi_1h < 44.0 or rsi_1h > 63.0 or 
+                    book_ratio < min_book_long or cvd_veto_long or btc_veto_long or near_24h_top or 
+                    candle_veto_long or ema_overextended_long or scalp_chasing_long or chop_filter or 
+                    htf_rsi_fail_long or whale_crowded_long or adx_range_veto):
+                    
+                    if near_24h_top:
+                        l_reason = f"Near 24h Top (<0.8% room to high ${hi_24h:.4f})"
+                    elif ema_overextended_long:
+                        l_reason = f"EMA21 Overextended (+{(curr_price-ema21_1h)/ema21_1h*100:+.2f}% > +1.2%)"
+                    elif scalp_chasing_long:
+                        l_reason = f"Scalp Chasing Spike (15m: {chg_15m:+.2f}%, vs VWAP: +{(curr_price-vwap_val)/vwap_val*100:+.2f}%)"
+                    elif chop_filter:
+                        l_reason = f"Dead Chop (RelVol: {rel_vol:.2f}x < 0.75x or ATR: {atr_pct:.2f}% < 0.45%)"
+                    elif htf_rsi_fail_long:
+                        l_reason = f"4H RSI Weakness ({rsi_4h:.1f} < 44.0)"
+                    elif whale_crowded_long:
+                        l_reason = f"Whale Long Crowding Trap (L/S: {whale_ls:.2f}x > 2.8x)"
+                    elif adx_range_veto:
+                        l_reason = f"Dead Chop ADX ({btc_regime.get('adx')} < 12.0 in red BTC)"
+                    elif candle_veto_long:
+                        l_reason = "Failed Breakout / Live Bearish Reversal"
+                    elif cvd_veto_long:
+                        l_reason = "Negative CVD Conflict"
+                    else:
+                        l_reason = "Failed alignment"
+
                     log_event("INFO", "ALIGNMENT_GATE", f"Filtered LONG on {sym}: {l_reason} (Price ${curr_price:.4f} vs EMA21 ${ema21_1h:.4f}, 24h High ${hi_24h:.4f}, RSI {rsi_1h:.1f}, Book {book_ratio}x, CVD {cvd_bias}, Candle {completed_candle_sig}/{live_candle_sig}).")
                     continue
             elif act == "SHORT":
                 max_book_short = 0.88 if is_scalp else 1.05
                 cvd_veto_short = (cvd_bias == "POSITIVE")
-                near_24h_bottom = (lo_24h > 0 and curr_price <= lo_24h * 1.012)
+                near_24h_bottom = bool(lo_24h > 0 and curr_price <= lo_24h * 1.010)
+                ema_overextended_short = bool(curr_price < (ema21_1h * 0.988))
+                scalp_chasing_short = bool(is_scalp and (chg_15m < -0.85 or (vwap_val > 0 and curr_price < vwap_val * 0.992)))
+                chop_filter = bool(is_scalp and (rel_vol < 0.75 or atr_pct < 0.45))
+                htf_rsi_fail_short = bool(not is_scalp and rsi_4h > 58.0)
                 whale_long_wall = (whale_ls >= 2.5)
+                adx_range_veto_short = bool(is_scalp and float(btc_regime.get("adx") or 18.0) < 12.0 and btc_24h_pct > 0.0 and not failed_breakout)
                 btc_veto_short = (not tradfi_asset and btc_24h_pct > 1.80)
                 candle_veto_short = (failed_breakdown or fast_bull_rev or live_candle_sig == "LIVE_BULLISH_EXPANSION" or not new_short_allowed)
-                if curr_price > (ema21_1h * 1.008) or rsi_1h > 57.0 or rsi_1h < 41.0 or book_ratio > max_book_short or cvd_veto_short or btc_veto_short or near_24h_bottom or whale_long_wall or candle_veto_short:
-                    reason = (
-                        "Failed Breakdown / Fast Bullish Reversal" if candle_veto_short
-                        else ("Positive CVD Conflict" if cvd_veto_short else ("Whale Long Defense (L/S >= 2.5)" if whale_long_wall else ("Near 24h Low (<1.2%)" if near_24h_bottom else "Failed Alignment")))
-                    )
+
+                if (curr_price > (ema21_1h * 1.008) or rsi_1h > 57.0 or rsi_1h < 41.0 or 
+                    book_ratio > max_book_short or cvd_veto_short or btc_veto_short or near_24h_bottom or 
+                    whale_long_wall or candle_veto_short or ema_overextended_short or scalp_chasing_short or 
+                    chop_filter or htf_rsi_fail_short or adx_range_veto_short):
+
+                    if near_24h_bottom:
+                        reason = f"Near 24h Low (<1.0% room to low ${lo_24h:.4f})"
+                    elif ema_overextended_short:
+                        reason = f"EMA21 Overextended ({(curr_price-ema21_1h)/ema21_1h*100:+.2f}% < -1.2%)"
+                    elif scalp_chasing_short:
+                        reason = f"Scalp Chasing Dump (15m: {chg_15m:+.2f}%, vs VWAP: {(curr_price-vwap_val)/vwap_val*100:+.2f}%)"
+                    elif chop_filter:
+                        reason = f"Dead Chop (RelVol: {rel_vol:.2f}x < 0.75x or ATR: {atr_pct:.2f}% < 0.45%)"
+                    elif htf_rsi_fail_short:
+                        reason = f"4H RSI Strength ({rsi_4h:.1f} > 58.0)"
+                    elif whale_long_wall:
+                        reason = f"Whale Long Defense (L/S >= 2.5: {whale_ls:.2f}x)"
+                    elif adx_range_veto_short:
+                        reason = f"Dead Chop ADX ({btc_regime.get('adx')} < 12.0 in green BTC)"
+                    elif candle_veto_short:
+                        reason = "Failed Breakdown / Fast Bullish Reversal"
+                    elif cvd_veto_short:
+                        reason = "Positive CVD Conflict"
+                    else:
+                        reason = "Failed Alignment"
+
                     log_event("INFO", "ALIGNMENT_GATE", f"Filtered SHORT on {sym}: {reason} (Price ${curr_price:.4f} vs 24h Low ${lo_24h:.4f}, RSI {rsi_1h:.1f}, Whale L/S {whale_ls:.2f}x, Book {book_ratio}x, CVD {cvd_bias}, Candle {completed_candle_sig}/{live_candle_sig}).")
                     continue
 

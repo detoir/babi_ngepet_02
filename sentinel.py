@@ -513,7 +513,7 @@ async def run_sentinel_cycle(session: aiohttp.ClientSession):
                 regime_label = "⚡ HIGH-SPEED SCALP SNIPER"
                 reversal_min_gain = 1.20      # Allow trade to reach TP1 (+1.1R) before reversal harvest engages
                 reversal_pullback_threshold = 0.50  # Harvest if pullback exceeds 0.50% from peak
-                stagnation_limit_mins = 120.0
+                stagnation_limit_mins = 90.0
             elif is_weekend:
                 regime_label = "WEEKEND ANOMALY"
                 reversal_min_gain = 1.25
@@ -885,8 +885,8 @@ async def run_sentinel_cycle(session: aiohttp.ClientSession):
                         with get_db_connection() as conn:
                             conn.execute("UPDATE watched_signals SET current_sl = ?, binance_sl_order_id = ?, movement_tag = ? WHERE id = ?", (current_sl, sl_order_id, tag_current, w_id))
                         log_event("INFO", "SENTINEL_DEFENSE", f"Stagnant scalp {sym} ({pnl_approx:+.2f}% after {holding_mins:.0f}m) secured at BE Stop-Loss ${current_sl:.6f}")
-                elif holding_mins >= 480.0 and abs(pnl_approx) <= 0.15:
-                    # Flat tape stagnation (> 8 hours near break-even): Safely recycle capital at scratch without taking an arbitrary forced loss
+                elif pnl_approx <= 0.20:
+                    # Stalled scalp past 90m without reaching TP1: Close to recycle capital and prevent stop-out
                     for oid in (sl_order_id, tp1_order_id, tp2_order_id, tp3_order_id):
                         if oid:
                             await asyncio.to_thread(cancel_binance_order, sym, oid)
@@ -910,16 +910,16 @@ async def run_sentinel_cycle(session: aiohttp.ClientSession):
                         conn.execute("""
                             INSERT INTO loss_diagnostics (symbol, action, entry_price, exit_price, stop_loss_price, exit_type, holding_duration_mins, market_regime, diagnostic_reason)
                             VALUES (?, ?, ?, ?, ?, 'SCALP_STAGNATION', ?, 'SCALP_SNIPER', ?)
-                        """, (sym, act, entry, exit_price, current_sl, holding_mins, f"Scalp stalled at scratch {pnl_approx:+.2f}% after {holding_mins:.0f}m."))
+                        """, (sym, act, entry, exit_price, current_sl, holding_mins, f"Scalp stalled below TP1 ({pnl_approx:+.2f}%) after {holding_mins:.0f}m."))
 
                     log_event("INFO", "SENTINEL_EXIT", f"Trade {sym} {act} closed via SCALP_STAGNATION_KILL at {final_pnl:+.2f}% net after {holding_mins:.0f}m")
 
                     msg = (
-                        f"⚡ <b>SCALP FLAT STAGNATION RECYCLE ({holding_mins:.0f}m)</b>\n\n"
+                        f"⚡ <b>SCALP STAGNATION TIMEOUT ({holding_mins:.0f}m)</b>\n\n"
                         f"• <b>Contract:</b> <code>{sym}</code> ({act})\n"
                         f"• <b>Exit Mark:</b> ${exit_price:.6f} (<code>{net_leg_pnl:+.2f}% net</code>)\n"
                         f"• <b>Total Realized Trade PnL:</b> <code>{final_pnl:+.2f}%</code>\n"
-                        f"🤖 <b>Flat stalled trade recycled after 8+ hours.</b>"
+                        f"🤖 <b>Stalled scalp recycled after {holding_mins:.0f}m to free capital and prevent stop-out.</b>"
                     )
                     await send_telegram_alert(session, msg)
                     continue
